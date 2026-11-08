@@ -13,6 +13,8 @@ import com.hierynomus.smbj.SmbConfig
 import com.hierynomus.smbj.auth.AuthenticationContext
 import com.hierynomus.smbj.share.DiskShare
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.EnumSet
@@ -35,6 +37,8 @@ data class SmbFileItem(
 
 object SmbClientManager {
 
+    private val queueMutex = Mutex()
+
     private fun buildClient(): SMBClient {
         val config = SmbConfig.builder()
             .withTimeout(10, TimeUnit.SECONDS)
@@ -55,7 +59,7 @@ object SmbClientManager {
         block: (DiskShare) -> T
     ): Result<T> {
         if (config.host.isBlank() || config.shareName.isBlank()) {
-            return Result.failure(IllegalArgumentException("Preencha o IP do PC e o Nome da Partilha."))
+            return Result.failure(IllegalArgumentException("Preencha o IP do PC e o Nome do Compartilhamento."))
         }
 
         return try {
@@ -79,7 +83,7 @@ object SmbClientManager {
 
                     conn.authenticate(auth).use { session ->
                         val share = session.connectShare(config.shareName.trim()) as? DiskShare
-                            ?: throw IllegalStateException("Partilha '${config.shareName}' não encontrada.")
+                            ?: throw IllegalStateException("Compartilhamento '${config.shareName}' não encontrado.")
                         share.use { diskShare ->
                             Result.success(block(diskShare))
                         }
@@ -255,6 +259,65 @@ object SmbClientManager {
                 }
             }
             Unit
+        }
+    }
+
+    suspend fun processPendingQueue(context: Context) = withContext(Dispatchers.IO) {
+        if (queueMutex.isLocked) return@withContext
+        queueMutex.withLock {
+            val pendingPaths = SettingsManager.getPendingQueue(context)
+            if (pendingPaths.isEmpty()) return@withLock
+
+            val config = SettingsManager.getSmbConfig(context)
+            if (config.host.isBlank() || config.shareName.isBlank()) {
+                SettingsManager.updateSyncStatus(
+                    "Na fila local (${pendingPaths.size}): configure o IP e pasta do PC"
+                )
+                return@withLock
+            }
+
+            val remoteFolder = SettingsManager.getSmbRemoteFolder(context)
+            val deleteAfterSync = SettingsManager.getDeleteLocalAfterSync(context)
+
+            for (path in pendingPaths) {
+                val file = File(path)
+                if (!file.exists()) {
+                    SettingsManager.removeFromPendingQueue(context, path)
+                    continue
+                }
+
+                SettingsManager.updateSyncStatus("Enviando para o PC: ${file.name}...")
+                val uploadResult = uploadLocalFile(config, file, remoteFolder)
+
+                if (uploadResult.isSuccess) {
+                    SettingsManager.removeFromPendingQueue(context, path)
+                    SettingsManager.incrementSyncedCount()
+
+                    if (deleteAfterSync) {
+                        val deleted = file.delete()
+                        if (deleted) {
+                            MediaScannerConnection.scanFile(
+                                context,
+                                arrayOf(file.absolutePath),
+                                null,
+                                null
+                            )
+                        }
+                        SettingsManager.updateSyncStatus(
+                            "Transferido ao PC e removido do celular: ${file.name}"
+                        )
+                    } else {
+                        SettingsManager.updateSyncStatus(
+                            "Espelhado no PC (mantido no celular): ${file.name}"
+                        )
+                    }
+                } else {
+                    SettingsManager.updateSyncStatus(
+                        "Guardado na fila (${SettingsManager.getPendingQueue(context).size} pendentes): PC inacessível no momento"
+                    )
+                    break
+                }
+            }
         }
     }
 
