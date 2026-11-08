@@ -48,6 +48,7 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        SettingsManager.refreshQueueState(this)
         setContent {
             MaterialTheme {
                 Surface(
@@ -120,6 +121,7 @@ fun IFGestorMainApp() {
 fun InterceptorTabScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
 
     var prefixText by remember { mutableStateOf(SettingsManager.getPrefix(context)) }
     var localFolderText by remember { mutableStateOf(SettingsManager.getLocalFolder(context)) }
@@ -127,10 +129,14 @@ fun InterceptorTabScreen() {
     var deleteLocalAfterSync by remember { mutableStateOf(SettingsManager.getDeleteLocalAfterSync(context)) }
     var activeRemoteFolder by remember { mutableStateOf(SettingsManager.getSmbRemoteFolder(context)) }
     var hasAllFilesPermission by remember { mutableStateOf(checkStoragePermission()) }
+    var isManualSyncing by remember { mutableStateOf(false) }
 
     val isServiceRunning by SettingsManager.isServiceRunning.collectAsState()
     val interceptedCount by SettingsManager.interceptedCount.collectAsState()
+    val syncedCount by SettingsManager.syncedCount.collectAsState()
+    val pendingQueueCount by SettingsManager.pendingQueueCount.collectAsState()
     val lastFile by SettingsManager.lastInterceptedFile.collectAsState()
+    val syncStatus by SettingsManager.syncStatus.collectAsState()
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -141,6 +147,8 @@ fun InterceptorTabScreen() {
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasAllFilesPermission = checkStoragePermission()
                 activeRemoteFolder = SettingsManager.getSmbRemoteFolder(context)
+                smbEnabled = SettingsManager.isSmbSyncEnabled(context)
+                SettingsManager.refreshQueueState(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -188,6 +196,7 @@ fun InterceptorTabScreen() {
             }
         }
 
+        // Card de Status e Fila de Sincronizacao
         Card(
             colors = CardDefaults.cardColors(
                 containerColor = if (isServiceRunning)
@@ -206,19 +215,63 @@ fun InterceptorTabScreen() {
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
-                Text("Capturados nesta sessão: $interceptedCount")
+                Text(
+                    text = "Capturados: $interceptedCount  |  Enviados ao PC: $syncedCount  |  Na Fila: $pendingQueueCount",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
                 Text(
                     text = "Último arquivo: $lastFile",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
-                    text = "Pasta no PC (SMB): ${if (activeRemoteFolder.isEmpty()) "Raiz do Compartilhamento" else activeRemoteFolder}",
+                    text = "Status SMB: $syncStatus",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    text = "Pasta destino no PC: ${if (activeRemoteFolder.isEmpty()) "Raiz do Compartilhamento" else activeRemoteFolder}",
                     style = MaterialTheme.typography.bodySmall,
                     fontWeight = FontWeight.Medium
                 )
+
+                if (pendingQueueCount > 0) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                isManualSyncing = true
+                                scope.launch {
+                                    SmbClientManager.processPendingQueue(context)
+                                    isManualSyncing = false
+                                }
+                            },
+                            enabled = !isManualSyncing,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                if (isManualSyncing) "ENVIANDO..."
+                                else "SINCRONIZAR FILA ($pendingQueueCount)"
+                            )
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                SettingsManager.clearPendingQueue(context)
+                                SettingsManager.updateSyncStatus("Fila pendente limpa manualmente")
+                            },
+                            enabled = !isManualSyncing
+                        ) {
+                            Text("Limpar Fila")
+                        }
+                    }
+                }
             }
         }
 
+        // Card de Configuracao de Captura e Rede
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier.padding(16.dp),
@@ -264,7 +317,7 @@ fun InterceptorTabScreen() {
                             fontWeight = FontWeight.Medium
                         )
                         Text(
-                            "Envia fotos e vídeos para a pasta escolhida na aba HD Externo",
+                            "Se estiver no 4G/offline, guarda na fila e envia ao conectar na rede do PC",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -289,8 +342,8 @@ fun InterceptorTabScreen() {
                             fontWeight = FontWeight.Medium
                         )
                         Text(
-                            if (deleteLocalAfterSync) "Modo Transferência ativo"
-                            else "Modo Espelhamento (mantém cópia local)",
+                            if (deleteLocalAfterSync) "Modo Transferência (remove cópia local após confirmar envio)"
+                            else "Modo Espelhamento (mantém cópia no celular e no PC)",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -366,7 +419,7 @@ fun SmbExplorerTabScreen() {
 
     var fileList by remember { mutableStateOf<List<SmbFileItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(false) }
-    var statusMessage by remember { mutableStateOf("Toque em Atualizar para listar os arquivos do PC.") }
+    var statusMessage by remember { mutableStateOf("Toque em Conectar / Atualizar para listar os arquivos do PC.") }
 
     var showNewFolderDialog by remember { mutableStateOf(false) }
     var newFolderName by remember { mutableStateOf("") }
@@ -409,7 +462,6 @@ fun SmbExplorerTabScreen() {
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // Barra Superior do Explorador: Configuracoes + Atualizar
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -431,7 +483,6 @@ fun SmbExplorerTabScreen() {
             }
         }
 
-        // Painel Expansivel de Credenciais do Windows
         if (showSettingsCard) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(
@@ -446,14 +497,14 @@ fun SmbExplorerTabScreen() {
                     OutlinedTextField(
                         value = host,
                         onValueChange = { host = it },
-                        label = { Text("IP do Computador (Ex: 192.168.1.100)") },
+                        label = { Text("IP do Computador (Ex: 192.168.1.11)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = shareName,
                         onValueChange = { shareName = it },
-                        label = { Text("Nome do Compartilhamento (Ex: HD_Externo)") },
+                        label = { Text("Nome do Compartilhamento (Ex: ifg)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -464,7 +515,7 @@ fun SmbExplorerTabScreen() {
                         OutlinedTextField(
                             value = username,
                             onValueChange = { username = it },
-                            label = { Text("Usuário do Windows") },
+                            label = { Text("Usuário") },
                             singleLine = true,
                             modifier = Modifier.weight(1f)
                         )
@@ -490,7 +541,6 @@ fun SmbExplorerTabScreen() {
             }
         }
 
-        // Barra de Caminho Atual e Botoes de Pasta
         Card(
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surfaceVariant
@@ -522,7 +572,8 @@ fun SmbExplorerTabScreen() {
                                 .substringBeforeLast('\\', "")
                             loadFolder(parent)
                         },
-                        enabled = currentPath.isNotEmpty() && !isLoading
+                        enabled = currentPath.isNotEmpty() && !isLoading,
+                        modifier = Modifier.weight(1f)
                     ) {
                         Icon(Icons.Default.ArrowBack, contentDescription = null)
                         Spacer(modifier = Modifier.width(4.dp))
@@ -534,31 +585,32 @@ fun SmbExplorerTabScreen() {
                             newFolderName = ""
                             showNewFolderDialog = true
                         },
-                        enabled = !isLoading
+                        enabled = !isLoading,
+                        modifier = Modifier.weight(1f)
                     ) {
                         Icon(Icons.Default.Add, contentDescription = null)
                         Spacer(modifier = Modifier.width(4.dp))
                         Text("Nova Pasta")
                     }
+                }
 
-                    Button(
-                        onClick = {
-                            SettingsManager.setSmbRemoteFolder(context, currentPath)
-                            SettingsManager.setSmbSyncEnabled(context, true)
-                            activeCameraFolder = currentPath
-                            Toast.makeText(
-                                context,
-                                "Pasta definida como destino automático da câmera!",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        },
-                        enabled = !isLoading,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(Icons.Default.Check, contentDescription = null)
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Usar na Câmera")
-                    }
+                Button(
+                    onClick = {
+                        SettingsManager.setSmbRemoteFolder(context, currentPath)
+                        SettingsManager.setSmbSyncEnabled(context, true)
+                        activeCameraFolder = currentPath
+                        Toast.makeText(
+                            context,
+                            "Pasta definida como destino automático da câmera!",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    },
+                    enabled = !isLoading,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.Check, contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("USAR ESTA PASTA NA CÂMERA")
                 }
             }
         }
@@ -572,7 +624,6 @@ fun SmbExplorerTabScreen() {
             style = MaterialTheme.typography.bodySmall
         )
 
-        // Lista de Pastas e Arquivos do HD Externo
         LazyColumn(
             modifier = Modifier
                 .fillMaxWidth()
@@ -620,7 +671,6 @@ fun SmbExplorerTabScreen() {
         }
     }
 
-    // Dialogo: Criar Nova Pasta
     if (showNewFolderDialog) {
         AlertDialog(
             onDismissRequest = { showNewFolderDialog = false },
@@ -662,7 +712,6 @@ fun SmbExplorerTabScreen() {
         )
     }
 
-    // Dialogo de Acoes para Arquivo ou Pasta (Baixar, Renomear, Excluir)
     selectedItemForAction?.let { item ->
         AlertDialog(
             onDismissRequest = { selectedItemForAction = null },
@@ -741,7 +790,6 @@ fun SmbExplorerTabScreen() {
         )
     }
 
-    // Dialogo: Confirmar Novo Nome
     if (showRenameDialog && selectedItemForAction != null) {
         val itemToRename = selectedItemForAction!!
         AlertDialog(
