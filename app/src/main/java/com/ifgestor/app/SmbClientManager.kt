@@ -55,7 +55,7 @@ object SmbClientManager {
         block: (DiskShare) -> T
     ): Result<T> {
         if (config.host.isBlank() || config.shareName.isBlank()) {
-            return Result.failure(IllegalArgumentException("Preencha o IP do PC e o Nome do Compartilhamento."))
+            return Result.failure(IllegalArgumentException("Preencha o IP do PC e o Nome da Partilha."))
         }
 
         return try {
@@ -79,7 +79,7 @@ object SmbClientManager {
 
                     conn.authenticate(auth).use { session ->
                         val share = session.connectShare(config.shareName.trim()) as? DiskShare
-                            ?: throw IllegalStateException("Compartilhamento '${config.shareName}' não encontrado.")
+                            ?: throw IllegalStateException("Partilha '${config.shareName}' não encontrada.")
                         share.use { diskShare ->
                             Result.success(block(diskShare))
                         }
@@ -226,7 +226,7 @@ object SmbClientManager {
         localFile: File,
         remoteFolderPath: String
     ): Result<Unit> = withContext(Dispatchers.IO) {
-        executeOnShare(config) { share ->
+        executeOnShare<Unit>(config) { share ->
             val folderSmb = toSmbPath(remoteFolderPath)
             if (folderSmb.isNotEmpty()) {
                 ensureRemoteDirectories(share, folderSmb)
@@ -254,6 +254,7 @@ object SmbClientManager {
                     }
                 }
             }
+            Unit
         }
     }
 
