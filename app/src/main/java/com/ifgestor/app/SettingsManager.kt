@@ -17,6 +17,7 @@ object SettingsManager {
     private const val KEY_SMB_USER = "smb_user"
     private const val KEY_SMB_PASS = "smb_pass"
     private const val KEY_SMB_REMOTE_FOLDER = "smb_remote_folder"
+    private const val KEY_PENDING_QUEUE = "smb_pending_queue"
 
     private val _isServiceRunning = MutableStateFlow(false)
     val isServiceRunning: StateFlow<Boolean> = _isServiceRunning.asStateFlow()
@@ -24,19 +25,73 @@ object SettingsManager {
     private val _interceptedCount = MutableStateFlow(0)
     val interceptedCount: StateFlow<Int> = _interceptedCount.asStateFlow()
 
+    private val _syncedCount = MutableStateFlow(0)
+    val syncedCount: StateFlow<Int> = _syncedCount.asStateFlow()
+
+    private val _pendingQueueCount = MutableStateFlow(0)
+    val pendingQueueCount: StateFlow<Int> = _pendingQueueCount.asStateFlow()
+
     private val _lastInterceptedFile = MutableStateFlow("Nenhum arquivo ainda")
     val lastInterceptedFile: StateFlow<String> = _lastInterceptedFile.asStateFlow()
+
+    private val _syncStatus = MutableStateFlow("Aguardando capturas")
+    val syncStatus: StateFlow<String> = _syncStatus.asStateFlow()
 
     fun setServiceRunning(running: Boolean) {
         _isServiceRunning.value = running
         if (running) {
             _interceptedCount.value = 0
+            _syncedCount.value = 0
         }
     }
 
     fun registerInterceptedFile(fileName: String) {
         _interceptedCount.value += 1
         _lastInterceptedFile.value = fileName
+    }
+
+    fun incrementSyncedCount() {
+        _syncedCount.value += 1
+    }
+
+    fun updateSyncStatus(status: String) {
+        _syncStatus.value = status
+    }
+
+    fun refreshQueueState(context: Context) {
+        _pendingQueueCount.value = getPendingQueue(context).size
+    }
+
+    @Synchronized
+    fun getPendingQueue(context: Context): List<String> {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedSet = prefs.getStringSet(KEY_PENDING_QUEUE, emptySet()) ?: emptySet()
+        return savedSet.toList().sorted()
+    }
+
+    @Synchronized
+    fun addToPendingQueue(context: Context, filePath: String) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val current = HashSet(prefs.getStringSet(KEY_PENDING_QUEUE, emptySet()) ?: emptySet())
+        current.add(filePath)
+        prefs.edit().putStringSet(KEY_PENDING_QUEUE, current).apply()
+        _pendingQueueCount.value = current.size
+    }
+
+    @Synchronized
+    fun removeFromPendingQueue(context: Context, filePath: String) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val current = HashSet(prefs.getStringSet(KEY_PENDING_QUEUE, emptySet()) ?: emptySet())
+        current.remove(filePath)
+        prefs.edit().putStringSet(KEY_PENDING_QUEUE, current).apply()
+        _pendingQueueCount.value = current.size
+    }
+
+    @Synchronized
+    fun clearPendingQueue(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().remove(KEY_PENDING_QUEUE).apply()
+        _pendingQueueCount.value = 0
     }
 
     fun getPrefix(context: Context): String {
