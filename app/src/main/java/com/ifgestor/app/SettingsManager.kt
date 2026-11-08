@@ -11,6 +11,13 @@ object SettingsManager {
     private const val KEY_FOLDER = "local_folder"
     private const val KEY_DELETE_LOCAL = "delete_local"
 
+    private const val KEY_SMB_ENABLED = "smb_enabled"
+    private const val KEY_SMB_HOST = "smb_host"
+    private const val KEY_SMB_SHARE = "smb_share"
+    private const val KEY_SMB_USER = "smb_user"
+    private const val KEY_SMB_PASS = "smb_pass"
+    private const val KEY_SMB_REMOTE_FOLDER = "smb_remote_folder"
+
     private val _isServiceRunning = MutableStateFlow(false)
     val isServiceRunning: StateFlow<Boolean> = _isServiceRunning.asStateFlow()
 
@@ -66,6 +73,50 @@ object SettingsManager {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_DELETE_LOCAL, delete)
+            .apply()
+    }
+
+    fun isSmbSyncEnabled(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_SMB_ENABLED, false)
+    }
+
+    fun setSmbSyncEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_SMB_ENABLED, enabled)
+            .apply()
+    }
+
+    fun getSmbConfig(context: Context): SmbConnectionConfig {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return SmbConnectionConfig(
+            host = prefs.getString(KEY_SMB_HOST, "") ?: "",
+            shareName = prefs.getString(KEY_SMB_SHARE, "") ?: "",
+            username = prefs.getString(KEY_SMB_USER, "") ?: "",
+            password = prefs.getString(KEY_SMB_PASS, "") ?: ""
+        )
+    }
+
+    fun saveSmbConfig(context: Context, config: SmbConnectionConfig) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_SMB_HOST, config.host.trim())
+            .putString(KEY_SMB_SHARE, config.shareName.trim())
+            .putString(KEY_SMB_USER, config.username.trim())
+            .putString(KEY_SMB_PASS, config.password)
+            .apply()
+    }
+
+    fun getSmbRemoteFolder(context: Context): String {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getString(KEY_SMB_REMOTE_FOLDER, "") ?: ""
+    }
+
+    fun setSmbRemoteFolder(context: Context, remoteFolder: String) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_SMB_REMOTE_FOLDER, remoteFolder.trim().trim('\\', '/'))
             .apply()
     }
 }
