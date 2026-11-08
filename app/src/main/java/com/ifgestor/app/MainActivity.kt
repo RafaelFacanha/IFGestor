@@ -12,6 +12,7 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -65,7 +66,7 @@ fun IFGestorHomeScreen() {
         contract = ActivityResultContracts.RequestPermission()
     ) { }
 
-    // Atualiza o status da permissao sempre que o usuario volta das Configuracoes
+    // Atualiza o estado da permissao sempre que o utilizador regressa das Definicoes
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -122,7 +123,7 @@ fun IFGestorHomeScreen() {
                             color = MaterialTheme.colorScheme.onErrorContainer
                         )
                         Text(
-                            "Para renomear e mover fotos da câmera nativa sem pop-ups, autorize o 'Acesso a todos os arquivos'.",
+                            "Para renomear e mover fotos da câmara nativa sem avisos no ecrã, autorize o 'Acesso a todos os ficheiros'.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onErrorContainer
                         )
@@ -132,13 +133,13 @@ fun IFGestorHomeScreen() {
                                 containerColor = MaterialTheme.colorScheme.error
                             )
                         ) {
-                            Text("LIBERAR ACESSO AOS ARQUIVOS")
+                            Text("LIBERTAR ACESSO AOS FICHEIROS")
                         }
                     }
                 }
             }
 
-            // Card de Status em Tempo Real
+            // Cartao de Estado em Tempo Real
             Card(
                 colors = CardDefaults.cardColors(
                     containerColor = if (isServiceRunning)
@@ -153,22 +154,22 @@ fun IFGestorHomeScreen() {
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text(
-                        text = if (isServiceRunning) "STATUS: INTERCEPTADOR ATIVO" else "STATUS: PARADO",
+                        text = if (isServiceRunning) "ESTADO: INTERCETADOR ATIVO" else "ESTADO: PARADO",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Arquivos processados nesta sessão: $interceptedCount",
+                        text = "Ficheiros processados nesta sessão: $interceptedCount",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        text = "Último arquivo: $lastFile",
+                        text = "Último ficheiro: $lastFile",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
             }
 
-            // Card de Configuracao de Interceptacao
+            // Cartao de Configuracao de Intercecao
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(
                     modifier = Modifier.padding(16.dp),
@@ -186,7 +187,7 @@ fun IFGestorHomeScreen() {
                             prefixText = it
                             SettingsManager.setPrefix(context, it)
                         },
-                        label = { Text("Prefixo dos arquivos (Ex: Vistoria_)") },
+                        label = { Text("Prefixo dos ficheiros (Ex: Vistoria_)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -209,7 +210,7 @@ fun IFGestorHomeScreen() {
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                "Apagar do celular após enviar ao PC",
+                                "Apagar do telemóvel após enviar ao PC",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Medium
                             )
@@ -232,7 +233,7 @@ fun IFGestorHomeScreen() {
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Botao Principal: Ativa Interceptador + Abre Camera Nativa
+            // Botao Principal: Ativa Intercetador + Abre Camara Nativa
             Button(
                 onClick = {
                     if (!hasAllFilesPermission) {
@@ -247,7 +248,7 @@ fun IFGestorHomeScreen() {
                     .height(56.dp)
             ) {
                 Text(
-                    "ATIVAR E ABRIR CÂMERA NATIVA",
+                    "ATIVAR E ABRIR CÂMARA NATIVA",
                     fontWeight = FontWeight.Bold
                 )
             }
@@ -274,7 +275,7 @@ fun IFGestorHomeScreen() {
                     .height(48.dp)
             ) {
                 Text(
-                    if (isServiceRunning) "PARAR INTERCEPTADOR EM SEGUNDO PLANO"
+                    if (isServiceRunning) "PARAR INTERCETADOR EM SEGUNDO PLANO"
                     else "APENAS ATIVAR EM SEGUNDO PLANO"
                 )
             }
@@ -306,7 +307,7 @@ private fun requestAllFilesPermission(context: Context) {
 
 private fun requestNotificationPermissionIfNeeded(
     context: Context,
-    launcher: androidx.activity.result.ManagedActivityResultLauncher<String, Boolean>
+    launcher: ManagedActivityResultLauncher<String, Boolean>
 ) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         val granted = ContextCompat.checkSelfPermission(
@@ -334,7 +335,6 @@ private fun startInterceptorAndOpenNativeCamera(context: Context) {
     startInterceptorServiceOnly(context)
 
     try {
-        // Abre a camera nativa completa (permite fotos continuas, video, zoom e HDR)
         val cameraIntent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
@@ -342,7 +342,7 @@ private fun startInterceptorAndOpenNativeCamera(context: Context) {
     } catch (e: Exception) {
         Toast.makeText(
             context,
-            "Não foi possível abrir o atalho da câmera automaticamente.",
+            "Não foi possível abrir o atalho da câmara automaticamente.",
             Toast.LENGTH_SHORT
         ).show()
     }
