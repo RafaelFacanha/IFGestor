@@ -55,9 +55,9 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 
-    // Corrotinas para segundo plano
+    // Corrotinas para operacoes em segundo plano
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // Servidor HTTP embarcado para acesso via navegador do PC
+    // Servidor HTTP leve embutido no celular para acesso via navegador do PC
     implementation("org.nanohttpd:nanohttpd:2.3.1")
 }
