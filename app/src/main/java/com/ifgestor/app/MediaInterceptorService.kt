@@ -36,7 +36,9 @@ class MediaInterceptorService : Service() {
         const val ACTION_TOGGLE_OVERLAY = "com.ifgestor.app.ACTION_TOGGLE_OVERLAY"
         const val ACTION_REFRESH_CONFIG = "com.ifgestor.app.ACTION_REFRESH_CONFIG"
         private const val CHANNEL_ID = "ifgestor_interceptor_channel"
+        private const val AUTH_CHANNEL_ID = "ifgestor_2fa_channel"
         private const val NOTIFICATION_ID = 1001
+        private const val TWO_FA_NOTIFICATION_ID = 1002
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -50,13 +52,18 @@ class MediaInterceptorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        createNotificationChannels()
         SettingsManager.syncStateFromPrefs(this)
         serviceStartEpochSeconds = (System.currentTimeMillis() / 1000) - 2
         acquireLocksForScreenOff()
 
         overlayManager = FloatingOverlayManager(this) {
             updateNotification()
+        }
+
+        // Dispara notificacao com o codigo 2FA sempre que um PC solicitar acesso
+        SettingsManager.onTwoFactorCodeGenerated = { code, clientIp ->
+            showTwoFactorNotification(code, clientIp)
         }
 
         registerMediaObservers()
@@ -73,6 +80,7 @@ class MediaInterceptorService : Service() {
                 return START_STICKY
             }
             ACTION_REFRESH_CONFIG -> {
+                syncWebServerState()
                 overlayManager?.refreshBubbleLabel()
                 updateNotification()
                 return START_STICKY
@@ -80,8 +88,9 @@ class MediaInterceptorService : Service() {
         }
 
         SettingsManager.setServiceRunning(true)
-        val notification = buildNotification()
+        syncWebServerState()
 
+        val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -100,6 +109,36 @@ class MediaInterceptorService : Service() {
         }
 
         return START_STICKY
+    }
+
+    private fun showTwoFactorNotification(code: String, clientIp: String) {
+        val openAppIntent = Intent(this, MainActivity::class.java)
+        val openAppPending = PendingIntent.getActivity(
+            this,
+            3,
+            openAppIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val notification = NotificationCompat.Builder(this, AUTH_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
+            .setContentTitle("Código 2FA IFGestor: $code")
+            .setContentText("Solicitação de acesso no PC ($clientIp). Expira em 2 min.")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(openAppPending)
+            .build()
+
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(TWO_FA_NOTIFICATION_ID, notification)
+    }
+
+    private fun syncWebServerState() {
+        if (SettingsManager.isWebServerEnabled(this)) {
+            WebServerManager.startServer(this, SettingsManager.getServerPort(this))
+        } else {
+            WebServerManager.stopServer()
+        }
     }
 
     private fun acquireLocksForScreenOff() {
@@ -222,7 +261,6 @@ class MediaInterceptorService : Service() {
 
                     if (!sourceFile.exists() || sourceFile.length() == 0L) continue
 
-                    // Evita reprocessar se o arquivo ja estiver na pasta final com o prefixo
                     if (sourceFile.parentFile?.absolutePath == targetDir.absolutePath &&
                         prefix.isNotEmpty() && displayName.startsWith(prefix)
                     ) {
@@ -285,8 +323,10 @@ class MediaInterceptorService : Service() {
 
     private fun buildNotification(): Notification {
         val prefix = SettingsManager.getPrefix(this)
-        val shortFolder = SettingsManager.formatShortPath(SettingsManager.getTargetFolderPath(this))
         val count = SettingsManager.interceptedCount.value
+        val ip = WebServerManager.getDeviceIpAddress(this)
+        val port = SettingsManager.getServerPort(this)
+        val webInfo = if (WebServerManager.isRunning()) "PC: http://$ip:$port" else "Web: Desativado"
 
         val openAppIntent = Intent(this, MainActivity::class.java)
         val openAppPending = PendingIntent.getActivity(
@@ -319,7 +359,7 @@ class MediaInterceptorService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setContentTitle("IFGestor Ativo ($count capturados)")
-            .setContentText("Prefixo: $prefix | Destino: $shortFolder")
+            .setContentText("Prefixo: $prefix | $webInfo")
             .setOngoing(true)
             .setContentIntent(openAppPending)
             .addAction(
@@ -340,22 +380,35 @@ class MediaInterceptorService : Service() {
         manager?.notify(NOTIFICATION_ID, buildNotification())
     }
 
-    private fun createNotificationChannel() {
+    private fun createNotificationChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
+            val manager = getSystemService(NotificationManager::class.java)
+
+            val serviceChannel = NotificationChannel(
                 CHANNEL_ID,
-                "Monitoramento da Câmera",
+                "Monitoramento da Câmera e Servidor Web",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Mantém o IFGestor interceptando fotos e vídeos em segundo plano"
+                description = "Mantém o IFGestor interceptando fotos e servindo arquivos na rede"
             }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
+
+            val authChannel = NotificationChannel(
+                AUTH_CHANNEL_ID,
+                "Códigos de Segurança 2FA",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Exibe o código de verificação em duas etapas quando um PC solicita acesso"
+            }
+
+            manager?.createNotificationChannel(serviceChannel)
+            manager?.createNotificationChannel(authChannel)
         }
     }
 
     private fun stopInterceptorService() {
+        SettingsManager.onTwoFactorCodeGenerated = null
         overlayManager?.hide()
+        WebServerManager.stopServer()
         releaseLocks()
         SettingsManager.setServiceRunning(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -363,7 +416,9 @@ class MediaInterceptorService : Service() {
     }
 
     override fun onDestroy() {
+        SettingsManager.onTwoFactorCodeGenerated = null
         overlayManager?.hide()
+        WebServerManager.stopServer()
         releaseLocks()
         mediaObserver?.let { contentResolver.unregisterContentObserver(it) }
         SettingsManager.setServiceRunning(false)
