@@ -2,22 +2,24 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Permissoes de Rede para o Servidor Web Local -->
+    <!-- Permissoes de Rede e Wi-Fi para o Servidor Web Local -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
-    <!-- Permissoes para manter o Servidor e o Interceptador ativos com a tela apagada -->
+    <!-- Permissoes para manter o servidor ativo com a tela apagada -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Permissao para exibir o Widget Flutuante sobre a Camera Nativa -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Permissoes de Servico em Segundo Plano -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Permissao para o Widget Flutuante sobre a Camera Nativa -->
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-
-    <!-- Permissao para gerenciar todas as pastas do celular silenciosamente -->
+    <!-- Permissao para gerenciar todas as pastas do celular e mover fotos silenciosamente -->
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
@@ -31,7 +33,7 @@
         android:maxSdkVersion="29" />
 
     <application
-        android:allowBackup="false"
+        android:allowBackup="true"
         android:icon="@android:drawable/ic_menu_camera"
         android:label="IFGestor"
         android:supportsRtl="true"
