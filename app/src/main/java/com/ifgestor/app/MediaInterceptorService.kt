@@ -5,16 +5,18 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.database.ContentObserver
 import android.media.MediaScannerConnection
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
-import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -22,7 +24,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -32,7 +33,8 @@ class MediaInterceptorService : Service() {
     companion object {
         const val ACTION_START = "com.ifgestor.app.ACTION_START"
         const val ACTION_STOP = "com.ifgestor.app.ACTION_STOP"
-        const val ACTION_SYNC_NOW = "com.ifgestor.app.ACTION_SYNC_NOW"
+        const val ACTION_TOGGLE_OVERLAY = "com.ifgestor.app.ACTION_TOGGLE_OVERLAY"
+        const val ACTION_REFRESH_CONFIG = "com.ifgestor.app.ACTION_REFRESH_CONFIG"
         private const val CHANNEL_ID = "ifgestor_interceptor_channel"
         private const val NOTIFICATION_ID = 1001
     }
@@ -41,28 +43,40 @@ class MediaInterceptorService : Service() {
     private val processedFiles = ConcurrentHashMap.newKeySet<String>()
     private var serviceStartEpochSeconds: Long = 0L
     private var mediaObserver: ContentObserver? = null
+    private var overlayManager: FloatingOverlayManager? = null
+
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        SettingsManager.refreshQueueState(this)
+        SettingsManager.syncStateFromPrefs(this)
         serviceStartEpochSeconds = (System.currentTimeMillis() / 1000) - 2
+        acquireLocksForScreenOff()
+
+        overlayManager = FloatingOverlayManager(this) {
+            updateNotification()
+        }
+
         registerMediaObservers()
-        startPeriodicQueueRetry()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopInterceptorService()
-            return START_NOT_STICKY
-        }
-
-        if (intent?.action == ACTION_SYNC_NOW) {
-            serviceScope.launch {
-                SmbClientManager.processPendingQueue(this@MediaInterceptorService)
-                updateNotification()
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopInterceptorService()
+                return START_NOT_STICKY
             }
-            return START_STICKY
+            ACTION_TOGGLE_OVERLAY -> {
+                overlayManager?.toggleVisibility()
+                return START_STICKY
+            }
+            ACTION_REFRESH_CONFIG -> {
+                overlayManager?.refreshBubbleLabel()
+                updateNotification()
+                return START_STICKY
+            }
         }
 
         SettingsManager.setServiceRunning(true)
@@ -78,28 +92,49 @@ class MediaInterceptorService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
-        if (SettingsManager.isSmbSyncEnabled(this)) {
-            serviceScope.launch {
-                SmbClientManager.processPendingQueue(this@MediaInterceptorService)
-                updateNotification()
-            }
+        if (SettingsManager.isOverlayEnabled(this)) {
+            overlayManager?.show()
+            overlayManager?.refreshBubbleLabel()
+        } else {
+            overlayManager?.hide()
         }
 
         return START_STICKY
     }
 
-    private fun startPeriodicQueueRetry() {
-        serviceScope.launch {
-            while (isActive) {
-                delay(25_000) // Tenta descarregar a fila a cada 25s se houver itens pendentes
-                if (SettingsManager.isSmbSyncEnabled(this@MediaInterceptorService)) {
-                    val pending = SettingsManager.getPendingQueue(this@MediaInterceptorService)
-                    if (pending.isNotEmpty()) {
-                        SmbClientManager.processPendingQueue(this@MediaInterceptorService)
-                        updateNotification()
-                    }
-                }
+    private fun acquireLocksForScreenOff() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "IFGestor::BackgroundWakeLock"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
             }
+
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val lockType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wm.createWifiLock(lockType, "IFGestor::BackgroundWifiLock").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun releaseLocks() {
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
@@ -182,15 +217,22 @@ class MediaInterceptorService : Service() {
                     if (!isFromCamera) continue
 
                     val prefix = SettingsManager.getPrefix(this)
-                    if (prefix.isNotEmpty() && displayName.startsWith(prefix)) continue
+                    val targetDir = File(SettingsManager.getTargetFolderPath(this))
+                    val sourceFile = File(filePath)
+
+                    if (!sourceFile.exists() || sourceFile.length() == 0L) continue
+
+                    // Evita reprocessar se o arquivo ja estiver na pasta final com o prefixo
+                    if (sourceFile.parentFile?.absolutePath == targetDir.absolutePath &&
+                        prefix.isNotEmpty() && displayName.startsWith(prefix)
+                    ) {
+                        continue
+                    }
 
                     if (processedFiles.contains(filePath)) continue
 
-                    val sourceFile = File(filePath)
-                    if (!sourceFile.exists() || sourceFile.length() == 0L) continue
-
                     processedFiles.add(filePath)
-                    moveAndRenameFile(sourceFile, displayName, prefix)
+                    moveAndRenameFile(sourceFile, displayName, prefix, targetDir)
                 }
             }
         } catch (e: Exception) {
@@ -198,11 +240,12 @@ class MediaInterceptorService : Service() {
         }
     }
 
-    private fun moveAndRenameFile(sourceFile: File, originalName: String, prefix: String) {
-        val targetFolderName = SettingsManager.getLocalFolder(this)
-        val baseDcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
-        val targetDir = File(baseDcim, targetFolderName)
-
+    private fun moveAndRenameFile(
+        sourceFile: File,
+        originalName: String,
+        prefix: String,
+        targetDir: File
+    ) {
         if (!targetDir.exists()) {
             targetDir.mkdirs()
         }
@@ -223,6 +266,7 @@ class MediaInterceptorService : Service() {
         }
 
         if (moved) {
+            processedFiles.add(destFile.absolutePath)
             MediaScannerConnection.scanFile(
                 this,
                 arrayOf(sourceFile.absolutePath, destFile.absolutePath),
@@ -230,16 +274,8 @@ class MediaInterceptorService : Service() {
                 null
             )
             SettingsManager.registerInterceptedFile(newFileName)
-
-            if (SettingsManager.isSmbSyncEnabled(this)) {
-                SettingsManager.addToPendingQueue(this, destFile.absolutePath)
-                updateNotification()
-                serviceScope.launch {
-                    SmbClientManager.processPendingQueue(this@MediaInterceptorService)
-                    updateNotification()
-                }
-            } else {
-                SettingsManager.updateSyncStatus("Salvo na pasta local: $newFileName")
+            Handler(Looper.getMainLooper()).post {
+                overlayManager?.refreshBubbleLabel()
                 updateNotification()
             }
         } else {
@@ -249,15 +285,24 @@ class MediaInterceptorService : Service() {
 
     private fun buildNotification(): Notification {
         val prefix = SettingsManager.getPrefix(this)
-        val captured = SettingsManager.interceptedCount.value
-        val synced = SettingsManager.syncedCount.value
-        val pending = SettingsManager.pendingQueueCount.value
+        val shortFolder = SettingsManager.formatShortPath(SettingsManager.getTargetFolderPath(this))
+        val count = SettingsManager.interceptedCount.value
 
         val openAppIntent = Intent(this, MainActivity::class.java)
         val openAppPending = PendingIntent.getActivity(
             this,
             0,
             openAppIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val toggleOverlayIntent = Intent(this, MediaInterceptorService::class.java).apply {
+            action = ACTION_TOGGLE_OVERLAY
+        }
+        val toggleOverlayPending = PendingIntent.getService(
+            this,
+            2,
+            toggleOverlayIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -271,21 +316,20 @@ class MediaInterceptorService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val titleText = if (SettingsManager.isSmbSyncEnabled(this)) {
-            "IFGestor Ativo (Capturados: $captured | PC: $synced | Fila: $pending)"
-        } else {
-            "IFGestor Ativo ($captured capturados localmente)"
-        }
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setContentTitle(titleText)
-            .setContentText("Prefixo: $prefix | ${SettingsManager.syncStatus.value}")
+            .setContentTitle("IFGestor Ativo ($count capturados)")
+            .setContentText("Prefixo: $prefix | Destino: $shortFolder")
             .setOngoing(true)
             .setContentIntent(openAppPending)
             .addAction(
+                android.R.drawable.ic_menu_view,
+                "Widget Flutuante",
+                toggleOverlayPending
+            )
+            .addAction(
                 android.R.drawable.ic_media_pause,
-                "Parar Interceptador",
+                "Parar",
                 stopPending
             )
             .build()
@@ -311,12 +355,16 @@ class MediaInterceptorService : Service() {
     }
 
     private fun stopInterceptorService() {
+        overlayManager?.hide()
+        releaseLocks()
         SettingsManager.setServiceRunning(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     override fun onDestroy() {
+        overlayManager?.hide()
+        releaseLocks()
         mediaObserver?.let { contentResolver.unregisterContentObserver(it) }
         SettingsManager.setServiceRunning(false)
         serviceScope.cancel()
