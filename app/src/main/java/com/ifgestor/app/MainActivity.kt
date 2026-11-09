@@ -1,6 +1,8 @@
 package com.ifgestor.app
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.Settings
 import android.widget.Toast
@@ -28,8 +31,10 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -37,6 +42,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -72,8 +78,11 @@ fun IFGestorMainApp() {
                     Column {
                         Text("IFGestor", fontWeight = FontWeight.Bold)
                         Text(
-                            if (selectedTab == 0) "Interceptador & Widget da Câmera"
-                            else "Explorador de Pastas do Celular",
+                            when (selectedTab) {
+                                0 -> "Interceptador & Widget da Câmera"
+                                1 -> "Explorador de Pastas do Celular"
+                                else -> "Servidor Web Seguro (PIN + 2FA)"
+                            },
                             style = MaterialTheme.typography.labelSmall
                         )
                     }
@@ -96,7 +105,13 @@ fun IFGestorMainApp() {
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
                     icon = { Icon(Icons.Default.Folder, contentDescription = null) },
-                    label = { Text("Pastas do Celular") }
+                    label = { Text("Pastas") }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 2,
+                    onClick = { selectedTab = 2 },
+                    icon = { Icon(Icons.Default.Share, contentDescription = null) },
+                    label = { Text("Acesso no PC") }
                 )
             }
         }
@@ -106,10 +121,10 @@ fun IFGestorMainApp() {
                 .fillMaxSize()
                 .padding(paddingValues)
         ) {
-            if (selectedTab == 0) {
-                InterceptorTabScreen(onOpenFolderPicker = { selectedTab = 1 })
-            } else {
-                LocalFolderExplorerTabScreen()
+            when (selectedTab) {
+                0 -> InterceptorTabScreen(onOpenFolderPicker = { selectedTab = 1 })
+                1 -> LocalFolderExplorerTabScreen()
+                else -> WebServerTabScreen()
             }
         }
     }
@@ -123,6 +138,7 @@ fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
     val activePrefix by SettingsManager.activePrefix.collectAsState()
     val activeFolderPath by SettingsManager.activeFolderPath.collectAsState()
     val isServiceRunning by SettingsManager.isServiceRunning.collectAsState()
+    val isWebServerRunning by SettingsManager.isWebServerRunning.collectAsState()
     val interceptedCount by SettingsManager.interceptedCount.collectAsState()
     val lastFile by SettingsManager.lastInterceptedFile.collectAsState()
 
@@ -130,6 +146,7 @@ fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
     var overlayEnabled by remember { mutableStateOf(SettingsManager.isOverlayEnabled(context)) }
     var hasAllFilesPermission by remember { mutableStateOf(checkStoragePermission()) }
     var hasOverlayPermission by remember { mutableStateOf(checkOverlayPermission(context)) }
+    var deviceIp by remember { mutableStateOf(WebServerManager.getDeviceIpAddress(context)) }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -140,6 +157,7 @@ fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasAllFilesPermission = checkStoragePermission()
                 hasOverlayPermission = checkOverlayPermission(context)
+                deviceIp = WebServerManager.getDeviceIpAddress(context)
                 SettingsManager.syncStateFromPrefs(context)
             }
         }
@@ -172,7 +190,7 @@ fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
                         color = MaterialTheme.colorScheme.onErrorContainer
                     )
                     Text(
-                        "Autorize o 'Acesso a todos os arquivos' para mover fotos e criar pastas em qualquer local do celular.",
+                        "Autorize o 'Acesso a todos os arquivos' para mover fotos e criar pastas.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onErrorContainer
                     )
@@ -206,7 +224,7 @@ fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
                         color = MaterialTheme.colorScheme.onTertiaryContainer
                     )
                     Text(
-                        "Autorize 'Sobrepor a outros apps' para exibir o botão flutuante sobre a câmera nativa.",
+                        "Autorize 'Sobrepor a outros apps' para exibir o botão flutuante sobre a câmera.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onTertiaryContainer
                     )
@@ -217,7 +235,6 @@ fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
             }
         }
 
-        // Card de Status
         Card(
             colors = CardDefaults.cardColors(
                 containerColor = if (isServiceRunning)
@@ -250,10 +267,17 @@ fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                     fontWeight = FontWeight.Medium
                 )
+                if (isWebServerRunning) {
+                    Text(
+                        text = "Acesso Web no PC: http://$deviceIp:${SettingsManager.getServerPort(context)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
         }
 
-        // Card de Configuracao
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier.padding(16.dp),
@@ -369,9 +393,337 @@ fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
                 .height(48.dp)
         ) {
             Text(
-                if (isServiceRunning) "PARAR INTERCEPTADOR EM SEGUNDO PLANO"
+                if (isServiceRunning) "PARAR INTERCEPTADOR E SERVIDOR WEB"
                 else "APENAS ATIVAR EM SEGUNDO PLANO"
             )
+        }
+    }
+}
+
+@Composable
+fun WebServerTabScreen() {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val isServiceRunning by SettingsManager.isServiceRunning.collectAsState()
+    val isWebServerRunning by SettingsManager.isWebServerRunning.collectAsState()
+    val active2faCode by SettingsManager.current2faCode.collectAsState()
+    val active2faIp by SettingsManager.current2faClientIp.collectAsState()
+    val activeSessionsCount by SettingsManager.activeSessionsCount.collectAsState()
+
+    var authEnabled by remember { mutableStateOf(SettingsManager.isWebAuthEnabled(context)) }
+    var twoFactorEnabled by remember { mutableStateOf(SettingsManager.isTwoFactorEnabled(context)) }
+    var newPinInput by remember { mutableStateOf("") }
+    var hasCustomPin by remember { mutableStateOf(SettingsManager.hasCustomPin(context)) }
+
+    var ipAddress by remember { mutableStateOf(WebServerManager.getDeviceIpAddress(context)) }
+    val port = remember { SettingsManager.getServerPort(context) }
+    var isIgnoringBattery by remember { mutableStateOf(checkBatteryOptimizationIgnored(context)) }
+
+    val fullUrl = "http://$ipAddress:$port"
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                ipAddress = WebServerManager.getDeviceIpAddress(context)
+                isIgnoringBattery = checkBatteryOptimizationIgnored(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // Alerta em Tempo Real do Codigo de 2a Etapa (2FA) quando um PC solicita login
+        if (active2faCode != null) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        "📲 CÓDIGO DE VERIFICAÇÃO EM 2 ETAPAS",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = active2faCode ?: "",
+                        style = MaterialTheme.typography.headlineLarge,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        "Solicitado pelo computador ($active2faIp). Digite este código no navegador do PC.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        }
+
+        // Card Principal de Endereco e Controle do Servidor
+        Card(
+            colors = CardDefaults.cardColors(
+                containerColor = if (isWebServerRunning)
+                    MaterialTheme.colorScheme.secondaryContainer
+                else
+                    MaterialTheme.colorScheme.surfaceVariant
+            ),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = if (isWebServerRunning) "SERVIDOR WEB ONLINE" else "SERVIDOR WEB PARADO",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Text(
+                    text = "Digite este endereço no navegador do computador:",
+                    style = MaterialTheme.typography.bodySmall
+                )
+
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surface
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = fullUrl,
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("URL IFGestor", fullUrl))
+                            Toast.makeText(context, "Endereço copiado!", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Copiar Link")
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            ipAddress = WebServerManager.getDeviceIpAddress(context)
+                            Toast.makeText(context, "IP atualizado!", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Atualizar IP")
+                    }
+                }
+
+                Button(
+                    onClick = {
+                        if (isServiceRunning && isWebServerRunning) {
+                            val stopIntent = Intent(context, MediaInterceptorService::class.java).apply {
+                                action = MediaInterceptorService.ACTION_STOP
+                            }
+                            context.startService(stopIntent)
+                        } else {
+                            SettingsManager.setWebServerEnabled(context, true)
+                            startInterceptorServiceOnly(context)
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp)
+                ) {
+                    Text(
+                        if (isWebServerRunning) "DESLIGAR SERVIDOR E SEGUNDO PLANO"
+                        else "LIGAR SERVIDOR WEB EM SEGUNDO PLANO",
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+
+        // Card de Seguranca (PIN + 2FA + Sessoes Ativas)
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(Icons.Default.Lock, contentDescription = null)
+                    Text(
+                        "Segurança de Acesso (PIN + 2 Etapas)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Exigir PIN ao abrir no PC", fontWeight = FontWeight.Medium)
+                        Text(
+                            if (hasCustomPin) "PIN personalizado configurado (SHA-256)"
+                            else "PIN padrão inicial: 1234",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = authEnabled,
+                        onCheckedChange = {
+                            authEnabled = it
+                            SettingsManager.setWebAuthEnabled(context, it)
+                        }
+                    )
+                }
+
+                if (authEnabled) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Verificação em Duas Etapas (2FA)", fontWeight = FontWeight.Medium)
+                            Text(
+                                "Envia código dinâmico de 6 dígitos na notificação do celular a cada login",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                        Switch(
+                            checked = twoFactorEnabled,
+                            onCheckedChange = {
+                                twoFactorEnabled = it
+                                SettingsManager.setTwoFactorEnabled(context, it)
+                            }
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = newPinInput,
+                            onValueChange = { newPinInput = it },
+                            label = { Text("Novo PIN (mín. 4 dígitos)") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(
+                            onClick = {
+                                if (newPinInput.trim().length < 4) {
+                                    Toast.makeText(
+                                        context,
+                                        "Digite pelo menos 4 dígitos para o PIN.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    SettingsManager.setWebPin(context, newPinInput)
+                                    hasCustomPin = true
+                                    newPinInput = ""
+                                    WebServerManager.disconnectAllSessions()
+                                    Toast.makeText(
+                                        context,
+                                        "Novo PIN salvo com sucesso!",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            }
+                        ) {
+                            Text("Salvar PIN")
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Sessões autenticadas no PC: $activeSessionsCount",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium
+                        )
+                        OutlinedButton(
+                            onClick = {
+                                WebServerManager.disconnectAllSessions()
+                                Toast.makeText(
+                                    context,
+                                    "Todos os computadores foram desconectados!",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        ) {
+                            Text("Desconectar PCs")
+                        }
+                    }
+                }
+            }
+        }
+
+        // Protecao para funcionar com a Tela Apagada
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    "Funcionamento com a Tela Apagada",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    if (isIgnoringBattery)
+                        "✅ Proteção ativa! O servidor continuará acessível pelo PC mesmo quando a tela do celular apagar."
+                    else
+                        "⚠️ Para que o Android não desligue o Wi-Fi quando a tela apagar, desative a restrição de bateria do IFGestor.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+
+                if (!isIgnoringBattery) {
+                    Button(
+                        onClick = { requestIgnoreBatteryOptimization(context) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("MANTER ATIVO COM A TELA APAGADA")
+                    }
+                }
+            }
         }
     }
 }
@@ -699,6 +1051,23 @@ private fun checkOverlayPermission(context: Context): Boolean {
         Settings.canDrawOverlays(context)
     } else {
         true
+    }
+}
+
+private fun checkBatteryOptimizationIgnored(context: Context): Boolean {
+    val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+    return pm.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+private fun requestIgnoreBatteryOptimization(context: Context) {
+    try {
+        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:${context.packageName}")
+        }
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+        context.startActivity(intent)
     }
 }
 
