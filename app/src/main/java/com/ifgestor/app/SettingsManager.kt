@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+import java.security.MessageDigest
 
 object SettingsManager {
     private const val PREFS_NAME = "ifgestor_v2_prefs"
@@ -13,10 +14,19 @@ object SettingsManager {
     private const val KEY_TARGET_PATH = "target_folder_path"
     private const val KEY_RECENT_PATHS = "recent_folder_paths"
     private const val KEY_OVERLAY_ENABLED = "overlay_enabled"
+    private const val KEY_WEB_SERVER_ENABLED = "web_server_enabled"
     private const val KEY_SERVER_PORT = "web_server_port"
+
+    // Chaves de Seguranca
+    private const val KEY_AUTH_ENABLED = "web_auth_enabled"
+    private const val KEY_TWO_FACTOR_ENABLED = "web_2fa_enabled"
+    private const val KEY_PIN_HASH = "web_pin_sha256"
 
     private val _isServiceRunning = MutableStateFlow(false)
     val isServiceRunning: StateFlow<Boolean> = _isServiceRunning.asStateFlow()
+
+    private val _isWebServerRunning = MutableStateFlow(false)
+    val isWebServerRunning: StateFlow<Boolean> = _isWebServerRunning.asStateFlow()
 
     private val _interceptedCount = MutableStateFlow(0)
     val interceptedCount: StateFlow<Int> = _interceptedCount.asStateFlow()
@@ -29,6 +39,18 @@ object SettingsManager {
 
     private val _activeFolderPath = MutableStateFlow(getDefaultFolderPath())
     val activeFolderPath: StateFlow<String> = _activeFolderPath.asStateFlow()
+
+    // Estados de Seguranca em Tempo Real (2FA e Sessoes)
+    private val _current2faCode = MutableStateFlow<String?>(null)
+    val current2faCode: StateFlow<String?> = _current2faCode.asStateFlow()
+
+    private val _current2faClientIp = MutableStateFlow<String?>(null)
+    val current2faClientIp: StateFlow<String?> = _current2faClientIp.asStateFlow()
+
+    private val _activeSessionsCount = MutableStateFlow(0)
+    val activeSessionsCount: StateFlow<Int> = _activeSessionsCount.asStateFlow()
+
+    var onTwoFactorCodeGenerated: ((String, String) -> Unit)? = null
 
     fun getDefaultFolderPath(): String {
         val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
@@ -49,6 +71,26 @@ object SettingsManager {
         if (running) {
             _interceptedCount.value = 0
         }
+    }
+
+    fun setWebServerRunning(running: Boolean) {
+        _isWebServerRunning.value = running
+        if (!running) {
+            _current2faCode.value = null
+            _activeSessionsCount.value = 0
+        }
+    }
+
+    fun publishTwoFactorCode(code: String?, clientIp: String?) {
+        _current2faCode.value = code
+        _current2faClientIp.value = clientIp
+        if (code != null && clientIp != null) {
+            onTwoFactorCodeGenerated?.invoke(code, clientIp)
+        }
+    }
+
+    fun updateActiveSessionsCount(count: Int) {
+        _activeSessionsCount.value = count
     }
 
     fun registerInterceptedFile(fileName: String) {
@@ -126,9 +168,72 @@ object SettingsManager {
             .apply()
     }
 
+    fun isWebServerEnabled(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_WEB_SERVER_ENABLED, true)
+    }
+
+    fun setWebServerEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_WEB_SERVER_ENABLED, enabled)
+            .apply()
+    }
+
     fun getServerPort(context: Context): Int {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return prefs.getInt(KEY_SERVER_PORT, 8080)
+    }
+
+    // Configuracoes de Seguranca (PIN + 2FA)
+    fun isWebAuthEnabled(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_AUTH_ENABLED, true)
+    }
+
+    fun setWebAuthEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_AUTH_ENABLED, enabled)
+            .apply()
+    }
+
+    fun isTwoFactorEnabled(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_TWO_FACTOR_ENABLED, true)
+    }
+
+    fun setTwoFactorEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_TWO_FACTOR_ENABLED, enabled)
+            .apply()
+    }
+
+    fun setWebPin(context: Context, rawPin: String) {
+        val clean = rawPin.trim()
+        if (clean.length >= 4) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_PIN_HASH, sha256(clean))
+                .apply()
+        }
+    }
+
+    fun verifyWebPin(context: Context, inputPin: String): Boolean {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedHash = prefs.getString(KEY_PIN_HASH, null) ?: sha256("1234")
+        return savedHash == sha256(inputPin.trim())
+    }
+
+    fun hasCustomPin(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.contains(KEY_PIN_HASH)
+    }
+
+    private fun sha256(input: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { "%02x".format(it) }
     }
 
     fun formatShortPath(fullPath: String): String {
