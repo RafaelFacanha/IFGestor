@@ -28,7 +28,7 @@ class FloatingOverlayManager(
     private var rootContainer: LinearLayout? = null
     private var bubbleView: TextView? = null
     private var expandedPanel: View? = null
-    private var layoutParams: WindowManager.LayoutParams? = null
+    private var windowParams: WindowManager.LayoutParams? = null
     private var isShowing = false
     private var isExpanded = false
 
@@ -45,7 +45,7 @@ class FloatingOverlayManager(
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
-        layoutParams = WindowManager.LayoutParams(
+        windowParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
@@ -65,7 +65,7 @@ class FloatingOverlayManager(
         rootContainer?.addView(bubbleView)
 
         try {
-            windowManager.addView(rootContainer, layoutParams)
+            windowManager.addView(rootContainer, windowParams)
             isShowing = true
             isExpanded = false
         } catch (e: Exception) {
@@ -119,7 +119,7 @@ class FloatingOverlayManager(
             var initialTouchY = 0f
 
             setOnTouchListener { _, event ->
-                val params = layoutParams ?: return@setOnTouchListener false
+                val params = this@FloatingOverlayManager.windowParams ?: return@setOnTouchListener false
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
                         initialX = params.x
@@ -153,9 +153,9 @@ class FloatingOverlayManager(
     private fun expandQuickPanel() {
         if (isExpanded) return
         val container = rootContainer ?: return
-        val params = layoutParams ?: return
+        val params = windowParams ?: return
 
-        // Libera o foco de teclado para permitir digitar o prefixo ou subpasta sobre a camera
+        // Liberta o foco de teclado para permitir digitar o prefixo ou subpasta sobre a camara
         params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
         params.width = dpToPx(310)
 
@@ -175,7 +175,7 @@ class FloatingOverlayManager(
     private fun collapseToBubble() {
         if (!isExpanded) return
         val container = rootContainer ?: return
-        val params = layoutParams ?: return
+        val params = windowParams ?: return
 
         params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         params.width = WindowManager.LayoutParams.WRAP_CONTENT
@@ -223,7 +223,7 @@ class FloatingOverlayManager(
         mainLayout.addView(folderInfo)
 
         val prefixLabel = TextView(context).apply {
-            text = "Prefixo do Arquivo:"
+            text = "Prefixo do Ficheiro:"
             setTextColor(Color.WHITE)
             textSize = 12f
         }
@@ -307,7 +307,7 @@ class FloatingOverlayManager(
             mainLayout.addView(recentScroll)
         }
 
-        // Botoes de Acao (Salvar / Minimizar)
+        // Botoes de Acao (Guardar / Fechar)
         val btnRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.END
@@ -321,7 +321,7 @@ class FloatingOverlayManager(
         }
 
         val saveBtn = Button(context).apply {
-            text = "Salvar"
+            text = "Guardar"
             textSize = 12f
             setOnClickListener {
                 val newPrefix = prefixInput.text.toString()
