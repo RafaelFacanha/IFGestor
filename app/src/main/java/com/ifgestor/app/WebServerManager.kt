@@ -282,7 +282,6 @@ private class PhoneHttpServer(
             return res
         }
 
-        // Caso 2FA esteja desativado, cria a sessao diretamente
         return createAuthenticatedSessionResponse(clientIp)
     }
 
@@ -306,7 +305,6 @@ private class PhoneHttpServer(
             return res
         }
 
-        // Codigo 2FA validado com sucesso!
         pending2faMap.remove(tempToken)
         SettingsManager.publishTwoFactorCode(null, null)
         resetAuthFailures(clientIp)
@@ -491,7 +489,7 @@ private class PhoneHttpServer(
             return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Arquivo nao encontrado")
         }
 
-        val mime = getMimeTypeForFile(file.name)
+        val mime = resolveMimeType(file.name)
         val fileLen = file.length()
         val rangeHeader = session.headers["range"]
 
@@ -596,18 +594,13 @@ private class PhoneHttpServer(
                     <h2>🔒 IFGestor Seguro</h2>
                     <p>Digite o PIN configurado na aba "Acesso no PC" do celular (Padrão inicial: 1234)</p>
                     $errBanner
-                    <form onsubmit="submitPin(event)">
+                    <form id="pinForm">
                         <input type="password" id="pinInput" placeholder="••••" required autofocus>
                         <button type="submit">Continuar</button>
                     </form>
                 </div>
                 <script>
-                    async function submitPin(e) {
-                        e.preventDefault();
-                        const pin = document.getElementById('pinInput').value;
-                        window.location.href = '/auth/pin_redirect?pin=' + encodeURIComponent(pin);
-                    }
-                    document.querySelector('form').onsubmit = async function(e) {
+                    document.getElementById('pinForm').onsubmit = async function(e) {
                         e.preventDefault();
                         const pin = document.getElementById('pinInput').value;
                         const resp = await fetch('/auth/pin?pin=' + encodeURIComponent(pin), { method: 'POST' });
@@ -965,7 +958,6 @@ private class PhoneHttpServer(
                     localStorage.setItem('ifg_thumb_size', size);
                 }
 
-                // Restaura o tamanho preferido salvo no navegador
                 const savedSize = localStorage.getItem('ifg_thumb_size') || 'medium';
                 setThumbSize(savedSize);
 
@@ -979,7 +971,7 @@ private class PhoneHttpServer(
 
                 function closeLightbox() {
                     const holder = document.getElementById('lbMediaHolder');
-                    holder.innerHTML = ''; // Pausa videos ativos
+                    holder.innerHTML = '';
                     document.getElementById('lightboxModal').classList.remove('open');
                 }
 
@@ -1127,7 +1119,7 @@ private class PhoneHttpServer(
         return low.endsWith(".mp4") || low.endsWith(".mov") || low.endsWith(".mkv") || low.endsWith(".3gp")
     }
 
-    private fun getMimeTypeForFile(name: String): String {
+    private fun resolveMimeType(name: String): String {
         val low = name.lowercase()
         return when {
             low.endsWith(".jpg") || low.endsWith(".jpeg") -> "image/jpeg"
