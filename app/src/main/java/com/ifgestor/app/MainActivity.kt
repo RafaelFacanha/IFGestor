@@ -26,11 +26,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -38,17 +37,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import kotlinx.coroutines.launch
+import java.io.File
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        SettingsManager.refreshQueueState(this)
+        SettingsManager.syncStateFromPrefs(this)
         setContent {
             MaterialTheme {
                 Surface(
@@ -74,8 +72,8 @@ fun IFGestorMainApp() {
                     Column {
                         Text("IFGestor", fontWeight = FontWeight.Bold)
                         Text(
-                            if (selectedTab == 0) "Interceptador da Câmera Nativa"
-                            else "Gerenciador de Rede (HD Externo / PC)",
+                            if (selectedTab == 0) "Interceptador & Widget da Câmera"
+                            else "Explorador de Pastas do Celular",
                             style = MaterialTheme.typography.labelSmall
                         )
                     }
@@ -97,8 +95,8 @@ fun IFGestorMainApp() {
                 NavigationBarItem(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Default.List, contentDescription = null) },
-                    label = { Text("HD Externo (PC)") }
+                    icon = { Icon(Icons.Default.Folder, contentDescription = null) },
+                    label = { Text("Pastas do Celular") }
                 )
             }
         }
@@ -109,34 +107,29 @@ fun IFGestorMainApp() {
                 .padding(paddingValues)
         ) {
             if (selectedTab == 0) {
-                InterceptorTabScreen()
+                InterceptorTabScreen(onOpenFolderPicker = { selectedTab = 1 })
             } else {
-                SmbExplorerTabScreen()
+                LocalFolderExplorerTabScreen()
             }
         }
     }
 }
 
 @Composable
-fun InterceptorTabScreen() {
+fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
 
-    var prefixText by remember { mutableStateOf(SettingsManager.getPrefix(context)) }
-    var localFolderText by remember { mutableStateOf(SettingsManager.getLocalFolder(context)) }
-    var smbEnabled by remember { mutableStateOf(SettingsManager.isSmbSyncEnabled(context)) }
-    var deleteLocalAfterSync by remember { mutableStateOf(SettingsManager.getDeleteLocalAfterSync(context)) }
-    var activeRemoteFolder by remember { mutableStateOf(SettingsManager.getSmbRemoteFolder(context)) }
-    var hasAllFilesPermission by remember { mutableStateOf(checkStoragePermission()) }
-    var isManualSyncing by remember { mutableStateOf(false) }
-
+    val activePrefix by SettingsManager.activePrefix.collectAsState()
+    val activeFolderPath by SettingsManager.activeFolderPath.collectAsState()
     val isServiceRunning by SettingsManager.isServiceRunning.collectAsState()
     val interceptedCount by SettingsManager.interceptedCount.collectAsState()
-    val syncedCount by SettingsManager.syncedCount.collectAsState()
-    val pendingQueueCount by SettingsManager.pendingQueueCount.collectAsState()
     val lastFile by SettingsManager.lastInterceptedFile.collectAsState()
-    val syncStatus by SettingsManager.syncStatus.collectAsState()
+
+    var prefixInput by remember(activePrefix) { mutableStateOf(activePrefix) }
+    var overlayEnabled by remember { mutableStateOf(SettingsManager.isOverlayEnabled(context)) }
+    var hasAllFilesPermission by remember { mutableStateOf(checkStoragePermission()) }
+    var hasOverlayPermission by remember { mutableStateOf(checkOverlayPermission(context)) }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -146,9 +139,8 @@ fun InterceptorTabScreen() {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasAllFilesPermission = checkStoragePermission()
-                activeRemoteFolder = SettingsManager.getSmbRemoteFolder(context)
-                smbEnabled = SettingsManager.isSmbSyncEnabled(context)
-                SettingsManager.refreshQueueState(context)
+                hasOverlayPermission = checkOverlayPermission(context)
+                SettingsManager.syncStateFromPrefs(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -174,13 +166,13 @@ fun InterceptorTabScreen() {
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        "Permissão Necessária",
+                        "1. Permissão de Arquivos Necessária",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onErrorContainer
                     )
                     Text(
-                        "Autorize o 'Acesso a todos os arquivos' para renomear e mover fotos sem pop-ups.",
+                        "Autorize o 'Acesso a todos os arquivos' para mover fotos e criar pastas em qualquer local do celular.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onErrorContainer
                     )
@@ -196,7 +188,36 @@ fun InterceptorTabScreen() {
             }
         }
 
-        // Card de Status e Fila de Sincronizacao
+        if (!hasOverlayPermission) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "2. Permissão do Widget Flutuante",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
+                    Text(
+                        "Autorize 'Sobrepor a outros apps' para exibir o botão flutuante sobre a câmera nativa.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
+                    Button(onClick = { requestOverlayPermission(context) }) {
+                        Text("LIBERAR WIDGET FLUTUANTE")
+                    }
+                }
+            }
+        }
+
+        // Card de Status
         Card(
             colors = CardDefaults.cardColors(
                 containerColor = if (isServiceRunning)
@@ -216,7 +237,7 @@ fun InterceptorTabScreen() {
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "Capturados: $interceptedCount  |  Enviados ao PC: $syncedCount  |  Na Fila: $pendingQueueCount",
+                    text = "Arquivos capturados nesta sessão: $interceptedCount",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -225,109 +246,56 @@ fun InterceptorTabScreen() {
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
-                    text = "Status SMB: $syncStatus",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Text(
-                    text = "Pasta destino no PC: ${if (activeRemoteFolder.isEmpty()) "Raiz do Compartilhamento" else activeRemoteFolder}",
+                    text = "Pasta atual: ${SettingsManager.formatShortPath(activeFolderPath)}",
                     style = MaterialTheme.typography.bodySmall,
                     fontWeight = FontWeight.Medium
                 )
-
-                if (pendingQueueCount > 0) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Button(
-                            onClick = {
-                                isManualSyncing = true
-                                scope.launch {
-                                    SmbClientManager.processPendingQueue(context)
-                                    isManualSyncing = false
-                                }
-                            },
-                            enabled = !isManualSyncing,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text(
-                                if (isManualSyncing) "ENVIANDO..."
-                                else "SINCRONIZAR FILA ($pendingQueueCount)"
-                            )
-                        }
-
-                        OutlinedButton(
-                            onClick = {
-                                SettingsManager.clearPendingQueue(context)
-                                SettingsManager.updateSyncStatus("Fila pendente limpa manualmente")
-                            },
-                            enabled = !isManualSyncing
-                        ) {
-                            Text("Limpar Fila")
-                        }
-                    }
-                }
             }
         }
 
-        // Card de Configuracao de Captura e Rede
+        // Card de Configuracao
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier.padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    "Regras de Captura e Rede",
+                    "Destino e Nomenclatura",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
 
                 OutlinedTextField(
-                    value = prefixText,
+                    value = prefixInput,
                     onValueChange = {
-                        prefixText = it
+                        prefixInput = it
                         SettingsManager.setPrefix(context, it)
+                        notifyServiceConfigChanged(context, isServiceRunning)
                     },
                     label = { Text("Prefixo dos arquivos (Ex: Vistoria_)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                OutlinedTextField(
-                    value = localFolderText,
-                    onValueChange = {
-                        localFolderText = it
-                        SettingsManager.setLocalFolder(context, it)
-                    },
-                    label = { Text("Pasta local em DCIM/") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                Text(
+                    text = "Pasta onde os arquivos serão salvos:",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = SettingsManager.formatShortPath(activeFolderPath),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
                 )
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                OutlinedButton(
+                    onClick = onOpenFolderPicker,
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            "Enviar automaticamente para o PC (SMB)",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Text(
-                            "Se estiver no 4G/offline, guarda na fila e envia ao conectar na rede do PC",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                    Switch(
-                        checked = smbEnabled,
-                        onCheckedChange = {
-                            smbEnabled = it
-                            SettingsManager.setSmbSyncEnabled(context, it)
-                        }
-                    )
+                    Icon(Icons.Default.Folder, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("ESCOLHER / CRIAR PASTA NO CELULAR")
                 }
 
                 Row(
@@ -337,21 +305,23 @@ fun InterceptorTabScreen() {
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            "Apagar do celular após enviar ao PC",
+                            "Widget Flutuante sobre a Câmera",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Medium
                         )
                         Text(
-                            if (deleteLocalAfterSync) "Modo Transferência (remove cópia local após confirmar envio)"
-                            else "Modo Espelhamento (mantém cópia no celular e no PC)",
+                            "Permite mudar prefixo e pasta sem sair da câmera",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
                     Switch(
-                        checked = deleteLocalAfterSync,
+                        checked = overlayEnabled,
                         onCheckedChange = {
-                            deleteLocalAfterSync = it
-                            SettingsManager.setDeleteLocalAfterSync(context, it)
+                            overlayEnabled = it
+                            SettingsManager.setOverlayEnabled(context, it)
+                            if (isServiceRunning) {
+                                startInterceptorServiceOnly(context)
+                            }
                         }
                     )
                 }
@@ -362,6 +332,10 @@ fun InterceptorTabScreen() {
             onClick = {
                 if (!hasAllFilesPermission) {
                     requestAllFilesPermission(context)
+                    return@Button
+                }
+                if (overlayEnabled && !hasOverlayPermission) {
+                    requestOverlayPermission(context)
                     return@Button
                 }
                 requestNotificationPermissionIfNeeded(context, notificationPermissionLauncher)
@@ -403,57 +377,36 @@ fun InterceptorTabScreen() {
 }
 
 @Composable
-fun SmbExplorerTabScreen() {
+fun LocalFolderExplorerTabScreen() {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+    val rootPath = remember { SettingsManager.getStorageRootPath() }
+    val activeFolderPath by SettingsManager.activeFolderPath.collectAsState()
 
-    val savedConfig = remember { SettingsManager.getSmbConfig(context) }
-    var host by remember { mutableStateOf(savedConfig.host) }
-    var shareName by remember { mutableStateOf(savedConfig.shareName) }
-    var username by remember { mutableStateOf(savedConfig.username) }
-    var password by remember { mutableStateOf(savedConfig.password) }
+    var currentDir by remember {
+        val initial = File(SettingsManager.getTargetFolderPath(context))
+        if (!initial.exists()) initial.mkdirs()
+        mutableStateOf(if (initial.exists() && initial.isDirectory) initial else File(rootPath))
+    }
 
-    var showSettingsCard by remember { mutableStateOf(savedConfig.host.isBlank()) }
-    var currentPath by remember { mutableStateOf(SettingsManager.getSmbRemoteFolder(context)) }
-    var activeCameraFolder by remember { mutableStateOf(SettingsManager.getSmbRemoteFolder(context)) }
-
-    var fileList by remember { mutableStateOf<List<SmbFileItem>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(false) }
-    var statusMessage by remember { mutableStateOf("Toque em Conectar / Atualizar para listar os arquivos do PC.") }
-
+    var itemsList by remember { mutableStateOf<List<File>>(emptyList()) }
     var showNewFolderDialog by remember { mutableStateOf(false) }
     var newFolderName by remember { mutableStateOf("") }
 
-    var selectedItemForAction by remember { mutableStateOf<SmbFileItem?>(null) }
+    var selectedFileForAction by remember { mutableStateOf<File?>(null) }
     var showRenameDialog by remember { mutableStateOf(false) }
-    var renameText by remember { mutableStateOf("") }
+    var renameInput by remember { mutableStateOf("") }
 
-    fun currentConfig(): SmbConnectionConfig {
-        val cfg = SmbConnectionConfig(
-            host = host,
-            shareName = shareName,
-            username = username,
-            password = password
-        )
-        SettingsManager.saveSmbConfig(context, cfg)
-        return cfg
+    fun refreshDirectory(dir: File) {
+        if (!dir.exists()) dir.mkdirs()
+        currentDir = dir
+        val children = dir.listFiles()?.toList() ?: emptyList()
+        itemsList = children
+            .filter { !it.name.startsWith(".") }
+            .sortedWith(compareByDescending<File> { it.isDirectory }.thenBy { it.name.lowercase() })
     }
 
-    fun loadFolder(pathToLoad: String) {
-        val cfg = currentConfig()
-        isLoading = true
-        statusMessage = "Conectando a \\\\${cfg.host}\\${cfg.shareName}..."
-        scope.launch {
-            val result = SmbClientManager.listDirectory(cfg, pathToLoad)
-            isLoading = false
-            result.onSuccess { items ->
-                currentPath = pathToLoad
-                fileList = items
-                statusMessage = if (items.isEmpty()) "Pasta vazia." else "${items.size} itens encontrados."
-            }.onFailure { err ->
-                statusMessage = "Erro: ${err.message ?: "Falha na conexão SMB"}"
-            }
-        }
+    LaunchedEffect(currentDir) {
+        refreshDirectory(currentDir)
     }
 
     Column(
@@ -462,85 +415,6 @@ fun SmbExplorerTabScreen() {
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            OutlinedButton(onClick = { showSettingsCard = !showSettingsCard }) {
-                Icon(Icons.Default.Settings, contentDescription = null)
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(if (showSettingsCard) "Ocultar Conexão" else "Configurar PC")
-            }
-
-            Button(
-                onClick = { loadFolder(currentPath) },
-                enabled = !isLoading
-            ) {
-                Icon(Icons.Default.Refresh, contentDescription = null)
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Conectar / Atualizar")
-            }
-        }
-
-        if (showSettingsCard) {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    modifier = Modifier.padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        "Dados do Compartilhamento Windows (SMB)",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold
-                    )
-                    OutlinedTextField(
-                        value = host,
-                        onValueChange = { host = it },
-                        label = { Text("IP do Computador (Ex: 192.168.1.11)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = shareName,
-                        onValueChange = { shareName = it },
-                        label = { Text("Nome do Compartilhamento (Ex: ifg)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        OutlinedTextField(
-                            value = username,
-                            onValueChange = { username = it },
-                            label = { Text("Usuário") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f)
-                        )
-                        OutlinedTextField(
-                            value = password,
-                            onValueChange = { password = it },
-                            label = { Text("Senha") },
-                            visualTransformation = PasswordVisualTransformation(),
-                            singleLine = true,
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    Button(
-                        onClick = {
-                            showSettingsCard = false
-                            loadFolder(currentPath)
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("SALVAR E ABRIR COMPARTILHAMENTO")
-                    }
-                }
-            }
-        }
-
         Card(
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surfaceVariant
@@ -552,12 +426,12 @@ fun SmbExplorerTabScreen() {
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "Local atual: \\\\${host.ifBlank { "IP" }}\\${shareName.ifBlank { "Share" }}\\${currentPath}",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.SemiBold
+                    text = "Navegando em: ${SettingsManager.formatShortPath(currentDir.absolutePath)}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "Destino ativo da câmera: ${if (activeCameraFolder.isEmpty()) "Raiz do Compartilhamento" else activeCameraFolder}",
+                    text = "Pasta ativa da câmera: ${SettingsManager.formatShortPath(activeFolderPath)}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -566,18 +440,17 @@ fun SmbExplorerTabScreen() {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    val canGoUp = currentDir.absolutePath != rootPath && currentDir.parentFile != null
                     OutlinedButton(
                         onClick = {
-                            val parent = currentPath.replace("/", "\\")
-                                .substringBeforeLast('\\', "")
-                            loadFolder(parent)
+                            currentDir.parentFile?.let { refreshDirectory(it) }
                         },
-                        enabled = currentPath.isNotEmpty() && !isLoading,
+                        enabled = canGoUp,
                         modifier = Modifier.weight(1f)
                     ) {
                         Icon(Icons.Default.ArrowBack, contentDescription = null)
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Voltar")
+                        Text("Acima")
                     }
 
                     OutlinedButton(
@@ -585,43 +458,40 @@ fun SmbExplorerTabScreen() {
                             newFolderName = ""
                             showNewFolderDialog = true
                         },
-                        enabled = !isLoading,
                         modifier = Modifier.weight(1f)
                     ) {
                         Icon(Icons.Default.Add, contentDescription = null)
                         Spacer(modifier = Modifier.width(4.dp))
                         Text("Nova Pasta")
                     }
+
+                    IconButton(onClick = { refreshDirectory(currentDir) }) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Atualizar")
+                    }
                 }
 
                 Button(
                     onClick = {
-                        SettingsManager.setSmbRemoteFolder(context, currentPath)
-                        SettingsManager.setSmbSyncEnabled(context, true)
-                        activeCameraFolder = currentPath
+                        SettingsManager.setTargetFolderPath(context, currentDir.absolutePath)
+                        notifyServiceConfigChanged(context, SettingsManager.isServiceRunning.value)
                         Toast.makeText(
                             context,
-                            "Pasta definida como destino automático da câmera!",
+                            "Pasta selecionada para salvar fotos e vídeos!",
                             Toast.LENGTH_SHORT
                         ).show()
                     },
-                    enabled = !isLoading,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Icon(Icons.Default.Check, contentDescription = null)
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("USAR ESTA PASTA NA CÂMERA")
+                    Text("SALVAR ARQUIVOS DA CÂMERA NESTA PASTA")
                 }
             }
         }
 
-        if (isLoading) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        }
-
         Text(
-            text = statusMessage,
-            style = MaterialTheme.typography.bodySmall
+            text = "${itemsList.count { it.isDirectory }} pastas e ${itemsList.count { !it.isDirectory }} arquivos neste local",
+            style = MaterialTheme.typography.labelSmall
         )
 
         LazyColumn(
@@ -630,15 +500,15 @@ fun SmbExplorerTabScreen() {
                 .weight(1f),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            items(fileList) { item ->
+            items(itemsList) { item ->
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable {
                             if (item.isDirectory) {
-                                loadFolder(item.relativePath)
+                                refreshDirectory(item)
                             } else {
-                                selectedItemForAction = item
+                                selectedFileForAction = item
                             }
                         }
                 ) {
@@ -651,18 +521,18 @@ fun SmbExplorerTabScreen() {
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = if (item.isDirectory) "[PASTA]  ${item.name}" else item.name,
+                                text = if (item.isDirectory) "📁 ${item.name}" else "📄 ${item.name}",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = if (item.isDirectory) FontWeight.Bold else FontWeight.Normal
                             )
                             Text(
                                 text = if (item.isDirectory) "Toque para abrir a pasta"
-                                else "Tamanho: ${formatFileSize(item.sizeBytes)}",
+                                else "Tamanho: ${formatFileSize(item.length())}",
                                 style = MaterialTheme.typography.labelSmall
                             )
                         }
 
-                        IconButton(onClick = { selectedItemForAction = item }) {
+                        IconButton(onClick = { selectedFileForAction = item }) {
                             Icon(Icons.Default.MoreVert, contentDescription = "Opções")
                         }
                     }
@@ -674,7 +544,7 @@ fun SmbExplorerTabScreen() {
     if (showNewFolderDialog) {
         AlertDialog(
             onDismissRequest = { showNewFolderDialog = false },
-            title = { Text("Criar Nova Pasta no HD Externo") },
+            title = { Text("Criar Nova Pasta / Subpasta") },
             text = {
                 OutlinedTextField(
                     value = newFolderName,
@@ -686,22 +556,18 @@ fun SmbExplorerTabScreen() {
             confirmButton = {
                 Button(
                     onClick = {
-                        val folderToCreate = newFolderName
-                        showNewFolderDialog = false
-                        isLoading = true
-                        scope.launch {
-                            val res = SmbClientManager.createFolder(currentConfig(), currentPath, folderToCreate)
-                            res.onSuccess {
-                                Toast.makeText(context, "Pasta criada!", Toast.LENGTH_SHORT).show()
-                                loadFolder(currentPath)
-                            }.onFailure { err ->
-                                isLoading = false
-                                statusMessage = "Erro ao criar pasta: ${err.message}"
+                        val cleanName = newFolderName.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                        if (cleanName.isNotEmpty()) {
+                            val newDir = File(currentDir, cleanName)
+                            if (newDir.mkdirs() || newDir.exists()) {
+                                refreshDirectory(newDir)
+                                Toast.makeText(context, "Pasta criada e aberta!", Toast.LENGTH_SHORT).show()
                             }
                         }
+                        showNewFolderDialog = false
                     }
                 ) {
-                    Text("Criar")
+                    Text("Criar e Abrir")
                 }
             },
             dismissButton = {
@@ -712,44 +578,29 @@ fun SmbExplorerTabScreen() {
         )
     }
 
-    selectedItemForAction?.let { item ->
+    selectedFileForAction?.let { item ->
         AlertDialog(
-            onDismissRequest = { selectedItemForAction = null },
+            onDismissRequest = { selectedFileForAction = null },
             title = { Text(item.name) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        if (item.isDirectory) "Escolha uma ação para esta pasta no PC:"
-                        else "Escolha uma ação para este arquivo no PC:"
-                    )
-
-                    if (!item.isDirectory) {
+                    if (item.isDirectory) {
                         Button(
                             onClick = {
-                                val target = item
-                                selectedItemForAction = null
-                                isLoading = true
-                                statusMessage = "Baixando ${target.name}..."
-                                scope.launch {
-                                    val res = SmbClientManager.downloadFileToPhone(context, currentConfig(), target)
-                                    isLoading = false
-                                    res.onSuccess { savedPath ->
-                                        statusMessage = "Salvo no celular em: $savedPath"
-                                        Toast.makeText(context, "Baixado em $savedPath", Toast.LENGTH_LONG).show()
-                                    }.onFailure { err ->
-                                        statusMessage = "Erro no download: ${err.message}"
-                                    }
-                                }
+                                SettingsManager.setTargetFolderPath(context, item.absolutePath)
+                                notifyServiceConfigChanged(context, SettingsManager.isServiceRunning.value)
+                                selectedFileForAction = null
+                                Toast.makeText(context, "Definida como pasta da câmera!", Toast.LENGTH_SHORT).show()
                             },
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("BAIXAR PARA O CELULAR")
+                            Text("USAR ESTA PASTA NA CÂMERA")
                         }
                     }
 
                     OutlinedButton(
                         onClick = {
-                            renameText = item.name
+                            renameInput = item.name
                             showRenameDialog = true
                         },
                         modifier = Modifier.fillMaxWidth()
@@ -759,46 +610,41 @@ fun SmbExplorerTabScreen() {
 
                     Button(
                         onClick = {
-                            val target = item
-                            selectedItemForAction = null
-                            isLoading = true
-                            scope.launch {
-                                val res = SmbClientManager.deleteItem(currentConfig(), target)
-                                res.onSuccess {
-                                    Toast.makeText(context, "Excluído com sucesso!", Toast.LENGTH_SHORT).show()
-                                    loadFolder(currentPath)
-                                }.onFailure { err ->
-                                    isLoading = false
-                                    statusMessage = "Erro ao excluir: ${err.message}"
-                                }
-                            }
+                            val deleted = item.deleteRecursively()
+                            selectedFileForAction = null
+                            refreshDirectory(currentDir)
+                            Toast.makeText(
+                                context,
+                                if (deleted) "Excluído com sucesso!" else "Não foi possível excluir.",
+                                Toast.LENGTH_SHORT
+                            ).show()
                         },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.error
                         ),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("EXCLUIR DO HD EXTERNO")
+                        Text("EXCLUIR DO CELULAR")
                     }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { selectedItemForAction = null }) {
+                TextButton(onClick = { selectedFileForAction = null }) {
                     Text("Fechar")
                 }
             }
         )
     }
 
-    if (showRenameDialog && selectedItemForAction != null) {
-        val itemToRename = selectedItemForAction!!
+    if (showRenameDialog && selectedFileForAction != null) {
+        val target = selectedFileForAction!!
         AlertDialog(
             onDismissRequest = { showRenameDialog = false },
-            title = { Text("Renomear ${itemToRename.name}") },
+            title = { Text("Renomear ${target.name}") },
             text = {
                 OutlinedTextField(
-                    value = renameText,
-                    onValueChange = { renameText = it },
+                    value = renameInput,
+                    onValueChange = { renameInput = it },
                     label = { Text("Novo nome") },
                     singleLine = true
                 )
@@ -806,20 +652,18 @@ fun SmbExplorerTabScreen() {
             confirmButton = {
                 Button(
                     onClick = {
-                        val newNameVal = renameText
-                        showRenameDialog = false
-                        selectedItemForAction = null
-                        isLoading = true
-                        scope.launch {
-                            val res = SmbClientManager.renameItem(currentConfig(), itemToRename, newNameVal)
-                            res.onSuccess {
-                                Toast.makeText(context, "Renomeado com sucesso!", Toast.LENGTH_SHORT).show()
-                                loadFolder(currentPath)
-                            }.onFailure { err ->
-                                isLoading = false
-                                statusMessage = "Erro ao renomear: ${err.message}"
+                        val cleanName = renameInput.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                        if (cleanName.isNotEmpty()) {
+                            val newFile = File(target.parentFile, cleanName)
+                            if (target.renameTo(newFile)) {
+                                if (activeFolderPath == target.absolutePath) {
+                                    SettingsManager.setTargetFolderPath(context, newFile.absolutePath)
+                                }
+                                refreshDirectory(currentDir)
                             }
                         }
+                        showRenameDialog = false
+                        selectedFileForAction = null
                     }
                 ) {
                     Text("Salvar")
@@ -850,6 +694,14 @@ private fun checkStoragePermission(): Boolean {
     }
 }
 
+private fun checkOverlayPermission(context: Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        Settings.canDrawOverlays(context)
+    } else {
+        true
+    }
+}
+
 private fun requestAllFilesPermission(context: Context) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         try {
@@ -861,6 +713,16 @@ private fun requestAllFilesPermission(context: Context) {
             val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
             context.startActivity(intent)
         }
+    }
+}
+
+private fun requestOverlayPermission(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:${context.packageName}")
+        )
+        context.startActivity(intent)
     }
 }
 
@@ -877,6 +739,14 @@ private fun requestNotificationPermissionIfNeeded(
             launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
+}
+
+private fun notifyServiceConfigChanged(context: Context, isRunning: Boolean) {
+    if (!isRunning) return
+    val intent = Intent(context, MediaInterceptorService::class.java).apply {
+        action = MediaInterceptorService.ACTION_REFRESH_CONFIG
+    }
+    context.startService(intent)
 }
 
 private fun startInterceptorServiceOnly(context: Context) {
