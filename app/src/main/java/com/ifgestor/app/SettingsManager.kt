@@ -27,7 +27,7 @@ object SettingsManager {
     private const val KEY_OVERLAY_ENABLED = "overlay_enabled"
     private const val KEY_WEB_SERVER_ENABLED = "web_server_enabled"
     private const val KEY_SERVER_PORT = "web_server_port"
-    private const val KEY_THEME_MODE = "ui_theme_mode" // 0 = Auto, 1 = Claro, 2 = Escuro
+    private const val KEY_THEME_MODE = "ui_theme_mode"
 
     // Chaves de Seguranca
     private const val KEY_AUTH_ENABLED = "web_auth_enabled"
@@ -60,17 +60,24 @@ object SettingsManager {
     private val _themeMode = MutableStateFlow(0)
     val themeMode: StateFlow<Int> = _themeMode.asStateFlow()
 
-    // Estados de Seguranca em Tempo Real (2FA e Sessoes)
+    // Estados de Seguranca em Tempo Real (2FA de Login e de Operacoes de Arquivo)
     private val _current2faCode = MutableStateFlow<String?>(null)
     val current2faCode: StateFlow<String?> = _current2faCode.asStateFlow()
 
     private val _current2faClientIp = MutableStateFlow<String?>(null)
     val current2faClientIp: StateFlow<String?> = _current2faClientIp.asStateFlow()
 
+    private val _current2faActionDesc = MutableStateFlow<String?>(null)
+    val current2faActionDesc: StateFlow<String?> = _current2faActionDesc.asStateFlow()
+
+    private val _approved2faCode = MutableStateFlow<String?>(null)
+    val approved2faCode: StateFlow<String?> = _approved2faCode.asStateFlow()
+
     private val _activeSessionsCount = MutableStateFlow(0)
     val activeSessionsCount: StateFlow<Int> = _activeSessionsCount.asStateFlow()
 
     var onTwoFactorCodeGenerated: ((String, String) -> Unit)? = null
+    var onTwoFactorRequestWithAction: ((String, String, String) -> Unit)? = null
 
     fun getDefaultFolderPath(): String {
         val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
@@ -115,15 +122,58 @@ object SettingsManager {
         _isWebServerRunning.value = running
         if (!running) {
             _current2faCode.value = null
+            _current2faClientIp.value = null
+            _current2faActionDesc.value = null
+            _approved2faCode.value = null
             _activeSessionsCount.value = 0
         }
     }
 
-    fun publishTwoFactorCode(code: String?, clientIp: String?) {
+    fun publishTwoFactorCode(
+        code: String?,
+        clientIp: String?,
+        actionDesc: String? = "Acesso ao Gerenciador Web"
+    ) {
+        if (code == null) {
+            _current2faCode.value = null
+            _current2faClientIp.value = null
+            _current2faActionDesc.value = null
+            return
+        }
+        _approved2faCode.value = null
         _current2faCode.value = code
         _current2faClientIp.value = clientIp
-        if (code != null && clientIp != null) {
+        _current2faActionDesc.value = actionDesc ?: "Operação no Gerenciador Web"
+
+        if (clientIp != null) {
+            val desc = _current2faActionDesc.value ?: "Operação no Gerenciador Web"
+            onTwoFactorRequestWithAction?.invoke(code, clientIp, desc)
             onTwoFactorCodeGenerated?.invoke(code, clientIp)
+        }
+    }
+
+    @Synchronized
+    fun approvePendingTwoFactor(): String? {
+        val pendingCode = _current2faCode.value ?: return null
+        _approved2faCode.value = pendingCode
+        _current2faCode.value = null
+        _current2faActionDesc.value = null
+        return pendingCode
+    }
+
+    @Synchronized
+    fun isCodeApprovedByPhone(code: String): Boolean {
+        return _approved2faCode.value == code
+    }
+
+    @Synchronized
+    fun consumeApprovedCode(code: String) {
+        if (_approved2faCode.value == code) {
+            _approved2faCode.value = null
+        }
+        if (_current2faCode.value == code) {
+            _current2faCode.value = null
+            _current2faActionDesc.value = null
         }
     }
 
