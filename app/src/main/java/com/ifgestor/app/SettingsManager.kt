@@ -2,25 +2,39 @@ package com.ifgestor.app
 
 import android.content.Context
 import android.os.Environment
+import android.os.StatFs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.security.MessageDigest
+import java.util.Locale
+
+data class StorageStats(
+    val totalBytes: Long,
+    val freeBytes: Long,
+    val usedBytes: Long,
+    val usedPercent: Int,
+    val formattedSummary: String
+)
 
 object SettingsManager {
     private const val PREFS_NAME = "ifgestor_v2_prefs"
     private const val KEY_PREFIX = "prefix"
+    private const val KEY_QUICK_PRESETS = "quick_prefix_presets"
     private const val KEY_TARGET_PATH = "target_folder_path"
     private const val KEY_RECENT_PATHS = "recent_folder_paths"
     private const val KEY_OVERLAY_ENABLED = "overlay_enabled"
     private const val KEY_WEB_SERVER_ENABLED = "web_server_enabled"
     private const val KEY_SERVER_PORT = "web_server_port"
+    private const val KEY_THEME_MODE = "ui_theme_mode" // 0 = Auto, 1 = Claro, 2 = Escuro
 
     // Chaves de Seguranca
     private const val KEY_AUTH_ENABLED = "web_auth_enabled"
     private const val KEY_TWO_FACTOR_ENABLED = "web_2fa_enabled"
     private const val KEY_PIN_HASH = "web_pin_sha256"
+
+    private val DEFAULT_PRESETS = listOf("Vistoria_", "Entrada_", "Saida_", "Avaria_", "Doc_")
 
     private val _isServiceRunning = MutableStateFlow(false)
     val isServiceRunning: StateFlow<Boolean> = _isServiceRunning.asStateFlow()
@@ -37,8 +51,14 @@ object SettingsManager {
     private val _activePrefix = MutableStateFlow("Vistoria_")
     val activePrefix: StateFlow<String> = _activePrefix.asStateFlow()
 
+    private val _quickPresets = MutableStateFlow(DEFAULT_PRESETS)
+    val quickPresets: StateFlow<List<String>> = _quickPresets.asStateFlow()
+
     private val _activeFolderPath = MutableStateFlow(getDefaultFolderPath())
     val activeFolderPath: StateFlow<String> = _activeFolderPath.asStateFlow()
+
+    private val _themeMode = MutableStateFlow(0)
+    val themeMode: StateFlow<Int> = _themeMode.asStateFlow()
 
     // Estados de Seguranca em Tempo Real (2FA e Sessoes)
     private val _current2faCode = MutableStateFlow<String?>(null)
@@ -64,6 +84,24 @@ object SettingsManager {
     fun syncStateFromPrefs(context: Context) {
         _activePrefix.value = getPrefix(context)
         _activeFolderPath.value = getTargetFolderPath(context)
+        _quickPresets.value = getQuickPresets(context)
+        _themeMode.value = getThemeMode(context)
+    }
+
+    fun getThemeMode(context: Context): Int {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val mode = prefs.getInt(KEY_THEME_MODE, 0)
+        _themeMode.value = mode
+        return mode
+    }
+
+    fun setThemeMode(context: Context, mode: Int) {
+        val validMode = mode.coerceIn(0, 2)
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_THEME_MODE, validMode)
+            .apply()
+        _themeMode.value = validMode
     }
 
     fun setServiceRunning(running: Boolean) {
@@ -114,6 +152,44 @@ object SettingsManager {
         _activePrefix.value = sanitized
     }
 
+    fun getQuickPresets(context: Context): List<String> {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val raw = prefs.getString(KEY_QUICK_PRESETS, null)
+        if (raw.isNullOrBlank()) {
+            _quickPresets.value = DEFAULT_PRESETS
+            return DEFAULT_PRESETS
+        }
+        val list = raw.split("|").map { it.trim() }.filter { it.isNotEmpty() }
+        val finalList = if (list.isEmpty()) DEFAULT_PRESETS else list
+        _quickPresets.value = finalList
+        return finalList
+    }
+
+    fun addQuickPreset(context: Context, preset: String) {
+        val sanitized = preset.trim().replace(Regex("[\\\\/:*?\"<>||]"), "_")
+        if (sanitized.isEmpty()) return
+        val current = getQuickPresets(context).toMutableList()
+        current.remove(sanitized)
+        current.add(0, sanitized)
+        val updated = current.take(12)
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_QUICK_PRESETS, updated.joinToString("|"))
+            .apply()
+        _quickPresets.value = updated
+    }
+
+    fun removeQuickPreset(context: Context, preset: String) {
+        val current = getQuickPresets(context).toMutableList()
+        current.remove(preset)
+        val updated = if (current.isEmpty()) DEFAULT_PRESETS else current
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_QUICK_PRESETS, updated.joinToString("|"))
+            .apply()
+        _quickPresets.value = updated
+    }
+
     fun getTargetFolderPath(context: Context): String {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val saved = prefs.getString(KEY_TARGET_PATH, null)
@@ -144,7 +220,7 @@ object SettingsManager {
         if (!list.contains(current)) {
             list.add(0, current)
         }
-        return list.take(5)
+        return list.take(6)
     }
 
     private fun addRecentFolder(context: Context, path: String) {
@@ -152,7 +228,7 @@ object SettingsManager {
         val raw = prefs.getString(KEY_RECENT_PATHS, "") ?: ""
         val currentList = raw.split("|").filter { it.isNotBlank() && it != path }.toMutableList()
         currentList.add(0, path)
-        val joined = currentList.take(5).joinToString("|")
+        val joined = currentList.take(6).joinToString("|")
         prefs.edit().putString(KEY_RECENT_PATHS, joined).apply()
     }
 
@@ -185,7 +261,6 @@ object SettingsManager {
         return prefs.getInt(KEY_SERVER_PORT, 8080)
     }
 
-    // Configuracoes de Seguranca (PIN + 2FA)
     fun isWebAuthEnabled(context: Context): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return prefs.getBoolean(KEY_AUTH_ENABLED, true)
@@ -234,6 +309,28 @@ object SettingsManager {
     private fun sha256(input: String): String {
         val bytes = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
         return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    fun getStorageStats(): StorageStats {
+        return try {
+            val stat = StatFs(Environment.getExternalStorageDirectory().path)
+            val total = stat.totalBytes
+            val free = stat.availableBytes
+            val used = (total - free).coerceAtLeast(0L)
+            val percent = if (total > 0) ((used * 100L) / total).toInt().coerceIn(0, 100) else 0
+            val usedGb = String.format(Locale.US, "%.1f GB", used / (1024.0 * 1024.0 * 1024.0))
+            val freeGb = String.format(Locale.US, "%.1f GB", free / (1024.0 * 1024.0 * 1024.0))
+            val totalGb = String.format(Locale.US, "%.1f GB", total / (1024.0 * 1024.0 * 1024.0))
+            StorageStats(
+                totalBytes = total,
+                freeBytes = free,
+                usedBytes = used,
+                usedPercent = percent,
+                formattedSummary = "$usedGb usados de $totalGb ($freeGb livres)"
+            )
+        } catch (e: Exception) {
+            StorageStats(0L, 0L, 0L, 0, "Armazenamento interno disponível")
+        }
     }
 
     fun formatShortPath(fullPath: String): String {
