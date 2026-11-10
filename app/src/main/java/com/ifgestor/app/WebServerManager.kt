@@ -103,14 +103,21 @@ private data class AuthSession(
     val token: String,
     val csrfToken: String,
     val clientIp: String,
-    var lastActivityMs: Long
+    var lastActivityMs: Long,
+    var elevatedUntilMs: Long = 0L
 )
 
 private data class Pending2FA(
     val tempToken: String,
     val code: String,
     val clientIp: String,
+    val actionDesc: String,
     val expiresAtMs: Long
+)
+
+private data class BatchOpGrant(
+    val opToken: String,
+    var lastChunkActivityMs: Long
 )
 
 private data class BruteForceRecord(
@@ -127,19 +134,25 @@ private class PhoneHttpServer(
     private val secureRandom = SecureRandom()
 
     private val activeSessions = ConcurrentHashMap<String, AuthSession>()
-    private val pending2faMap = ConcurrentHashMap<String, Pending2FA>()
+    private val pendingLogin2faMap = ConcurrentHashMap<String, Pending2FA>()
+    private val pendingAction2faMap = ConcurrentHashMap<String, Pending2FA>()
+    private val activeBatchGrants = ConcurrentHashMap<String, BatchOpGrant>()
     private val bruteForceMap = ConcurrentHashMap<String, BruteForceRecord>()
 
     companion object {
-        private const val SESSION_TIMEOUT_MS = 30 * 60 * 1000L // 30 minutos
-        private const val TWO_FA_EXPIRY_MS = 2 * 60 * 1000L    // 2 minutos
+        private const val SESSION_TIMEOUT_MS = 30 * 60 * 1000L
+        private const val TWO_FA_EXPIRY_MS = 2 * 60 * 1000L
+        private const val ELEVATED_WINDOW_MS = 5 * 60 * 1000L
+        private const val BATCH_GRANT_IDLE_MS = 10 * 60 * 1000L
         private const val MAX_ATTEMPTS = 5
-        private const val LOCKOUT_DURATION_MS = 5 * 60 * 1000L // 5 minutos
+        private const val LOCKOUT_DURATION_MS = 5 * 60 * 1000L
     }
 
     fun clearAllSessions() {
         activeSessions.clear()
-        pending2faMap.clear()
+        pendingLogin2faMap.clear()
+        pendingAction2faMap.clear()
+        activeBatchGrants.clear()
         SettingsManager.publishTwoFactorCode(null, null)
         SettingsManager.updateActiveSessionsCount(0)
     }
@@ -162,11 +175,15 @@ private class PhoneHttpServer(
             )
         }
 
+        // Rotas de Login Inicial (PIN + 2FA de Entrada)
         if (uri == "/auth/pin" && session.method == Method.POST) {
             return secureResponse(handlePinSubmission(params, clientIp))
         }
         if (uri == "/auth/2fa" && session.method == Method.POST) {
-            return secureResponse(handle2faSubmission(params, clientIp))
+            return secureResponse(handleLogin2faSubmission(params, clientIp))
+        }
+        if (uri == "/auth/check_login_2fa") {
+            return secureResponse(handleCheckLogin2faPolling(params, clientIp))
         }
         if (uri == "/auth/logout") {
             return secureResponse(handleLogout(session))
@@ -177,8 +194,8 @@ private class PhoneHttpServer(
             val step = params["step"]
             val tempToken = params["temp"] ?: ""
             val errorMsg = params["err"]
-            val pageHtml = if (step == "2fa" && pending2faMap.containsKey(tempToken)) {
-                render2faPage(tempToken, errorMsg)
+            val pageHtml = if (step == "2fa" && pendingLogin2faMap.containsKey(tempToken)) {
+                render2faLoginPage(tempToken, errorMsg)
             } else {
                 renderPinLoginPage(errorMsg)
             }
@@ -189,24 +206,48 @@ private class PhoneHttpServer(
 
         return try {
             val response = when {
+                uri == "/dirs" -> handleListDirectoriesJson(params)
+                uri == "/action/request_2fa" && session.method == Method.POST -> {
+                    if (!verifyCsrf(session, params, authSession)) {
+                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "CSRF invalido")
+                    } else {
+                        handleRequestAction2fa(params, clientIp, authSession)
+                    }
+                }
+                uri == "/action/verify_2fa" && session.method == Method.POST -> {
+                    if (!verifyCsrf(session, params, authSession)) {
+                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "CSRF invalido")
+                    } else {
+                        handleVerifyAction2fa(params, clientIp, authSession)
+                    }
+                }
+                uri == "/action/lock_window" && session.method == Method.POST -> {
+                    authSession?.elevatedUntilMs = 0L
+                    activeBatchGrants.clear()
+                    newFixedLengthResponse(Response.Status.OK, "application/json", """{"locked":true}""")
+                }
                 uri == "/upload" && session.method == Method.POST -> {
                     if (!verifyCsrf(session, params, authSession)) {
-                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "Token CSRF invalido")
+                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "CSRF invalido")
+                    } else if (!verifyOperationAuthorized(session, params, authSession)) {
+                        newFixedLengthResponse(Response.Status.UNAUTHORIZED, MIME_PLAINTEXT, "2FA_REQUIRED")
                     } else {
-                        handleFileUpload(session, params)
+                        handleFileUpload(session, params, authSession)
                     }
                 }
                 uri == "/action" && session.method == Method.POST -> {
                     if (!verifyCsrf(session, params, authSession)) {
-                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "Token CSRF invalido")
+                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "CSRF invalido")
+                    } else if (!verifyOperationAuthorized(session, params, authSession)) {
+                        newFixedLengthResponse(Response.Status.UNAUTHORIZED, MIME_PLAINTEXT, "2FA_REQUIRED")
                     } else {
                         val bodyText = readUtf8Body(session)
-                        handleFileAction(params, bodyText)
+                        handleFileAction(params, bodyText, authSession)
                     }
                 }
                 uri == "/file" -> handleFileStream(session, params)
                 uri == "/zip" -> handleFolderZipDownload(params)
-                else -> renderExplorerPage(params["dir"], csrfToken)
+                else -> renderExplorerPage(params["dir"], csrfToken, authSession)
             }
             secureResponse(response)
         } catch (e: Exception) {
@@ -218,6 +259,166 @@ private class PhoneHttpServer(
                 )
             )
         }
+    }
+
+    // Verifica se a operacao possui um BatchOpGrant ativo ou se esta na Janela Deslizante de 5 min
+    private fun verifyOperationAuthorized(
+        session: IHTTPSession,
+        params: Map<String, String>,
+        authSession: AuthSession?
+    ): Boolean {
+        val now = System.currentTimeMillis()
+        val opToken = session.headers["x-op-token"] ?: params["opToken"] ?: ""
+
+        if (opToken.isNotBlank()) {
+            val grant = activeBatchGrants[opToken]
+            if (grant != null && (now - grant.lastChunkActivityMs) <= BATCH_GRANT_IDLE_MS) {
+                // Renova o token do lote a cada arquivo transferido (nunca interrompe lotes longos!)
+                grant.lastChunkActivityMs = now
+                if (authSession != null && authSession.elevatedUntilMs > now) {
+                    authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
+                }
+                return true
+            }
+        }
+
+        if (authSession != null && authSession.elevatedUntilMs > now) {
+            // Janela deslizante: renova +5 min enquanto o usuario estiver operando ativamente
+            authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
+            return true
+        }
+
+        return false
+    }
+
+    private fun handleRequestAction2fa(
+        params: Map<String, String>,
+        clientIp: String,
+        authSession: AuthSession?
+    ): Response {
+        val now = System.currentTimeMillis()
+        // Se a janela deslizante de 5 min ja estiver ativa, libera o opToken imediatamente
+        if (authSession != null && authSession.elevatedUntilMs > now) {
+            authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
+            val opToken = issueBatchOpGrant()
+            val remSec = ((authSession.elevatedUntilMs - now) / 1000).coerceAtLeast(1)
+            return newFixedLengthResponse(
+                Response.Status.OK,
+                "application/json",
+                """{"status":"already_authorized","opToken":"$opToken","remainingSeconds":$remSec}"""
+            )
+        }
+
+        val actionDesc = (params["desc"] ?: "Operação de Arquivo no PC").trim()
+        val code6Digits = String.format(Locale.US, "%06d", secureRandom.nextInt(1_000_000))
+        val reqId = generateRandomHex(16)
+
+        pendingAction2faMap[reqId] = Pending2FA(
+            tempToken = reqId,
+            code = code6Digits,
+            clientIp = clientIp,
+            actionDesc = actionDesc,
+            expiresAtMs = now + TWO_FA_EXPIRY_MS
+        )
+
+        SettingsManager.publishTwoFactorCode(code6Digits, clientIp, actionDesc)
+
+        return newFixedLengthResponse(
+            Response.Status.OK,
+            "application/json",
+            """{"status":"pending","reqId":"$reqId"}"""
+        )
+    }
+
+    private fun handleVerifyAction2fa(
+        params: Map<String, String>,
+        clientIp: String,
+        authSession: AuthSession?
+    ): Response {
+        val reqId = params["reqId"] ?: ""
+        val inputCode = (params["code"] ?: "").trim()
+        val keep5Min = params["keep5m"] == "1"
+        val mode = params["mode"] ?: "manual" // "manual" ou "poll"
+
+        val pending = pendingAction2faMap[reqId]
+        val now = System.currentTimeMillis()
+
+        if (pending == null || now > pending.expiresAtMs) {
+            pendingAction2faMap.remove(reqId)
+            return newFixedLengthResponse(
+                Response.Status.OK,
+                "application/json",
+                """{"status":"expired"}"""
+            )
+        }
+
+        val approvedByPhoneButton = SettingsManager.isCodeApprovedByPhone(pending.code)
+        val approvedByTypedCode = inputCode.isNotEmpty() && pending.code == inputCode
+
+        if (!approvedByPhoneButton && !approvedByTypedCode) {
+            if (mode == "manual") {
+                registerAuthFailure(clientIp)
+                return newFixedLengthResponse(
+                    Response.Status.OK,
+                    "application/json",
+                    """{"status":"invalid_code"}"""
+                )
+            }
+            return newFixedLengthResponse(
+                Response.Status.OK,
+                "application/json",
+                """{"status":"waiting"}"""
+            )
+        }
+
+        // Autorizado com sucesso (pelo codigo digitado ou pelo botao da notificacao)!
+        pendingAction2faMap.remove(reqId)
+        SettingsManager.consumeApprovedCode(pending.code)
+        resetAuthFailures(clientIp)
+
+        if (keep5Min && authSession != null) {
+            authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
+        }
+
+        val opToken = issueBatchOpGrant()
+        val remSec = if (authSession != null && authSession.elevatedUntilMs > now) {
+            ((authSession.elevatedUntilMs - now) / 1000).coerceAtLeast(0)
+        } else 0L
+
+        return newFixedLengthResponse(
+            Response.Status.OK,
+            "application/json",
+            """{"status":"approved","opToken":"$opToken","remainingSeconds":$remSec}"""
+        )
+    }
+
+    private fun issueBatchOpGrant(): String {
+        val token = generateRandomHex(24)
+        activeBatchGrants[token] = BatchOpGrant(
+            opToken = token,
+            lastChunkActivityMs = System.currentTimeMillis()
+        )
+        return token
+    }
+
+    private fun handleListDirectoriesJson(params: Map<String, String>): Response {
+        val dir = sanitizeFile(params["dir"])
+        val rootFile = File(rootStoragePath).canonicalFile
+        val parentPath = if (dir.canonicalPath != rootFile.path) {
+            dir.parentFile?.canonicalPath ?: ""
+        } else ""
+
+        val subDirs = dir.listFiles()
+            ?.filter { it.isDirectory && !it.name.startsWith(".") }
+            ?.sortedBy { it.name.lowercase() }
+            ?: emptyList()
+
+        val itemsJson = subDirs.joinToString(",") { folder ->
+            """{"name":"${escapeJs(folder.name)}","path":"${escapeJs(folder.absolutePath)}"}"""
+        }
+
+        val json = """{"currentPath":"${escapeJs(dir.absolutePath)}","shortPath":"${escapeJs(SettingsManager.formatShortPath(dir.absolutePath))}","parentPath":"${escapeJs(parentPath)}","folders":[$itemsJson]}"""
+        return newFixedLengthResponse(Response.Status.OK, "application/json", json)
     }
 
     private fun readUtf8Body(session: IHTTPSession): String {
@@ -280,13 +481,14 @@ private class PhoneHttpServer(
         if (SettingsManager.isTwoFactorEnabled(context)) {
             val code6Digits = String.format(Locale.US, "%06d", secureRandom.nextInt(1_000_000))
             val tempToken = generateRandomHex(24)
-            pending2faMap[tempToken] = Pending2FA(
+            pendingLogin2faMap[tempToken] = Pending2FA(
                 tempToken = tempToken,
                 code = code6Digits,
                 clientIp = clientIp,
+                actionDesc = "Login no Gerenciador Web",
                 expiresAtMs = System.currentTimeMillis() + TWO_FA_EXPIRY_MS
             )
-            SettingsManager.publishTwoFactorCode(code6Digits, clientIp)
+            SettingsManager.publishTwoFactorCode(code6Digits, clientIp, "Login no Gerenciador Web")
 
             val res = newFixedLengthResponse(Response.Status.REDIRECT, MIME_HTML, "")
             res.addHeader("Location", "/?step=2fa&temp=$tempToken")
@@ -296,28 +498,54 @@ private class PhoneHttpServer(
         return createAuthenticatedSessionResponse(clientIp)
     }
 
-    private fun handle2faSubmission(params: Map<String, String>, clientIp: String): Response {
+    private fun handleCheckLogin2faPolling(params: Map<String, String>, clientIp: String): Response {
+        val tempToken = params["temp"] ?: ""
+        val pending = pendingLogin2faMap[tempToken]
+        if (pending == null || System.currentTimeMillis() > pending.expiresAtMs) {
+            return newFixedLengthResponse(Response.Status.OK, "application/json", """{"approved":false,"expired":true}""")
+        }
+        if (SettingsManager.isCodeApprovedByPhone(pending.code)) {
+            pendingLogin2faMap.remove(tempToken)
+            SettingsManager.consumeApprovedCode(pending.code)
+            resetAuthFailures(clientIp)
+            val sessionToken = generateRandomHex(32)
+            val csrfToken = generateRandomHex(24)
+            activeSessions[sessionToken] = AuthSession(
+                token = sessionToken,
+                csrfToken = csrfToken,
+                clientIp = clientIp,
+                lastActivityMs = System.currentTimeMillis()
+            )
+            SettingsManager.updateActiveSessionsCount(activeSessions.size)
+            val res = newFixedLengthResponse(Response.Status.OK, "application/json", """{"approved":true}""")
+            res.addHeader("Set-Cookie", "IFG_SESSION=$sessionToken; Path=/; HttpOnly; SameSite=Strict")
+            return res
+        }
+        return newFixedLengthResponse(Response.Status.OK, "application/json", """{"approved":false}""")
+    }
+
+    private fun handleLogin2faSubmission(params: Map<String, String>, clientIp: String): Response {
         val tempToken = params["temp"] ?: ""
         val inputCode = (params["code"] ?: "").trim()
-        val pending = pending2faMap[tempToken]
+        val pending = pendingLogin2faMap[tempToken]
 
         if (pending == null || System.currentTimeMillis() > pending.expiresAtMs) {
-            pending2faMap.remove(tempToken)
+            pendingLogin2faMap.remove(tempToken)
             SettingsManager.publishTwoFactorCode(null, null)
             val res = newFixedLengthResponse(Response.Status.REDIRECT, MIME_HTML, "")
             res.addHeader("Location", "/?err=expired")
             return res
         }
 
-        if (pending.code != inputCode) {
+        if (pending.code != inputCode && !SettingsManager.isCodeApprovedByPhone(pending.code)) {
             registerAuthFailure(clientIp)
             val res = newFixedLengthResponse(Response.Status.REDIRECT, MIME_HTML, "")
             res.addHeader("Location", "/?step=2fa&temp=$tempToken&err=2fa")
             return res
         }
 
-        pending2faMap.remove(tempToken)
-        SettingsManager.publishTwoFactorCode(null, null)
+        pendingLogin2faMap.remove(tempToken)
+        SettingsManager.consumeApprovedCode(pending.code)
         resetAuthFailures(clientIp)
         return createAuthenticatedSessionResponse(clientIp)
     }
@@ -409,10 +637,41 @@ private class PhoneHttpServer(
         return if (candidate.path.startsWith(rootFile.path)) candidate else rootFile
     }
 
-    private fun handleFileAction(params: Map<String, String>, bodyText: String): Response {
+    private fun moveFileOrDirectorySafely(source: File, destDir: File): Boolean {
+        if (!source.exists() || source.absolutePath == rootStoragePath) return false
+        if (!destDir.exists()) destDir.mkdirs()
+        val targetFile = File(destDir, source.name)
+        if (source.canonicalPath == targetFile.canonicalPath) return false
+        if (source.isDirectory && targetFile.canonicalPath.startsWith(source.canonicalPath + File.separator)) {
+            return false
+        }
+        return if (source.renameTo(targetFile)) {
+            true
+        } else {
+            try {
+                if (source.isDirectory) {
+                    source.copyRecursively(targetFile, overwrite = true)
+                    source.deleteRecursively()
+                } else {
+                    source.copyTo(targetFile, overwrite = true)
+                    source.delete()
+                }
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
+    private fun handleFileAction(
+        params: Map<String, String>,
+        bodyText: String,
+        authSession: AuthSession?
+    ): Response {
         val cmd = params["cmd"] ?: ""
         val currentDir = sanitizeFile(params["dir"])
         val targetPath = params["target"]
+        val destPath = params["dest"]
 
         when (cmd) {
             "mkdir" -> {
@@ -436,6 +695,36 @@ private class PhoneHttpServer(
                             null,
                             null
                         )
+                    }
+                }
+            }
+            "move" -> {
+                if (!targetPath.isNullOrBlank() && !destPath.isNullOrBlank()) {
+                    val src = sanitizeFile(targetPath)
+                    val dstDir = sanitizeFile(destPath)
+                    val oldPath = src.absolutePath
+                    if (moveFileOrDirectorySafely(src, dstDir)) {
+                        val newPath = File(dstDir, src.name).absolutePath
+                        MediaScannerConnection.scanFile(context, arrayOf(oldPath, newPath), null, null)
+                    }
+                }
+            }
+            "batch_move" -> {
+                if (!destPath.isNullOrBlank()) {
+                    val dstDir = sanitizeFile(destPath)
+                    val rawList = if (bodyText.isNotBlank()) bodyText else (params["targets"] ?: "")
+                    val names = rawList.split("|").map { it.trim() }.filter { it.isNotEmpty() }
+                    val scannedPaths = mutableListOf<String>()
+                    for (name in names) {
+                        val src = sanitizeFile(File(currentDir, name).absolutePath)
+                        val oldPath = src.absolutePath
+                        if (moveFileOrDirectorySafely(src, dstDir)) {
+                            scannedPaths.add(oldPath)
+                            scannedPaths.add(File(dstDir, src.name).absolutePath)
+                        }
+                    }
+                    if (scannedPaths.isNotEmpty()) {
+                        MediaScannerConnection.scanFile(context, scannedPaths.toTypedArray(), null, null)
                     }
                 }
             }
@@ -465,24 +754,20 @@ private class PhoneHttpServer(
                     MediaScannerConnection.scanFile(context, deletedPaths.toTypedArray(), null, null)
                 }
             }
-            "set_camera" -> {
-                if (currentDir.exists() && currentDir.isDirectory) {
-                    SettingsManager.setTargetFolderPath(context, currentDir.absolutePath)
-                }
-            }
-            "set_prefix" -> {
-                val newPrefix = (params["name"] ?: "").trim()
-                SettingsManager.setPrefix(context, newPrefix)
-                if (newPrefix.isNotEmpty()) {
-                    SettingsManager.addQuickPreset(context, newPrefix)
-                }
-            }
+        }
+
+        if (authSession != null && authSession.elevatedUntilMs > System.currentTimeMillis()) {
+            authSession.elevatedUntilMs = System.currentTimeMillis() + ELEVATED_WINDOW_MS
         }
 
         return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "OK")
     }
 
-    private fun handleFileUpload(session: IHTTPSession, params: Map<String, String>): Response {
+    private fun handleFileUpload(
+        session: IHTTPSession,
+        params: Map<String, String>,
+        authSession: AuthSession?
+    ): Response {
         val targetDir = sanitizeFile(params["dir"])
         if (!targetDir.exists()) targetDir.mkdirs()
 
@@ -495,6 +780,9 @@ private class PhoneHttpServer(
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Arquivo vazio")
         }
 
+        val opToken = session.headers["x-op-token"] ?: params["opToken"] ?: ""
+        val grant = if (opToken.isNotBlank()) activeBatchGrants[opToken] else null
+
         FileOutputStream(destFile).use { output ->
             val buffer = ByteArray(16 * 1024)
             var remaining = contentLength
@@ -505,6 +793,13 @@ private class PhoneHttpServer(
                 if (read == -1) break
                 output.write(buffer, 0, read)
                 remaining -= read
+
+                // Mantem o token do lote e a janela deslizante vivos durante transferencias grandes
+                val now = System.currentTimeMillis()
+                grant?.lastChunkActivityMs = now
+                if (authSession != null && authSession.elevatedUntilMs > 0L) {
+                    authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
+                }
             }
             output.flush()
         }
@@ -611,6 +906,28 @@ private class PhoneHttpServer(
         return res
     }
 
+    private fun getBrandLogoSvg(sizePx: Int = 56, animatedClass: String = ""): String {
+        return """
+            <svg width="$sizePx" height="$sizePx" viewBox="0 0 108 108" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <rect x="4" y="4" width="100" height="100" rx="22" fill="#0B1120" stroke="#1E293B" stroke-width="2"/>
+                <path d="M54 14L86 26V52C86 73 72 88 54 95C36 88 22 73 22 52V26L54 14Z" fill="#38BDF8"/>
+                <path d="M54 18L82 28.5V52C82 70.5 69.5 84 54 90.5C38.5 84 26 70.5 26 52V28.5L54 18Z" fill="#0F2942"/>
+                <path d="M34 35H46L51 40H74C75.65 40 77 41.35 77 43V69C77 71.2 75.2 73 73 73H35C32.8 73 31 71.2 31 69V38C31 36.35 32.35 35 34 35Z" fill="#0284C7"/>
+                <path d="M34 35H46L50 39H31V38C31 36.35 32.35 35 34 35Z" fill="#38BDF8"/>
+                <g class="$animatedClass" style="transform-origin: 54px 56px;">
+                    <circle cx="54" cy="56" r="15" fill="#0B1120"/>
+                    <circle cx="54" cy="56" r="12.5" fill="#10B981"/>
+                    <circle cx="54" cy="56" r="10.5" fill="#0F2942"/>
+                    <path d="M54 47L61.5 50.5L56 54.5Z" fill="#10B981"/>
+                    <path d="M63 56L59.5 63.5L55.5 58Z" fill="#38BDF8"/>
+                    <path d="M54 65L46.5 61.5L52 57.5Z" fill="#10B981"/>
+                    <path d="M45 56L48.5 48.5L52.5 54Z" fill="#38BDF8"/>
+                    <circle cx="54" cy="56" r="2" fill="#F8FAFC"/>
+                </g>
+            </svg>
+        """.trimIndent()
+    }
+
     private fun renderPinLoginPage(errorType: String?): String {
         val errBanner = when (errorType) {
             "pin" -> """<div class="err">❌ PIN incorreto. Verifique no aplicativo IFGestor.</div>"""
@@ -623,30 +940,32 @@ private class PhoneHttpServer(
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>IFGestor — Portal Corporativo Seguro</title>
+                <title>IFGestor — Gerenciador de Arquivos Seguro</title>
                 <style>
                     * { box-sizing: border-box; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
-                    body { margin: 0; background: radial-gradient(circle at top, #0f2942 0%, #090d16 100%); color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; padding: 16px; }
-                    .box { background: rgba(30, 41, 59, 0.92); border: 1px solid #334155; padding: 36px 32px; border-radius: 20px; width: 100%; max-width: 400px; text-align: center; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.65); }
-                    .badge-top { display: inline-block; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 5px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 14px; }
+                    body { margin: 0; background: radial-gradient(circle at top, #0f2942 0%, #070b14 100%); color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; padding: 16px; }
+                    .box { background: rgba(21, 31, 50, 0.94); border: 1px solid #2e3f59; padding: 36px 32px; border-radius: 22px; width: 100%; max-width: 400px; text-align: center; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.7); }
+                    .logo-wrap { margin-bottom: 14px; display: inline-flex; animation: pulseIn 0.8s ease-out; }
+                    @keyframes pulseIn { from { transform: scale(0.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+                    .badge-top { display: inline-block; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 5px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 12px; }
                     h2 { margin: 0 0 8px; color: #f8fafc; font-size: 22px; }
                     p { font-size: 13px; color: #94a3b8; margin-bottom: 24px; line-height: 1.5; }
-                    input { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid #475569; background: #0f172a; color: #38bdf8; font-size: 22px; font-weight: 700; text-align: center; letter-spacing: 8px; margin-bottom: 18px; outline: none; }
+                    input { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid #475569; background: #0b1120; color: #38bdf8; font-size: 22px; font-weight: 700; text-align: center; letter-spacing: 8px; margin-bottom: 18px; outline: none; }
                     input:focus { border-color: #38bdf8; }
-                    button { width: 100%; padding: 14px; background: linear-gradient(135deg, #0284c7, #2563eb); color: #fff; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; transition: opacity 0.15s; }
-                    button:hover { opacity: 0.92; }
+                    button { width: 100%; padding: 14px; background: linear-gradient(135deg, #0284c7, #10b981); color: #fff; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; }
                     .err { background: rgba(127, 29, 29, 0.85); border: 1px solid #ef4444; color: #fecaca; padding: 11px; border-radius: 10px; font-size: 13px; margin-bottom: 18px; }
                 </style>
             </head>
             <body>
                 <div class="box">
-                    <div class="badge-top">🛡️ SEGURANÇA CORPORATIVA</div>
+                    <div class="logo-wrap">${getBrandLogoSvg(76)}</div><br>
+                    <div class="badge-top">🛡️ ACESSO CORPORATIVO PROTEGIDO</div>
                     <h2>IFGestor Web</h2>
-                    <p>Insira o PIN de segurança configurado na aba <strong>Acesso no PC</strong> do seu smartphone (Padrão: 1234)</p>
+                    <p>Digite o PIN configurado na aba <strong>Servidor PC</strong> do seu celular (Padrão: 1234)</p>
                     $errBanner
                     <form id="pinForm">
                         <input type="password" id="pinInput" placeholder="••••" required autofocus>
-                        <button type="submit">Autenticar Acesso</button>
+                        <button type="submit">Continuar para 2ª Etapa</button>
                     </form>
                 </div>
                 <script>
@@ -666,7 +985,7 @@ private class PhoneHttpServer(
         """.trimIndent()
     }
 
-    private fun render2faPage(tempToken: String, errorType: String?): String {
+    private fun render2faLoginPage(tempToken: String, errorType: String?): String {
         val errBanner = if (errorType == "2fa") {
             """<div class="err">❌ Código de verificação inválido.</div>"""
         } else ""
@@ -680,39 +999,50 @@ private class PhoneHttpServer(
                 <title>IFGestor — Verificação em 2 Etapas</title>
                 <style>
                     * { box-sizing: border-box; font-family: 'Inter', system-ui, sans-serif; }
-                    body { margin: 0; background: radial-gradient(circle at top, #0f2942 0%, #090d16 100%); color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; padding: 16px; }
-                    .box { background: rgba(30, 41, 59, 0.94); border: 1px solid #334155; padding: 36px 32px; border-radius: 20px; width: 100%; max-width: 420px; text-align: center; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.65); }
+                    body { margin: 0; background: radial-gradient(circle at top, #0f2942 0%, #070b14 100%); color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; padding: 16px; }
+                    .box { background: rgba(21, 31, 50, 0.94); border: 1px solid #2e3f59; padding: 36px 32px; border-radius: 22px; width: 100%; max-width: 420px; text-align: center; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.7); }
                     .badge-top { display: inline-block; background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.35); padding: 5px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; margin-bottom: 14px; }
                     h2 { margin: 0 0 8px; color: #f8fafc; font-size: 22px; }
-                    p { font-size: 13px; color: #cbd5e1; margin-bottom: 22px; line-height: 1.5; }
-                    input { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid #475569; background: #0f172a; color: #10b981; font-size: 26px; font-weight: 800; text-align: center; letter-spacing: 10px; margin-bottom: 18px; outline: none; }
+                    p { font-size: 13px; color: #cbd5e1; margin-bottom: 20px; line-height: 1.5; }
+                    input { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid #475569; background: #0b1120; color: #10b981; font-size: 26px; font-weight: 800; text-align: center; letter-spacing: 10px; margin-bottom: 18px; outline: none; }
                     button { width: 100%; padding: 14px; background: #10b981; color: #fff; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; }
-                    button:hover { background: #059669; }
                     .err { background: rgba(127, 29, 29, 0.85); border: 1px solid #ef4444; color: #fecaca; padding: 11px; border-radius: 10px; font-size: 13px; margin-bottom: 18px; }
                 </style>
             </head>
             <body>
                 <div class="box">
+                    <div style="margin-bottom:12px;">${getBrandLogoSvg(64)}</div>
                     <div class="badge-top">📲 2ª ETAPA DE SEGURANÇA (2FA)</div>
-                    <h2>Confirme o Código</h2>
-                    <p>Digite o código único de <strong>6 dígitos</strong> exibido agora na notificação ou no painel do seu celular:</p>
+                    <h2>Autorize no Celular</h2>
+                    <p>Toque em <strong>"✓ Aprovar Agora"</strong> na notificação do seu celular ou digite abaixo o código de <strong>6 dígitos</strong>:</p>
                     $errBanner
                     <form id="twoFaForm">
                         <input type="text" id="codeInput" maxlength="6" placeholder="000000" required autofocus>
-                        <button type="submit">Liberar Painel de Arquivos</button>
+                        <button type="submit">Liberar Gerenciador de Arquivos</button>
                     </form>
                 </div>
                 <script>
+                    const tempToken = "${escapeJs(tempToken)}";
                     document.getElementById('twoFaForm').onsubmit = async function(e) {
                         e.preventDefault();
                         const code = document.getElementById('codeInput').value;
-                        const resp = await fetch('/auth/2fa?temp=${escapeJs(tempToken)}&code=' + encodeURIComponent(code), { method: 'POST' });
+                        const resp = await fetch('/auth/2fa?temp=' + encodeURIComponent(tempToken) + '&code=' + encodeURIComponent(code), { method: 'POST' });
                         if (resp.redirected) {
                             window.location.href = resp.url;
                         } else {
                             window.location.reload();
                         }
                     };
+                    // Verifica automaticamente se o usuario clicou em "Aprovar Agora" na notificacao do celular
+                    setInterval(async () => {
+                        try {
+                            const r = await fetch('/auth/check_login_2fa?temp=' + encodeURIComponent(tempToken));
+                            const data = await r.json();
+                            if (data.approved) {
+                                window.location.href = '/';
+                            }
+                        } catch (_) {}
+                    }, 1200);
                 </script>
             </body>
             </html>
@@ -724,8 +1054,8 @@ private class PhoneHttpServer(
             <!DOCTYPE html>
             <html lang="pt-BR">
             <head><meta charset="UTF-8"><title>Acesso Temporariamente Bloqueado</title></head>
-            <body style="background:#090d16;color:#f8fafc;font-family:sans-serif;display:flex;height:100vh;align-items:center;justify-content:center;text-align:center;padding:16px;">
-                <div style="background:#1e293b;border:1px solid #ef4444;padding:32px;border-radius:18px;max-width:420px;">
+            <body style="background:#070b14;color:#f8fafc;font-family:sans-serif;display:flex;height:100vh;align-items:center;justify-content:center;text-align:center;padding:16px;">
+                <div style="background:#151f32;border:1px solid #ef4444;padding:32px;border-radius:18px;max-width:420px;">
                     <h2 style="color:#ef4444;margin-top:0;">🛡️ Bloqueio Anti-Força Bruta</h2>
                     <p style="color:#cbd5e1;font-size:14px;">Foram detectadas muitas tentativas incorretas a partir deste computador.</p>
                     <p style="color:#f8fafc;font-size:15px;">Tente novamente em <strong>$remainingSeconds segundos</strong>.</p>
@@ -755,15 +1085,19 @@ private class PhoneHttpServer(
         return sb.toString()
     }
 
-    private fun renderExplorerPage(requestedDir: String?, csrfToken: String): Response {
+    private fun renderExplorerPage(
+        requestedDir: String?,
+        csrfToken: String,
+        authSession: AuthSession?
+    ): Response {
         val currentDir = sanitizeFile(requestedDir)
         if (!currentDir.exists()) currentDir.mkdirs()
 
-        val activeCameraDir = SettingsManager.getTargetFolderPath(context)
-        val activePrefix = SettingsManager.getPrefix(context)
-        val quickPresets = SettingsManager.getQuickPresets(context)
         val storageStats = SettingsManager.getStorageStats()
-        val isCurrentActiveCamera = currentDir.absolutePath == activeCameraDir
+        val now = System.currentTimeMillis()
+        val initialElevatedRemSec = if (authSession != null && authSession.elevatedUntilMs > now) {
+            ((authSession.elevatedUntilMs - now) / 1000).coerceAtLeast(0)
+        } else 0L
 
         val children = currentDir.listFiles()
             ?.filter { !it.name.startsWith(".") }
@@ -797,7 +1131,6 @@ private class PhoneHttpServer(
         }
         mediaItemsJsArray.append("]")
 
-        val presetsJsArray = quickPresets.joinToString(",", "[", "]") { "\"${escapeJs(it)}\"" }
         val breadcrumbsHtml = buildBreadcrumbsHtml(currentDir)
 
         val sb = StringBuilder()
@@ -808,7 +1141,7 @@ private class PhoneHttpServer(
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>IFGestor — Gestor de Fotos e Vídeos</title>
+                <title>IFGestor — Gerenciador de Arquivos</title>
                 <style>
                     :root {
                         --card-min: 220px;
@@ -837,14 +1170,26 @@ private class PhoneHttpServer(
                         --brand-danger: #dc2626;
                     }
                     * { box-sizing: border-box; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
-                    body { margin: 0; background: var(--bg-main); color: var(--text-primary); padding: 18px 18px 90px; transition: background 0.2s, color 0.2s; }
+                    body { margin: 0; background: var(--bg-main); color: var(--text-primary); padding: 18px 18px 95px; transition: background 0.2s, color 0.2s; }
                     .container { max-width: 1360px; margin: 0 auto; }
 
+                    /* Tela de Abertura Animada em Tela Cheia (Splash Screen Web) */
+                    .web-splash { position: fixed; inset: 0; background: radial-gradient(circle at center, #0f2942 0%, #060a12 100%); z-index: 15000; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: opacity 0.45s ease, visibility 0.45s ease; }
+                    .web-splash.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+                    .splash-ring { padding: 24px; border-radius: 50%; background: rgba(56, 189, 248, 0.06); border: 1px solid rgba(56, 189, 248, 0.2); animation: splashPulse 1.4s ease-out infinite alternate; }
+                    .spin-lens { animation: spinShutter 2.2s cubic-bezier(0.4, 0, 0.2, 1) infinite; }
+                    @keyframes spinShutter { 0% { transform: rotate(0deg) scale(0.92); } 50% { transform: rotate(180deg) scale(1.04); } 100% { transform: rotate(360deg) scale(0.92); } }
+                    @keyframes splashPulse { from { box-shadow: 0 0 15px rgba(56,189,248,0.15); } to { box-shadow: 0 0 40px rgba(16,185,129,0.35); } }
+                    .splash-title { margin: 18px 0 4px; font-size: 28px; font-weight: 800; color: #f8fafc; letter-spacing: 0.5px; }
+                    .splash-sub { margin: 0 0 22px; font-size: 13px; color: #94a3b8; }
+                    .splash-bar { width: 220px; height: 5px; background: #1e293b; border-radius: 8px; overflow: hidden; }
+                    .splash-bar-fill { width: 0%; height: 100%; background: linear-gradient(90deg, #38bdf8, #10b981); animation: loadProgress 1.25s ease-out forwards; }
+                    @keyframes loadProgress { to { width: 100%; } }
+
                     /* Cabecalho Corporativo */
-                    .header { background: var(--bg-surface); padding: 18px 22px; border-radius: 16px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; border: 1px solid var(--border-color); box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
-                    .brand-row { display: flex; align-items: center; gap: 12px; }
-                    .brand-logo { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, #0284c7, #0f2942); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: bold; }
-                    .title h1 { margin: 0; font-size: 20px; color: var(--text-primary); letter-spacing: -0.3px; }
+                    .header { background: var(--bg-surface); padding: 16px 22px; border-radius: 16px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; border: 1px solid var(--border-color); }
+                    .brand-row { display: flex; align-items: center; gap: 14px; }
+                    .title h1 { margin: 0; font-size: 20px; color: var(--text-primary); }
                     .title p { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); }
                     .storage-widget { min-width: 240px; background: var(--bg-elevated); padding: 10px 14px; border-radius: 12px; border: 1px solid var(--border-color); }
                     .storage-top { display: flex; justify-content: space-between; font-size: 11px; font-weight: 600; margin-bottom: 6px; color: var(--text-secondary); }
@@ -858,7 +1203,6 @@ private class PhoneHttpServer(
                     .crumb { color: var(--brand-accent); text-decoration: none; font-weight: 600; padding: 4px 8px; border-radius: 6px; }
                     .crumb:hover { background: var(--bg-elevated); }
                     .crumb-sep { color: var(--text-secondary); font-weight: bold; }
-                    .badge-active { background: var(--brand-success); color: #fff; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; }
 
                     .actions-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
                     .btn-cluster { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -867,7 +1211,6 @@ private class PhoneHttpServer(
                     .filter-bar { background: var(--bg-surface); padding: 12px 18px; border-radius: 14px; margin-bottom: 16px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; border: 1px solid var(--border-color); }
                     .search-box { flex: 1; min-width: 220px; position: relative; }
                     .search-box input { width: 100%; padding: 9px 14px 9px 36px; border-radius: 10px; border: 1px solid var(--border-color); background: var(--bg-main); color: var(--text-primary); font-size: 13px; outline: none; }
-                    .search-box input:focus { border-color: var(--brand-accent); }
                     .search-icon { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); font-size: 14px; color: var(--text-secondary); }
                     .pill-group { display: inline-flex; background: var(--bg-main); padding: 4px; border-radius: 10px; border: 1px solid var(--border-color); gap: 4px; flex-wrap: wrap; }
                     .pill-btn { background: transparent; color: var(--text-secondary); border: none; padding: 6px 12px; border-radius: 7px; font-size: 12px; cursor: pointer; font-weight: 600; }
@@ -887,15 +1230,15 @@ private class PhoneHttpServer(
                     .select-check { position: absolute; top: 16px; right: 16px; width: 22px; height: 22px; z-index: 5; accent-color: var(--brand-primary); cursor: pointer; }
                     .thumb-box { width: 100%; height: var(--thumb-h); background: var(--bg-main); border-radius: 10px; display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 8px; cursor: pointer; position: relative; }
                     .thumb-box img { width: 100%; height: 100%; object-fit: cover; }
-                    .play-badge { position: absolute; bottom: 8px; right: 8px; background: rgba(15, 23, 42, 0.85); color: #fff; padding: 4px 10px; border-radius: 16px; font-size: 11px; font-weight: 700; border: 1px solid rgba(255,255,255,0.2); }
+                    .play-badge { position: absolute; bottom: 8px; right: 8px; background: rgba(15, 23, 42, 0.85); color: #fff; padding: 4px 10px; border-radius: 16px; font-size: 11px; font-weight: 700; }
                     .icon-big { font-size: 46px; }
                     .item-name { font-size: 13px; font-weight: 600; color: var(--text-primary); word-break: break-word; margin-bottom: 3px; cursor: pointer; display: block; text-decoration: none; }
                     .item-meta { font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; }
-                    .card-actions { display: flex; gap: 5px; }
-                    .card-actions .btn, .card-actions button { padding: 6px 8px; font-size: 11px; flex: 1; justify-content: center; }
+                    .card-actions { display: flex; gap: 4px; }
+                    .card-actions .btn, .card-actions button { padding: 6px 6px; font-size: 11px; flex: 1; justify-content: center; }
 
                     /* Barra Flutuante de Selecao em Lote */
-                    .batch-bar { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #0f2942; color: #fff; padding: 12px 22px; border-radius: 16px; display: none; align-items: center; gap: 14px; z-index: 900; box-shadow: 0 20px 35px rgba(0,0,0,0.55); border: 1px solid #38bdf8; flex-wrap: wrap; }
+                    .batch-bar { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #0f2942; color: #fff; padding: 12px 22px; border-radius: 16px; display: none; align-items: center; gap: 12px; z-index: 900; box-shadow: 0 20px 35px rgba(0,0,0,0.6); border: 1px solid #38bdf8; flex-wrap: wrap; }
                     .batch-bar.visible { display: flex; }
 
                     /* Zona Drag & Drop */
@@ -903,14 +1246,17 @@ private class PhoneHttpServer(
                     .drop-overlay.active { display: flex; }
 
                     /* Modais Customizados */
-                    .modal-backdrop { position: fixed; inset: 0; background: rgba(5, 10, 20, 0.78); z-index: 9200; display: none; align-items: center; justify-content: center; padding: 16px; }
+                    .modal-backdrop { position: fixed; inset: 0; background: rgba(5, 10, 20, 0.82); z-index: 9200; display: none; align-items: center; justify-content: center; padding: 16px; }
                     .modal-backdrop.open { display: flex; }
-                    .modal-card { background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 16px; padding: 24px; width: 100%; max-width: 440px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
-                    .modal-card h3 { margin: 0 0 10px; font-size: 17px; color: var(--text-primary); }
-                    .modal-card input { width: 100%; padding: 11px 14px; border-radius: 10px; border: 1px solid var(--border-color); background: var(--bg-main); color: var(--text-primary); font-size: 14px; margin: 10px 0 16px; outline: none; }
-                    .preset-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
-                    .preset-chip { background: var(--bg-elevated); color: var(--brand-accent); border: 1px solid var(--border-color); padding: 5px 11px; border-radius: 16px; font-size: 12px; font-weight: 600; cursor: pointer; }
-                    .modal-footer { display: flex; justify-content: flex-end; gap: 8px; }
+                    .modal-card { background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 18px; padding: 24px; width: 100%; max-width: 460px; box-shadow: 0 25px 50px rgba(0,0,0,0.6); }
+                    .modal-card h3 { margin: 0 0 8px; font-size: 18px; color: var(--text-primary); }
+                    .modal-card input[type="text"] { width: 100%; padding: 11px 14px; border-radius: 10px; border: 1px solid var(--border-color); background: var(--bg-main); color: var(--text-primary); font-size: 14px; margin: 10px 0 16px; outline: none; }
+                    .modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+                    /* Lista de Pastas no Seletor de Destino (Mover) */
+                    .dir-picker-list { max-height: 230px; overflow-y: auto; background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 10px; padding: 6px; margin: 10px 0; }
+                    .dir-item { padding: 8px 10px; border-radius: 8px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-primary); }
+                    .dir-item:hover { background: var(--bg-elevated); }
 
                     /* Modal de Tela Cheia (Lightbox) */
                     .lightbox { display: none; position: fixed; inset: 0; background: rgba(5, 10, 20, 0.96); z-index: 9999; flex-direction: column; justify-content: space-between; }
@@ -922,32 +1268,41 @@ private class PhoneHttpServer(
                     .lb-stage { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; padding: 16px 70px; }
                     .lb-stage img, .lb-stage video { max-width: 100%; max-height: 82vh; object-fit: contain; border-radius: 6px; transition: transform 0.2s; }
                     .lb-stage img.zoomed { transform: scale(1.75); cursor: zoom-out; }
-                    .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(30, 41, 59, 0.85); color: #fff; border: 1px solid #475569; width: 52px; height: 52px; border-radius: 50%; font-size: 22px; cursor: pointer; display: flex; align-items: center; justify-content: center; user-select: none; }
-                    .lb-nav:hover { background: #0284c7; }
+                    .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(30, 41, 59, 0.85); color: #fff; border: 1px solid #475569; width: 52px; height: 52px; border-radius: 50%; font-size: 22px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
                     .lb-prev { left: 16px; }
                     .lb-next { right: 16px; }
                     .lb-footer { padding: 10px; text-align: center; font-size: 12px; color: #94a3b8; background: rgba(15, 23, 42, 0.8); }
                 </style>
             </head>
             <body>
+            <!-- Tela de Abertura Animada (Splash Screen) -->
+            <div id="webSplash" class="web-splash">
+                <div class="splash-ring">
+                    ${getBrandLogoSvg(112, "spin-lens")}
+                </div>
+                <div class="splash-title">IFGestor</div>
+                <div class="splash-sub">Gerenciador Corporativo de Mídia & Arquivos</div>
+                <div class="splash-bar"><div class="splash-bar-fill"></div></div>
+            </div>
+
             <div id="dropOverlay" class="drop-overlay">
-                ⬆️ Solte os arquivos aqui para enviar diretamente para esta pasta do celular
+                ⬆️ Solte os arquivos aqui para enviar (Requer autorização 2FA no celular)
             </div>
 
             <div class="container">
-                <!-- Cabecalho Corporativo com Armazenamento e Tema -->
+                <!-- Cabecalho Corporativo Puro (Apenas Gerenciador de Arquivos) -->
                 <div class="header">
                     <div class="brand-row">
-                        <div class="brand-logo">📷</div>
+                        ${getBrandLogoSvg(48)}
                         <div class="title">
-                            <h1>IFGestor — Gestor Corporativo de Fotos e Vídeos</h1>
-                            <p>Destino da Câmera: <strong>${SettingsManager.formatShortPath(activeCameraDir)}</strong> • Prefixo Ativo: <strong style="color:var(--brand-accent);">$activePrefix</strong></p>
+                            <h1>IFGestor — Gerenciador de Arquivos</h1>
+                            <p>🛡️ Proteção 2FA Ativa em Todas as Movimentações, Envios e Exclusões</p>
                         </div>
                     </div>
 
                     <div class="storage-widget">
                         <div class="storage-top">
-                            <span>💾 Memória do Dispositivo</span>
+                            <span>💾 Armazenamento do Celular</span>
                             <span>${storageStats.usedPercent}%</span>
                         </div>
                         <div class="storage-bar-bg"><div class="storage-bar-fill"></div></div>
@@ -955,31 +1310,29 @@ private class PhoneHttpServer(
                     </div>
 
                     <div class="btn-cluster">
-                        <button type="button" class="btn-sec" id="themeToggleBtn" onclick="toggleTheme()">☀️ Claro / 🌙 Escuro</button>
-                        <button type="button" class="btn-sec" onclick="openPrefixModal()">🏷️ Prefixo ($activePrefix)</button>
+                        <button type="button" class="btn-ok" id="elevatedBadgeBtn" style="display:none;" onclick="lockElevatedWindowNow()" title="Clique para bloquear imediatamente">
+                            🔓 Janela 2FA Ativa (<span id="elevatedTimerText">5:00</span>) • Bloquear Agora
+                        </button>
+                        <button type="button" class="btn-sec" onclick="toggleTheme()">☀️ Claro / 🌙 Escuro</button>
                         ${if (SettingsManager.isWebAuthEnabled(context)) """<a class="btn btn-danger" href="/auth/logout">🔒 Sair</a>""" else ""}
                     </div>
                 </div>
 
-                <!-- Barra de Caminho (Breadcrumbs) e Acoes Principais -->
+                <!-- Barra de Caminho (Breadcrumbs) e Ferramentas de Arquivo -->
                 <div class="toolbar">
                     <div class="crumbs-row">
-                        <div class="crumbs">
-                            $breadcrumbsHtml
-                            ${if (isCurrentActiveCamera) "<span class='badge-active' style='margin-left:8px;'>★ Pasta Ativa da Câmera</span>" else ""}
-                        </div>
+                        <div class="crumbs">$breadcrumbsHtml</div>
                         <span id="uploadStatus" style="font-size:12px; font-weight:700; color:var(--brand-accent);"></span>
                     </div>
 
                     <div class="actions-row">
                         <div class="btn-cluster">
-                            ${if (parentDir != null) """<a class="btn btn-sec" href="/?dir=${urlEncode(parentDir.absolutePath)}">⬅️ Acima</a>""" else ""}
+                            ${if (parentDir != null) """<a class="btn btn-sec" href="/?dir=${urlEncode(parentDir.absolutePath)}">⬅️ Pasta Acima</a>""" else ""}
                             <button type="button" onclick="openMkdirModal()">➕ Nova Pasta</button>
-                            <button type="button" class="btn-ok" onclick="setCameraHere()">📷 Definir como Destino da Câmera</button>
-                            <a class="btn btn-sec" href="/zip?dir=$encodedCurrentDir">📦 Baixar Tudo (.ZIP)</a>
-                            <label class="btn btn-sec" style="cursor:pointer;">
-                                ⬆️ Enviar Arquivos
-                                <input type="file" id="fileInput" multiple style="display:none" onchange="uploadFiles(this.files)">
+                            <a class="btn btn-sec" href="/zip?dir=$encodedCurrentDir">📦 Baixar Pasta (.ZIP)</a>
+                            <label class="btn btn-ok" style="cursor:pointer;">
+                                ⬆️ Enviar do PC para cá
+                                <input type="file" id="fileInput" multiple style="display:none" onchange="uploadFilesWith2FA(this.files)">
                             </label>
                         </div>
 
@@ -1005,9 +1358,9 @@ private class PhoneHttpServer(
                     </div>
 
                     <div class="pill-group" title="Tamanho das Miniaturas">
-                        <button type="button" class="pill-btn" id="btnSizeS" onclick="setThumbSize('small')">P</button>
-                        <button type="button" class="pill-btn active" id="btnSizeM" onclick="setThumbSize('medium')">M</button>
-                        <button type="button" class="pill-btn" id="btnSizeL" onclick="setThumbSize('large')">G</button>
+                        <button type="button" class="pill-btn" id="btnSizeS" onclick="setThumbSize('small')">Pequenas</button>
+                        <button type="button" class="pill-btn active" id="btnSizeM" onclick="setThumbSize('medium')">Médias</button>
+                        <button type="button" class="pill-btn" id="btnSizeL" onclick="setThumbSize('large')">Grandes</button>
                     </div>
                 </div>
 
@@ -1017,7 +1370,7 @@ private class PhoneHttpServer(
         )
 
         if (children.isEmpty()) {
-            sb.append("""<p style="color:var(--text-secondary); grid-column: 1/-1; text-align:center; padding: 40px 0;">Esta pasta está vazia. Tire fotos com a câmera ou arraste arquivos do PC para cá.</p>""")
+            sb.append("""<p style="color:var(--text-secondary); grid-column: 1/-1; text-align:center; padding: 40px 0;">Esta pasta está vazia.</p>""")
         }
 
         for (item in children) {
@@ -1040,8 +1393,9 @@ private class PhoneHttpServer(
                         </div>
                         <div class="card-actions">
                             <a class="btn" href="/?dir=$encodedPath">Abrir</a>
-                            <button type="button" class="btn-sec" onclick="openRenameModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">✏️</button>
-                            <button type="button" class="btn-danger" onclick="openDeleteModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">🗑️</button>
+                            <button type="button" class="btn-sec" title="Mover Pasta" onclick="openMoveModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}', false)">📁↗</button>
+                            <button type="button" class="btn-sec" title="Renomear" onclick="openRenameModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">✏️</button>
+                            <button type="button" class="btn-danger" title="Excluir" onclick="openDeleteModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">🗑️</button>
                         </div>
                     </div>
                     """.trimIndent()
@@ -1079,10 +1433,11 @@ private class PhoneHttpServer(
                             <div class="item-meta">$sizeStr • $dateStr</div>
                         </div>
                         <div class="card-actions">
-                            ${if (mIdx != null) """<button type="button" onclick="openLightbox($mIdx)">🔍 Ver</button>""" else ""}
-                            <a class="btn btn-ok" href="/file?path=$encodedPath&download=1">⬇️</a>
-                            <button type="button" class="btn-sec" onclick="openRenameModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">✏️</button>
-                            <button type="button" class="btn-danger" onclick="openDeleteModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">🗑️</button>
+                            ${if (mIdx != null) """<button type="button" title="Tela Cheia" onclick="openLightbox($mIdx)">🔍</button>""" else ""}
+                            <a class="btn btn-ok" title="Baixar" href="/file?path=$encodedPath&download=1">⬇️</a>
+                            <button type="button" class="btn-sec" title="Mover para outra pasta" onclick="openMoveModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}', false)">📁↗</button>
+                            <button type="button" class="btn-sec" title="Renomear" onclick="openRenameModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">✏️</button>
+                            <button type="button" class="btn-danger" title="Excluir" onclick="openDeleteModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">🗑️</button>
                         </div>
                     </div>
                     """.trimIndent()
@@ -1098,21 +1453,56 @@ private class PhoneHttpServer(
             <!-- Barra Flutuante de Acoes em Lote -->
             <div id="batchBar" class="batch-bar">
                 <strong id="batchCountText">0 selecionados</strong>
-                <button type="button" class="btn-ok" onclick="downloadSelectedZip()">📦 Baixar Selecionados (.ZIP)</button>
+                <button type="button" class="btn-ok" onclick="downloadSelectedZip()">📦 Baixar (.ZIP)</button>
+                <button type="button" class="btn" onclick="openBatchMoveModal()">📁↗ Mover Selecionados</button>
                 <button type="button" class="btn-danger" onclick="deleteSelectedBatch()">🗑️ Excluir Selecionados</button>
                 <button type="button" class="btn-sec" onclick="clearAllSelection()">✖ Limpar</button>
             </div>
 
-            <!-- Modal Customizado Universal -->
+            <!-- Modal Customizado de Entrada / Confirmacao -->
             <div id="customModal" class="modal-backdrop">
                 <div class="modal-card">
                     <h3 id="modalTitle">Título</h3>
                     <p id="modalDesc" style="font-size:13px; color:var(--text-secondary); margin:0 0 8px;"></p>
-                    <div id="modalPresetsBox" class="preset-chips" style="display:none;"></div>
                     <input type="text" id="modalInput" placeholder="">
                     <div class="modal-footer">
                         <button type="button" class="btn-sec" onclick="closeCustomModal()">Cancelar</button>
-                        <button type="button" id="modalConfirmBtn">Confirmar</button>
+                        <button type="button" id="modalConfirmBtn">Continuar (2FA)</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Modal Seletor Livre de Pastas para Mover Arquivos -->
+            <div id="moveModal" class="modal-backdrop">
+                <div class="modal-card">
+                    <h3>📁 Mover para qual pasta?</h3>
+                    <p id="moveModalTargetDesc" style="font-size:12px; color:var(--text-secondary); margin:0 0 6px;"></p>
+                    <div style="font-size:12px; font-weight:700; color:var(--brand-accent); margin-bottom:6px;" id="moveCurrentPathLabel">Memória Interna</div>
+                    <div class="dir-picker-list" id="moveDirsContainer"></div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn-sec" onclick="closeMoveModal()">Cancelar</button>
+                        <button type="button" class="btn-ok" id="confirmMoveHereBtn">✓ Mover para Esta Pasta</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Modal de Verificacao em 2 Etapas (2FA) por Operacao -->
+            <div id="action2faModal" class="modal-backdrop">
+                <div class="modal-card" style="text-align:center;">
+                    <div style="font-size:11px; font-weight:800; color:#10b981; margin-bottom:6px;">📲 AUTORIZAÇÃO EM DUAS ETAPAS (2FA)</div>
+                    <h3 id="a2faTitle">Confirmar Operação</h3>
+                    <p style="font-size:13px; color:var(--text-secondary); line-height:1.45;">
+                        Toque em <strong>"✓ Aprovar Agora"</strong> na notificação do seu celular ou digite abaixo o código de <strong>6 dígitos</strong>:
+                    </p>
+                    <input type="text" id="a2faCodeInput" maxlength="6" placeholder="000000" style="text-align:center; font-size:24px; font-weight:800; letter-spacing:8px; color:#10b981;">
+                    <label style="display:flex; align-items:center; justify-content:center; gap:8px; font-size:12px; color:var(--text-secondary); cursor:pointer; margin-bottom:10px;">
+                        <input type="checkbox" id="a2faKeep5Min" style="width:16px; height:16px;">
+                        Manter operações liberadas por 5 min (sem interromper lotes)
+                    </label>
+                    <div id="a2faErrorText" style="color:#ef4444; font-size:12px; font-weight:600; display:none; margin-bottom:8px;">❌ Código incorreto.</div>
+                    <div class="modal-footer" style="justify-content:center;">
+                        <button type="button" class="btn-sec" onclick="cancelAction2fa()">Cancelar Operação</button>
+                        <button type="button" class="btn-ok" id="a2faSubmitBtn">Verificar e Executar</button>
                     </div>
                 </div>
             </div>
@@ -1127,6 +1517,7 @@ private class PhoneHttpServer(
                     <div class="lb-actions">
                         <button type="button" class="btn-sec" onclick="toggleLightboxZoom()">🔍 Zoom</button>
                         <a id="lbDownloadBtn" class="btn btn-ok" href="#">⬇️ Baixar</a>
+                        <button type="button" class="btn-sec" onclick="moveCurrentLightboxItem()">📁↗ Mover</button>
                         <button type="button" class="btn-sec" onclick="renameCurrentLightboxItem()">✏️ Renomear</button>
                         <button type="button" class="btn-danger" onclick="deleteCurrentLightboxItem()">🗑️ Excluir</button>
                         <button type="button" class="btn-sec" onclick="closeLightbox()">✖ Fechar</button>
@@ -1138,17 +1529,60 @@ private class PhoneHttpServer(
                     <button type="button" class="lb-nav lb-next" onclick="stepLightbox(1)">▶</button>
                 </div>
                 <div class="lb-footer">
-                    Use <strong>◀ Anterior</strong> / <strong>Próximo ▶</strong> ou as setas <strong>⬅️ ➡️</strong> do teclado • Clique em <strong>Zoom</strong> para ampliar detalhes da vistoria
+                    Use <strong>◀ Anterior</strong> / <strong>Próximo ▶</strong> ou as setas <strong>⬅️ ➡️</strong> do teclado
                 </div>
             </div>
 
             <script>
                 const currentDir = "$encodedCurrentDir";
+                const rawCurrentDirPath = "${escapeJs(currentDir.absolutePath)}";
                 const csrfToken = "$csrfToken";
                 const mediaList = $mediaItemsJsArray;
-                const quickPresets = $presetsJsArray;
                 let currentLightboxIndex = 0;
                 let activeCategory = 'all';
+                let elevatedRemainingSec = $initialElevatedRemSec;
+                let poll2faTimer = null;
+
+                // Controle da Splash Screen Animada na Abertura da Sessao
+                (function initWebSplash() {
+                    const splash = document.getElementById('webSplash');
+                    if (sessionStorage.getItem('ifg_splash_shown') === '1') {
+                        splash.classList.add('hidden');
+                    } else {
+                        sessionStorage.setItem('ifg_splash_shown', '1');
+                        setTimeout(() => splash.classList.add('hidden'), 1350);
+                    }
+                })();
+
+                // Cronometro Visual da Janela Deslizante de 5 Minutos
+                function updateElevatedBadgeUI() {
+                    const btn = document.getElementById('elevatedBadgeBtn');
+                    const txt = document.getElementById('elevatedTimerText');
+                    if (elevatedRemainingSec > 0) {
+                        btn.style.display = 'inline-flex';
+                        const m = Math.floor(elevatedRemainingSec / 60);
+                        const s = elevatedRemainingSec % 60;
+                        txt.innerText = m + ":" + (s < 10 ? "0" + s : s);
+                    } else {
+                        btn.style.display = 'none';
+                    }
+                }
+                updateElevatedBadgeUI();
+                setInterval(() => {
+                    if (elevatedRemainingSec > 0) {
+                        elevatedRemainingSec--;
+                        updateElevatedBadgeUI();
+                    }
+                }, 1000);
+
+                async function lockElevatedWindowNow() {
+                    await fetch('/action/lock_window', {
+                        method: 'POST',
+                        headers: { 'X-CSRF-Token': csrfToken }
+                    });
+                    elevatedRemainingSec = 0;
+                    updateElevatedBadgeUI();
+                }
 
                 // Tema Dinamico Claro / Escuro
                 function applyTheme(theme) {
@@ -1161,7 +1595,7 @@ private class PhoneHttpServer(
                 }
                 applyTheme(localStorage.getItem('ifg_web_theme') || 'dark');
 
-                // Tamanho das Miniaturas (P, M, G)
+                // Tamanho das Miniaturas (Pequenas, Medias, Grandes)
                 function setThumbSize(size) {
                     const root = document.documentElement;
                     document.getElementById('btnSizeS').classList.remove('active');
@@ -1185,7 +1619,7 @@ private class PhoneHttpServer(
                 }
                 setThumbSize(localStorage.getItem('ifg_thumb_size') || 'medium');
 
-                // Busca Instantanea e Filtros por Categoria
+                // Busca e Filtros
                 function setCategoryFilter(cat) {
                     activeCategory = cat;
                     ['All', 'Image', 'Video', 'Folder'].forEach(id => {
@@ -1199,8 +1633,7 @@ private class PhoneHttpServer(
 
                 function applyFilters() {
                     const q = (document.getElementById('searchInput').value || '').toLowerCase().trim();
-                    const cards = document.querySelectorAll('.item-card');
-                    cards.forEach(card => {
+                    document.querySelectorAll('.item-card').forEach(card => {
                         const name = card.getAttribute('data-name') || '';
                         const type = card.getAttribute('data-type') || '';
                         const matchQuery = q === '' || name.includes(q);
@@ -1265,44 +1698,100 @@ private class PhoneHttpServer(
                     window.location.href = "/zip?dir=" + currentDir + "&files=" + encodeURIComponent(sel.join("|"));
                 }
 
-                function deleteSelectedBatch() {
-                    const sel = getSelectedFilenames();
-                    if (sel.length === 0) return;
-                    openConfirmModal(
-                        "Excluir " + sel.length + " item(ns)?",
-                        "Os itens selecionados serão removidos permanentemente da memória do celular.",
-                        async () => {
-                            await postAction("cmd=batch_delete&dir=" + currentDir, sel.join("|"));
+                // Motor de Autorizacao em 2 Etapas (2FA) para TODAS as Operacoes
+                function authorizeWith2FA(actionDescription, callbackWithOpToken) {
+                    fetch('/action/request_2fa?desc=' + encodeURIComponent(actionDescription), {
+                        method: 'POST',
+                        headers: { 'X-CSRF-Token': csrfToken }
+                    })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.status === 'already_authorized') {
+                            if (data.remainingSeconds) {
+                                elevatedRemainingSec = data.remainingSeconds;
+                                updateElevatedBadgeUI();
+                            }
+                            callbackWithOpToken(data.opToken);
+                            return;
                         }
-                    );
+                        openAction2faModal(actionDescription, data.reqId, callbackWithOpToken);
+                    });
                 }
 
-                // Modais Elegantes (Sem prompt/confirm nativos)
-                function openInputModal(title, desc, initialValue, showPresets, onConfirm) {
+                function openAction2faModal(actionDesc, reqId, onAuthorized) {
+                    if (poll2faTimer) clearInterval(poll2faTimer);
+                    document.getElementById('a2faTitle').innerText = actionDesc;
+                    const codeInput = document.getElementById('a2faCodeInput');
+                    codeInput.value = '';
+                    document.getElementById('a2faErrorText').style.display = 'none';
+                    document.getElementById('action2faModal').classList.add('open');
+                    setTimeout(() => codeInput.focus(), 60);
+
+                    const verifyNow = async (mode) => {
+                        const keep5m = document.getElementById('a2faKeep5Min').checked ? '1' : '0';
+                        const code = codeInput.value.trim();
+                        const resp = await fetch('/action/verify_2fa?reqId=' + encodeURIComponent(reqId) + '&code=' + encodeURIComponent(code) + '&keep5m=' + keep5m + '&mode=' + mode, {
+                            method: 'POST',
+                            headers: { 'X-CSRF-Token': csrfToken }
+                        });
+                        const res = await resp.json();
+                        if (res.status === 'approved') {
+                            if (poll2faTimer) clearInterval(poll2faTimer);
+                            document.getElementById('action2faModal').classList.remove('open');
+                            if (res.remainingSeconds) {
+                                elevatedRemainingSec = res.remainingSeconds;
+                                updateElevatedBadgeUI();
+                            }
+                            onAuthorized(res.opToken);
+                        } else if (res.status === 'invalid_code') {
+                            document.getElementById('a2faErrorText').style.display = 'block';
+                        } else if (res.status === 'expired') {
+                            if (poll2faTimer) clearInterval(poll2faTimer);
+                            alert('O código 2FA expirou. Tente novamente.');
+                            document.getElementById('action2faModal').classList.remove('open');
+                        }
+                    };
+
+                    document.getElementById('a2faSubmitBtn').onclick = () => verifyNow('manual');
+                    poll2faTimer = setInterval(() => verifyNow('poll'), 1200);
+                }
+
+                function cancelAction2fa() {
+                    if (poll2faTimer) clearInterval(poll2faTimer);
+                    document.getElementById('action2faModal').classList.remove('open');
+                }
+
+                async function executeProtectedAction(actionDesc, queryParams, bodyPayload = "") {
+                    authorizeWith2FA(actionDesc, async (opToken) => {
+                        const resp = await fetch("/action?" + queryParams + "&opToken=" + encodeURIComponent(opToken), {
+                            method: "POST",
+                            headers: {
+                                "X-CSRF-Token": csrfToken,
+                                "X-Op-Token": opToken,
+                                "Content-Type": "text/plain; charset=utf-8"
+                            },
+                            body: bodyPayload
+                        });
+                        if (resp.ok) {
+                            window.location.reload();
+                        } else {
+                            alert("Não foi possível concluir a operação.");
+                            window.location.reload();
+                        }
+                    });
+                }
+
+                // Modais de Criar Pasta, Renomear e Excluir (Todos passam pelo 2FA)
+                function openInputModal(title, desc, initialValue, onConfirm) {
                     document.getElementById('modalTitle').innerText = title;
                     document.getElementById('modalDesc').innerText = desc;
                     const input = document.getElementById('modalInput');
                     input.style.display = 'block';
                     input.value = initialValue || '';
 
-                    const presetsBox = document.getElementById('modalPresetsBox');
-                    if (showPresets && quickPresets.length > 0) {
-                        presetsBox.style.display = 'flex';
-                        presetsBox.innerHTML = '';
-                        quickPresets.forEach(p => {
-                            const chip = document.createElement('span');
-                            chip.className = 'preset-chip';
-                            chip.innerText = p;
-                            chip.onclick = () => { input.value = p; };
-                            presetsBox.appendChild(chip);
-                        });
-                    } else {
-                        presetsBox.style.display = 'none';
-                    }
-
                     const btn = document.getElementById('modalConfirmBtn');
                     btn.className = 'btn';
-                    btn.innerText = 'Salvar';
+                    btn.innerText = 'Continuar (2FA)';
                     btn.onclick = () => {
                         const val = input.value.trim();
                         closeCustomModal();
@@ -1317,11 +1806,10 @@ private class PhoneHttpServer(
                     document.getElementById('modalTitle').innerText = title;
                     document.getElementById('modalDesc').innerText = desc;
                     document.getElementById('modalInput').style.display = 'none';
-                    document.getElementById('modalPresetsBox').style.display = 'none';
 
                     const btn = document.getElementById('modalConfirmBtn');
                     btn.className = 'btn-danger';
-                    btn.innerText = 'Confirmar Exclusão';
+                    btn.innerText = 'Autorizar com 2FA';
                     btn.onclick = () => {
                         closeCustomModal();
                         onConfirm();
@@ -1335,32 +1823,150 @@ private class PhoneHttpServer(
                 }
 
                 function openMkdirModal() {
-                    openInputModal("Criar Nova Pasta", "Digite o nome da nova pasta ou subpasta:", "", false, (val) => {
-                        if (val) postAction("cmd=mkdir&dir=" + currentDir + "&name=" + encodeURIComponent(val));
-                    });
-                }
-
-                function openPrefixModal() {
-                    openInputModal("Prefixo de Captura da Câmera", "Toque em uma etiqueta rápida ou digite um novo prefixo:", "${escapeJs(activePrefix)}", true, (val) => {
-                        postAction("cmd=set_prefix&dir=" + currentDir + "&name=" + encodeURIComponent(val));
+                    openInputModal("Criar Nova Pasta", "Digite o nome da nova pasta:", "", (val) => {
+                        if (val) {
+                            executeProtectedAction(
+                                "Criar Pasta: " + val,
+                                "cmd=mkdir&dir=" + currentDir + "&name=" + encodeURIComponent(val)
+                            );
+                        }
                     });
                 }
 
                 function openRenameModal(targetPath, oldName) {
-                    openInputModal("Renomear Item", "Novo nome para '" + oldName + "':", oldName, false, (val) => {
+                    openInputModal("Renomear Item", "Novo nome para '" + oldName + "':", oldName, (val) => {
                         if (val && val !== oldName) {
-                            postAction("cmd=rename&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath) + "&name=" + encodeURIComponent(val));
+                            executeProtectedAction(
+                                "Renomear '" + oldName + "' para '" + val + "'",
+                                "cmd=rename&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath) + "&name=" + encodeURIComponent(val)
+                            );
                         }
                     });
                 }
 
                 function openDeleteModal(targetPath, name) {
-                    openConfirmModal("Excluir '" + name + "'?", "Este item será apagado permanentemente do armazenamento do celular.", () => {
-                        postAction("cmd=delete&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath));
+                    openConfirmModal("Excluir '" + name + "'?", "Esta exclusão exigirá autorização de 2ª etapa no celular.", () => {
+                        executeProtectedAction(
+                            "Excluir: " + name,
+                            "cmd=delete&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath)
+                        );
                     });
                 }
 
-                // Lightbox em Tela Cheia com Zoom e Teclado
+                function deleteSelectedBatch() {
+                    const sel = getSelectedFilenames();
+                    if (sel.length === 0) return;
+                    openConfirmModal(
+                        "Excluir " + sel.length + " item(ns)?",
+                        "A exclusão em lote exigirá autorização de 2ª etapa no celular.",
+                        () => {
+                            executeProtectedAction(
+                                "Excluir em Lote (" + sel.length + " itens)",
+                                "cmd=batch_delete&dir=" + currentDir,
+                                sel.join("|")
+                            );
+                        }
+                    );
+                }
+
+                // Seletor Livre de Pastas para Movimentacao (Individual ou Lote)
+                let currentMoveBrowsePath = rawCurrentDirPath;
+                function loadMovePickerDirectory(dirPath) {
+                    fetch('/dirs?dir=' + encodeURIComponent(dirPath))
+                    .then(r => r.json())
+                    .then(data => {
+                        currentMoveBrowsePath = data.currentPath;
+                        document.getElementById('moveCurrentPathLabel').innerText = "📂 " + data.shortPath;
+                        const box = document.getElementById('moveDirsContainer');
+                        box.innerHTML = '';
+
+                        if (data.parentPath && data.parentPath !== "") {
+                            const upDiv = document.createElement('div');
+                            upDiv.className = 'dir-item';
+                            upDiv.innerHTML = "⬅️ <strong>.. (Subir para pasta acima)</strong>";
+                            upDiv.onclick = () => loadMovePickerDirectory(data.parentPath);
+                            box.appendChild(upDiv);
+                        }
+
+                        if (data.folders.length === 0) {
+                            const emptyMsg = document.createElement('div');
+                            emptyMsg.style.padding = '10px';
+                            emptyMsg.style.fontSize = '12px';
+                            emptyMsg.style.color = '#94a3b8';
+                            emptyMsg.innerText = 'Nenhuma subpasta aqui. Você pode mover para cá.';
+                            box.appendChild(emptyMsg);
+                        } else {
+                            data.folders.forEach(f => {
+                                const row = document.createElement('div');
+                                row.className = 'dir-item';
+                                row.innerHTML = "📁 " + f.name;
+                                row.onclick = () => loadMovePickerDirectory(f.path);
+                                box.appendChild(row);
+                            });
+                        }
+                    });
+                }
+
+                function openMoveModal(targetPath, itemName, isBatch) {
+                    document.getElementById('moveModalTargetDesc').innerText = isBatch
+                        ? "Movendo " + itemName
+                        : "Movendo: " + itemName;
+                    loadMovePickerDirectory(rawCurrentDirPath);
+                    document.getElementById('moveModal').classList.add('open');
+
+                    document.getElementById('confirmMoveHereBtn').onclick = () => {
+                        const dest = currentMoveBrowsePath;
+                        closeMoveModal();
+                        if (isBatch) {
+                            const sel = getSelectedFilenames();
+                            executeProtectedAction(
+                                "Mover " + sel.length + " item(ns)",
+                                "cmd=batch_move&dir=" + currentDir + "&dest=" + encodeURIComponent(dest),
+                                sel.join("|")
+                            );
+                        } else {
+                            executeProtectedAction(
+                                "Mover: " + itemName,
+                                "cmd=move&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath) + "&dest=" + encodeURIComponent(dest)
+                            );
+                        }
+                    };
+                }
+
+                function openBatchMoveModal() {
+                    const sel = getSelectedFilenames();
+                    if (sel.length === 0) return;
+                    openMoveModal("", sel.length + " item(ns) selecionados", true);
+                }
+
+                function closeMoveModal() {
+                    document.getElementById('moveModal').classList.remove('open');
+                }
+
+                // Upload de Arquivos Protegido por 2FA com Token de Lote Ininterrupto
+                function uploadFilesWith2FA(files) {
+                    if (!files || files.length === 0) return;
+                    const fileArray = Array.from(files);
+                    authorizeWith2FA("Enviar " + fileArray.length + " arquivo(s) do PC", async (opToken) => {
+                        const status = document.getElementById("uploadStatus");
+                        for (let i = 0; i < fileArray.length; i++) {
+                            const file = fileArray[i];
+                            status.innerText = "⬆️ Enviando (" + (i + 1) + "/" + fileArray.length + "): " + file.name + "...";
+                            await fetch("/upload?dir=" + currentDir + "&name=" + encodeURIComponent(file.name) + "&opToken=" + encodeURIComponent(opToken), {
+                                method: "POST",
+                                headers: {
+                                    "X-CSRF-Token": csrfToken,
+                                    "X-Op-Token": opToken
+                                },
+                                body: file
+                            });
+                        }
+                        status.innerText = "✅ Upload concluído!";
+                        window.location.reload();
+                    });
+                }
+
+                // Lightbox em Tela Cheia
                 function openLightbox(index) {
                     if (mediaList.length === 0) return;
                     currentLightboxIndex = index;
@@ -1398,6 +2004,14 @@ private class PhoneHttpServer(
                     }
                 }
 
+                function moveCurrentLightboxItem() {
+                    const item = mediaList[currentLightboxIndex];
+                    if (item) {
+                        closeLightbox();
+                        openMoveModal(item.path, item.name, false);
+                    }
+                }
+
                 function renameCurrentLightboxItem() {
                     const item = mediaList[currentLightboxIndex];
                     if (item) openRenameModal(item.path, item.name);
@@ -1416,7 +2030,7 @@ private class PhoneHttpServer(
                     else if (e.key === 'Escape') closeLightbox();
                 });
 
-                // Drag & Drop de Arquivos na Janela
+                // Drag & Drop Protegido por 2FA
                 window.addEventListener('dragover', function(e) {
                     e.preventDefault();
                     document.getElementById('dropOverlay').classList.add('active');
@@ -1429,46 +2043,9 @@ private class PhoneHttpServer(
                     e.preventDefault();
                     document.getElementById('dropOverlay').classList.remove('active');
                     if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                        uploadFiles(e.dataTransfer.files);
+                        uploadFilesWith2FA(e.dataTransfer.files);
                     }
                 });
-
-                async function postAction(queryParams, bodyPayload = "") {
-                    const resp = await fetch("/action?" + queryParams, {
-                        method: "POST",
-                        headers: {
-                            "X-CSRF-Token": csrfToken,
-                            "Content-Type": "text/plain; charset=utf-8"
-                        },
-                        body: bodyPayload
-                    });
-                    if (resp.ok) {
-                        window.location.reload();
-                    } else {
-                        alert("Sessão expirada. Recarregue a página.");
-                        window.location.reload();
-                    }
-                }
-
-                function setCameraHere() {
-                    postAction("cmd=set_camera&dir=" + currentDir);
-                }
-
-                async function uploadFiles(files) {
-                    if (!files || files.length === 0) return;
-                    const status = document.getElementById("uploadStatus");
-                    for (let i = 0; i < files.length; i++) {
-                        const file = files[i];
-                        status.innerText = "⬆️ Enviando (" + (i + 1) + "/" + files.length + "): " + file.name + "...";
-                        await fetch("/upload?dir=" + currentDir + "&name=" + encodeURIComponent(file.name), {
-                            method: "POST",
-                            headers: { "X-CSRF-Token": csrfToken },
-                            body: file
-                        });
-                    }
-                    status.innerText = "✅ Upload concluído!";
-                    window.location.reload();
-                }
             </script>
             </body>
             </html>
