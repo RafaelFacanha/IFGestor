@@ -151,7 +151,6 @@ private class PhoneHttpServer(
             ?: session.headers["http-client-ip"]
             ?: "PC-Rede-Local"
 
-        // Verifica bloqueio de Forca Bruta por IP
         if (isIpLockedOut(clientIp)) {
             val remainingSec = ((bruteForceMap[clientIp]?.lockedUntilMs ?: 0L) - System.currentTimeMillis()) / 1000
             return secureResponse(
@@ -163,7 +162,6 @@ private class PhoneHttpServer(
             )
         }
 
-        // Rotas de Login / Logout
         if (uri == "/auth/pin" && session.method == Method.POST) {
             return secureResponse(handlePinSubmission(params, clientIp))
         }
@@ -174,7 +172,6 @@ private class PhoneHttpServer(
             return secureResponse(handleLogout(session))
         }
 
-        // Verifica se a Autenticacao por PIN + 2FA esta ativa
         val authSession = getValidSession(session, clientIp)
         if (SettingsManager.isWebAuthEnabled(context) && authSession == null) {
             val step = params["step"]
@@ -203,7 +200,8 @@ private class PhoneHttpServer(
                     if (!verifyCsrf(session, params, authSession)) {
                         newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "Token CSRF invalido")
                     } else {
-                        handleFileAction(params)
+                        val bodyText = readUtf8Body(session)
+                        handleFileAction(params, bodyText)
                     }
                 }
                 uri == "/file" -> handleFileStream(session, params)
@@ -220,6 +218,20 @@ private class PhoneHttpServer(
                 )
             )
         }
+    }
+
+    private fun readUtf8Body(session: IHTTPSession): String {
+        val len = session.headers["content-length"]?.toIntOrNull() ?: 0
+        if (len <= 0 || len > 512 * 1024) return ""
+        val buf = ByteArray(len)
+        var readTotal = 0
+        val input = session.inputStream
+        while (readTotal < len) {
+            val r = input.read(buf, readTotal, len - readTotal)
+            if (r == -1) break
+            readTotal += r
+        }
+        return String(buf, 0, readTotal, Charsets.UTF_8)
     }
 
     private fun secureResponse(response: Response): Response {
@@ -265,7 +277,6 @@ private class PhoneHttpServer(
 
         resetAuthFailures(clientIp)
 
-        // Se a Verificacao em Duas Etapas (2FA) estiver ativa, gera codigo de 6 digitos no celular
         if (SettingsManager.isTwoFactorEnabled(context)) {
             val code6Digits = String.format(Locale.US, "%06d", secureRandom.nextInt(1_000_000))
             val tempToken = generateRandomHex(24)
@@ -398,7 +409,7 @@ private class PhoneHttpServer(
         return if (candidate.path.startsWith(rootFile.path)) candidate else rootFile
     }
 
-    private fun handleFileAction(params: Map<String, String>): Response {
+    private fun handleFileAction(params: Map<String, String>, bodyText: String): Response {
         val cmd = params["cmd"] ?: ""
         val currentDir = sanitizeFile(params["dir"])
         val targetPath = params["target"]
@@ -438,14 +449,33 @@ private class PhoneHttpServer(
                     }
                 }
             }
+            "batch_delete" -> {
+                val rawList = if (bodyText.isNotBlank()) bodyText else (params["targets"] ?: "")
+                val names = rawList.split("|").map { it.trim() }.filter { it.isNotEmpty() }
+                val deletedPaths = mutableListOf<String>()
+                for (name in names) {
+                    val candidate = File(currentDir, name)
+                    val safeItem = sanitizeFile(candidate.absolutePath)
+                    if (safeItem.exists() && safeItem.absolutePath != rootStoragePath) {
+                        deletedPaths.add(safeItem.absolutePath)
+                        safeItem.deleteRecursively()
+                    }
+                }
+                if (deletedPaths.isNotEmpty()) {
+                    MediaScannerConnection.scanFile(context, deletedPaths.toTypedArray(), null, null)
+                }
+            }
             "set_camera" -> {
                 if (currentDir.exists() && currentDir.isDirectory) {
                     SettingsManager.setTargetFolderPath(context, currentDir.absolutePath)
                 }
             }
             "set_prefix" -> {
-                val newPrefix = params["name"] ?: ""
+                val newPrefix = (params["name"] ?: "").trim()
                 SettingsManager.setPrefix(context, newPrefix)
+                if (newPrefix.isNotEmpty()) {
+                    SettingsManager.addQuickPreset(context, newPrefix)
+                }
             }
         }
 
@@ -493,7 +523,6 @@ private class PhoneHttpServer(
         val fileLen = file.length()
         val rangeHeader = session.headers["range"]
 
-        // Suporte a Streaming Parcial (HTTP 206) para avancar/voltar videos em Tela Cheia
         if (rangeHeader != null && rangeHeader.startsWith("bytes=") && params["download"] != "1") {
             try {
                 val rangeValue = rangeHeader.removePrefix("bytes=")
@@ -535,13 +564,31 @@ private class PhoneHttpServer(
             return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Pasta invalida")
         }
 
-        val tempZip = File(context.cacheDir, "${dir.name.ifEmpty { "Memoria" }}.zip")
+        val selectedFilter = params["files"]
+            ?.split("|")
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.toSet()
+
+        val zipBaseName = if (!selectedFilter.isNullOrEmpty()) {
+            "Selecionados_${dir.name.ifEmpty { "IFGestor" }}"
+        } else {
+            dir.name.ifEmpty { "Memoria" }
+        }
+
+        val tempZip = File(context.cacheDir, "$zipBaseName.zip")
         if (tempZip.exists()) tempZip.delete()
 
         ZipOutputStream(BufferedOutputStream(FileOutputStream(tempZip))).use { zos ->
-            val files = dir.listFiles()?.filter { it.isFile && !it.name.startsWith(".") } ?: emptyList()
+            val allFiles = dir.listFiles()?.filter { it.isFile && !it.name.startsWith(".") } ?: emptyList()
+            val filesToZip = if (!selectedFilter.isNullOrEmpty()) {
+                allFiles.filter { selectedFilter.contains(it.name) }
+            } else {
+                allFiles
+            }
+
             val buffer = ByteArray(16 * 1024)
-            for (f in files) {
+            for (f in filesToZip) {
                 FileInputStream(f).use { fis ->
                     BufferedInputStream(fis).use { origin ->
                         val entry = ZipEntry(f.name)
@@ -559,7 +606,7 @@ private class PhoneHttpServer(
         val res = newFixedLengthResponse(Response.Status.OK, "application/zip", fis, tempZip.length())
         res.addHeader(
             "Content-Disposition",
-            "attachment; filename=\"${dir.name.ifEmpty { "Arquivos" }}.zip\""
+            "attachment; filename=\"${zipBaseName.replace("\"", "")}.zip\""
         )
         return res
     }
@@ -576,27 +623,30 @@ private class PhoneHttpServer(
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>IFGestor - Acesso Seguro</title>
+                <title>IFGestor — Portal Corporativo Seguro</title>
                 <style>
-                    * { box-sizing: border-box; font-family: system-ui, sans-serif; }
-                    body { margin: 0; background: #0f172a; color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; }
-                    .box { background: #1e293b; border: 1px solid #334155; padding: 32px; border-radius: 16px; width: 100%; max-width: 380px; text-align: center; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); }
-                    h2 { margin: 0 0 8px; color: #38bdf8; }
-                    p { font-size: 13px; color: #94a3b8; margin-bottom: 20px; }
-                    input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; font-size: 20px; text-align: center; letter-spacing: 6px; margin-bottom: 16px; }
-                    button { width: 100%; padding: 12px; background: #3b82f6; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 700; cursor: pointer; }
-                    button:hover { background: #2563eb; }
-                    .err { background: #7f1d1d; color: #fecaca; padding: 10px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }
+                    * { box-sizing: border-box; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+                    body { margin: 0; background: radial-gradient(circle at top, #0f2942 0%, #090d16 100%); color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; padding: 16px; }
+                    .box { background: rgba(30, 41, 59, 0.92); border: 1px solid #334155; padding: 36px 32px; border-radius: 20px; width: 100%; max-width: 400px; text-align: center; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.65); }
+                    .badge-top { display: inline-block; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 5px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 14px; }
+                    h2 { margin: 0 0 8px; color: #f8fafc; font-size: 22px; }
+                    p { font-size: 13px; color: #94a3b8; margin-bottom: 24px; line-height: 1.5; }
+                    input { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid #475569; background: #0f172a; color: #38bdf8; font-size: 22px; font-weight: 700; text-align: center; letter-spacing: 8px; margin-bottom: 18px; outline: none; }
+                    input:focus { border-color: #38bdf8; }
+                    button { width: 100%; padding: 14px; background: linear-gradient(135deg, #0284c7, #2563eb); color: #fff; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; transition: opacity 0.15s; }
+                    button:hover { opacity: 0.92; }
+                    .err { background: rgba(127, 29, 29, 0.85); border: 1px solid #ef4444; color: #fecaca; padding: 11px; border-radius: 10px; font-size: 13px; margin-bottom: 18px; }
                 </style>
             </head>
             <body>
                 <div class="box">
-                    <h2>🔒 IFGestor Seguro</h2>
-                    <p>Digite o PIN configurado na aba "Acesso no PC" do celular (Padrão inicial: 1234)</p>
+                    <div class="badge-top">🛡️ SEGURANÇA CORPORATIVA</div>
+                    <h2>IFGestor Web</h2>
+                    <p>Insira o PIN de segurança configurado na aba <strong>Acesso no PC</strong> do seu smartphone (Padrão: 1234)</p>
                     $errBanner
                     <form id="pinForm">
                         <input type="password" id="pinInput" placeholder="••••" required autofocus>
-                        <button type="submit">Continuar</button>
+                        <button type="submit">Autenticar Acesso</button>
                     </form>
                 </div>
                 <script>
@@ -627,27 +677,29 @@ private class PhoneHttpServer(
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>IFGestor - Verificação em 2 Etapas</title>
+                <title>IFGestor — Verificação em 2 Etapas</title>
                 <style>
-                    * { box-sizing: border-box; font-family: system-ui, sans-serif; }
-                    body { margin: 0; background: #0f172a; color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; }
-                    .box { background: #1e293b; border: 1px solid #334155; padding: 32px; border-radius: 16px; width: 100%; max-width: 400px; text-align: center; }
-                    h2 { margin: 0 0 8px; color: #10b981; }
-                    p { font-size: 13px; color: #cbd5e1; margin-bottom: 20px; line-height: 1.5; }
-                    input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #38bdf8; font-size: 24px; font-weight: bold; text-align: center; letter-spacing: 8px; margin-bottom: 16px; }
-                    button { width: 100%; padding: 12px; background: #10b981; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 700; cursor: pointer; }
+                    * { box-sizing: border-box; font-family: 'Inter', system-ui, sans-serif; }
+                    body { margin: 0; background: radial-gradient(circle at top, #0f2942 0%, #090d16 100%); color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; padding: 16px; }
+                    .box { background: rgba(30, 41, 59, 0.94); border: 1px solid #334155; padding: 36px 32px; border-radius: 20px; width: 100%; max-width: 420px; text-align: center; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.65); }
+                    .badge-top { display: inline-block; background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.35); padding: 5px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; margin-bottom: 14px; }
+                    h2 { margin: 0 0 8px; color: #f8fafc; font-size: 22px; }
+                    p { font-size: 13px; color: #cbd5e1; margin-bottom: 22px; line-height: 1.5; }
+                    input { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid #475569; background: #0f172a; color: #10b981; font-size: 26px; font-weight: 800; text-align: center; letter-spacing: 10px; margin-bottom: 18px; outline: none; }
+                    button { width: 100%; padding: 14px; background: #10b981; color: #fff; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; }
                     button:hover { background: #059669; }
-                    .err { background: #7f1d1d; color: #fecaca; padding: 10px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }
+                    .err { background: rgba(127, 29, 29, 0.85); border: 1px solid #ef4444; color: #fecaca; padding: 11px; border-radius: 10px; font-size: 13px; margin-bottom: 18px; }
                 </style>
             </head>
             <body>
                 <div class="box">
-                    <h2>📲 Verificação em 2 Etapas</h2>
-                    <p>Um código de <strong>6 dígitos</strong> acabou de aparecer na notificação e na tela do seu celular. Digite-o abaixo para liberar o acesso:</p>
+                    <div class="badge-top">📲 2ª ETAPA DE SEGURANÇA (2FA)</div>
+                    <h2>Confirme o Código</h2>
+                    <p>Digite o código único de <strong>6 dígitos</strong> exibido agora na notificação ou no painel do seu celular:</p>
                     $errBanner
                     <form id="twoFaForm">
                         <input type="text" id="codeInput" maxlength="6" placeholder="000000" required autofocus>
-                        <button type="submit">Verificar e Entrar</button>
+                        <button type="submit">Liberar Painel de Arquivos</button>
                     </form>
                 </div>
                 <script>
@@ -671,16 +723,36 @@ private class PhoneHttpServer(
         return """
             <!DOCTYPE html>
             <html lang="pt-BR">
-            <head><meta charset="UTF-8"><title>Acesso Bloqueado</title></head>
-            <body style="background:#0f172a;color:#f8fafc;font-family:sans-serif;display:flex;height:100vh;align-items:center;justify-content:center;text-align:center;">
-                <div style="background:#7f1d1d;padding:30px;border-radius:14px;max-width:420px;">
-                    <h2>🛡️ Proteção Anti-Força Bruta Ativada</h2>
-                    <p>Muitas tentativas incorretas de login a partir deste computador.</p>
-                    <p>Aguarde <strong>$remainingSeconds segundos</strong> antes de tentar novamente.</p>
+            <head><meta charset="UTF-8"><title>Acesso Temporariamente Bloqueado</title></head>
+            <body style="background:#090d16;color:#f8fafc;font-family:sans-serif;display:flex;height:100vh;align-items:center;justify-content:center;text-align:center;padding:16px;">
+                <div style="background:#1e293b;border:1px solid #ef4444;padding:32px;border-radius:18px;max-width:420px;">
+                    <h2 style="color:#ef4444;margin-top:0;">🛡️ Bloqueio Anti-Força Bruta</h2>
+                    <p style="color:#cbd5e1;font-size:14px;">Foram detectadas muitas tentativas incorretas a partir deste computador.</p>
+                    <p style="color:#f8fafc;font-size:15px;">Tente novamente em <strong>$remainingSeconds segundos</strong>.</p>
                 </div>
             </body>
             </html>
         """.trimIndent()
+    }
+
+    private fun buildBreadcrumbsHtml(currentDir: File): String {
+        val rootFile = File(rootStoragePath).canonicalFile
+        val currentCanonical = currentDir.canonicalFile
+        val sb = StringBuilder()
+
+        sb.append("""<a class="crumb" href="/?dir=${urlEncode(rootFile.absolutePath)}">🏠 Memória Interna</a>""")
+
+        if (currentCanonical.path.startsWith(rootFile.path) && currentCanonical.path != rootFile.path) {
+            val rel = currentCanonical.path.removePrefix(rootFile.path).trimStart('/', '\\')
+            val parts = rel.split('/', '\\').filter { it.isNotEmpty() }
+            var accum = rootFile
+            for (part in parts) {
+                accum = File(accum, part)
+                sb.append(""" <span class="crumb-sep">›</span> """)
+                sb.append("""<a class="crumb" href="/?dir=${urlEncode(accum.absolutePath)}">${escapeHtml(part)}</a>""")
+            }
+        }
+        return sb.toString()
     }
 
     private fun renderExplorerPage(requestedDir: String?, csrfToken: String): Response {
@@ -689,6 +761,8 @@ private class PhoneHttpServer(
 
         val activeCameraDir = SettingsManager.getTargetFolderPath(context)
         val activePrefix = SettingsManager.getPrefix(context)
+        val quickPresets = SettingsManager.getQuickPresets(context)
+        val storageStats = SettingsManager.getStorageStats()
         val isCurrentActiveCamera = currentDir.absolutePath == activeCameraDir
 
         val children = currentDir.listFiles()
@@ -696,11 +770,14 @@ private class PhoneHttpServer(
             ?.sortedWith(compareByDescending<File> { it.isDirectory }.thenBy { it.name.lowercase() })
             ?: emptyList()
 
+        val totalFolders = children.count { it.isDirectory }
+        val totalPhotos = children.count { !it.isDirectory && isImageFile(it.name) }
+        val totalVideos = children.count { !it.isDirectory && isVideoFile(it.name) }
+
         val dateFormat = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
         val encodedCurrentDir = urlEncode(currentDir.absolutePath)
         val parentDir = if (currentDir.absolutePath != rootStoragePath) currentDir.parentFile else null
 
-        // Prepara a lista de arquivos de midia (fotos e videos) para o Modo Tela Cheia (Anterior / Proximo)
         val mediaItemsJsArray = StringBuilder("[")
         var mediaIndex = 0
         val filePathToMediaIndex = mutableMapOf<String, Int>()
@@ -712,7 +789,7 @@ private class PhoneHttpServer(
                 val fileUrl = "/file?path=" + urlEncode(item.absolutePath)
                 val downloadUrl = "$fileUrl&download=1"
                 mediaItemsJsArray.append(
-                    """{"name":"${escapeJs(item.name)}","path":"${escapeJs(item.absolutePath)}","url":"$fileUrl","download":"$downloadUrl","type":"$type","size":"${formatSize(item.length())}"}"""
+                    """{"name":"${escapeJs(item.name)}","path":"${escapeJs(item.absolutePath)}","url":"$fileUrl","download":"$downloadUrl","type":"$type","size":"${formatSize(item.length())}","date":"${dateFormat.format(Date(item.lastModified()))}"}"""
                 )
                 filePathToMediaIndex[item.absolutePath] = mediaIndex
                 mediaIndex++
@@ -720,144 +797,251 @@ private class PhoneHttpServer(
         }
         mediaItemsJsArray.append("]")
 
+        val presetsJsArray = quickPresets.joinToString(",", "[", "]") { "\"${escapeJs(it)}\"" }
+        val breadcrumbsHtml = buildBreadcrumbsHtml(currentDir)
+
         val sb = StringBuilder()
         sb.append(
             """
             <!DOCTYPE html>
-            <html lang="pt-BR">
+            <html lang="pt-BR" data-theme="dark">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>IFGestor - Gerenciador Web</title>
+                <title>IFGestor — Gestor de Fotos e Vídeos</title>
                 <style>
                     :root {
-                        --card-min: 230px;
-                        --thumb-h: 160px;
+                        --card-min: 220px;
+                        --thumb-h: 165px;
+                        --bg-main: #0b1120;
+                        --bg-surface: #151f32;
+                        --bg-elevated: #1e293b;
+                        --border-color: #2e3f59;
+                        --text-primary: #f8fafc;
+                        --text-secondary: #94a3b8;
+                        --brand-primary: #0284c7;
+                        --brand-accent: #38bdf8;
+                        --brand-success: #10b981;
+                        --brand-danger: #ef4444;
                     }
-                    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
-                    body { margin: 0; background: #0f172a; color: #f8fafc; padding: 18px; }
-                    .container { max-width: 1280px; margin: 0 auto; }
-                    .header { background: #1e293b; padding: 16px 20px; border-radius: 14px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; border: 1px solid #334155; }
-                    .title h1 { margin: 0; font-size: 20px; color: #38bdf8; }
-                    .title p { margin: 4px 0 0; font-size: 13px; color: #94a3b8; }
-                    .badge { background: #0284c7; color: #fff; padding: 5px 10px; border-radius: 8px; font-size: 12px; font-weight: 600; }
-                    .toolbar { background: #1e293b; padding: 14px 18px; border-radius: 12px; margin-bottom: 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; border: 1px solid #334155; }
-                    .path-box { flex: 1 1 100%; font-size: 14px; color: #cbd5e1; margin-bottom: 6px; word-break: break-all; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-                    .size-group { display: inline-flex; background: #0f172a; padding: 4px; border-radius: 8px; border: 1px solid #334155; gap: 4px; }
-                    .size-btn { background: transparent; color: #94a3b8; border: none; padding: 5px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; font-weight: 600; }
-                    .size-btn.active { background: #3b82f6; color: #fff; }
-                    button, .btn { background: #3b82f6; color: #fff; border: none; padding: 8px 13px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
-                    button:hover, .btn:hover { background: #2563eb; }
-                    .btn-sec { background: #334155; }
-                    .btn-sec:hover { background: #475569; }
-                    .btn-ok { background: #10b981; }
-                    .btn-ok:hover { background: #059669; }
-                    .btn-danger { background: #ef4444; }
-                    .btn-danger:hover { background: #dc2626; }
+                    html[data-theme="light"] {
+                        --bg-main: #f1f5f9;
+                        --bg-surface: #ffffff;
+                        --bg-elevated: #e2e8f0;
+                        --border-color: #cbd5e1;
+                        --text-primary: #0f172a;
+                        --text-secondary: #475569;
+                        --brand-primary: #0f2942;
+                        --brand-accent: #0284c7;
+                        --brand-success: #059669;
+                        --brand-danger: #dc2626;
+                    }
+                    * { box-sizing: border-box; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+                    body { margin: 0; background: var(--bg-main); color: var(--text-primary); padding: 18px 18px 90px; transition: background 0.2s, color 0.2s; }
+                    .container { max-width: 1360px; margin: 0 auto; }
+
+                    /* Cabecalho Corporativo */
+                    .header { background: var(--bg-surface); padding: 18px 22px; border-radius: 16px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; border: 1px solid var(--border-color); box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
+                    .brand-row { display: flex; align-items: center; gap: 12px; }
+                    .brand-logo { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, #0284c7, #0f2942); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: bold; }
+                    .title h1 { margin: 0; font-size: 20px; color: var(--text-primary); letter-spacing: -0.3px; }
+                    .title p { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); }
+                    .storage-widget { min-width: 240px; background: var(--bg-elevated); padding: 10px 14px; border-radius: 12px; border: 1px solid var(--border-color); }
+                    .storage-top { display: flex; justify-content: space-between; font-size: 11px; font-weight: 600; margin-bottom: 6px; color: var(--text-secondary); }
+                    .storage-bar-bg { width: 100%; height: 7px; background: var(--bg-main); border-radius: 10px; overflow: hidden; }
+                    .storage-bar-fill { height: 100%; width: ${storageStats.usedPercent}%; background: linear-gradient(90deg, #0284c7, #10b981); border-radius: 10px; }
+
+                    /* Barra de Navegacao e Ferramentas */
+                    .toolbar { background: var(--bg-surface); padding: 14px 18px; border-radius: 16px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 12px; border: 1px solid var(--border-color); }
+                    .crumbs-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border-color); }
+                    .crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; font-size: 13px; }
+                    .crumb { color: var(--brand-accent); text-decoration: none; font-weight: 600; padding: 4px 8px; border-radius: 6px; }
+                    .crumb:hover { background: var(--bg-elevated); }
+                    .crumb-sep { color: var(--text-secondary); font-weight: bold; }
+                    .badge-active { background: var(--brand-success); color: #fff; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; }
+
+                    .actions-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+                    .btn-cluster { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+                    /* Barra de Busca e Filtros */
+                    .filter-bar { background: var(--bg-surface); padding: 12px 18px; border-radius: 14px; margin-bottom: 16px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; border: 1px solid var(--border-color); }
+                    .search-box { flex: 1; min-width: 220px; position: relative; }
+                    .search-box input { width: 100%; padding: 9px 14px 9px 36px; border-radius: 10px; border: 1px solid var(--border-color); background: var(--bg-main); color: var(--text-primary); font-size: 13px; outline: none; }
+                    .search-box input:focus { border-color: var(--brand-accent); }
+                    .search-icon { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); font-size: 14px; color: var(--text-secondary); }
+                    .pill-group { display: inline-flex; background: var(--bg-main); padding: 4px; border-radius: 10px; border: 1px solid var(--border-color); gap: 4px; flex-wrap: wrap; }
+                    .pill-btn { background: transparent; color: var(--text-secondary); border: none; padding: 6px 12px; border-radius: 7px; font-size: 12px; cursor: pointer; font-weight: 600; }
+                    .pill-btn.active { background: var(--brand-primary); color: #fff; }
+
+                    button, .btn { background: var(--brand-primary); color: #fff; border: none; padding: 8px 14px; border-radius: 10px; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: all 0.15s; }
+                    button:hover, .btn:hover { filter: brightness(1.12); }
+                    .btn-sec { background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-color); }
+                    .btn-ok { background: var(--brand-success); color: #fff; }
+                    .btn-danger { background: var(--brand-danger); color: #fff; }
+
+                    /* Grade de Fotos, Videos e Pastas */
                     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--card-min), 1fr)); gap: 14px; }
-                    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 10px; display: flex; flex-direction: column; justify-content: space-between; transition: transform 0.12s; }
-                    .card:hover { border-color: #38bdf8; }
-                    .thumb-box { width: 100%; height: var(--thumb-h); background: #0f172a; border-radius: 8px; display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 8px; cursor: pointer; position: relative; }
+                    .card { background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 14px; padding: 10px; display: flex; flex-direction: column; justify-content: space-between; position: relative; transition: transform 0.12s, border-color 0.12s; }
+                    .card:hover { border-color: var(--brand-accent); transform: translateY(-2px); }
+                    .card.selected { border: 2px solid var(--brand-accent); background: rgba(56, 189, 248, 0.08); }
+                    .select-check { position: absolute; top: 16px; right: 16px; width: 22px; height: 22px; z-index: 5; accent-color: var(--brand-primary); cursor: pointer; }
+                    .thumb-box { width: 100%; height: var(--thumb-h); background: var(--bg-main); border-radius: 10px; display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 8px; cursor: pointer; position: relative; }
                     .thumb-box img { width: 100%; height: 100%; object-fit: cover; }
-                    .play-badge { position: absolute; background: rgba(0,0,0,0.65); color: #fff; padding: 8px 14px; border-radius: 24px; font-size: 13px; font-weight: bold; }
-                    .icon-big { font-size: 44px; }
-                    .item-name { font-size: 13px; font-weight: 600; color: #f1f5f9; word-break: break-word; margin-bottom: 4px; cursor: pointer; }
-                    .item-meta { font-size: 11px; color: #94a3b8; margin-bottom: 8px; }
-                    .card-actions { display: flex; gap: 5px; flex-wrap: wrap; }
+                    .play-badge { position: absolute; bottom: 8px; right: 8px; background: rgba(15, 23, 42, 0.85); color: #fff; padding: 4px 10px; border-radius: 16px; font-size: 11px; font-weight: 700; border: 1px solid rgba(255,255,255,0.2); }
+                    .icon-big { font-size: 46px; }
+                    .item-name { font-size: 13px; font-weight: 600; color: var(--text-primary); word-break: break-word; margin-bottom: 3px; cursor: pointer; display: block; text-decoration: none; }
+                    .item-meta { font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; }
+                    .card-actions { display: flex; gap: 5px; }
                     .card-actions .btn, .card-actions button { padding: 6px 8px; font-size: 11px; flex: 1; justify-content: center; }
-                    #uploadStatus { font-size: 13px; color: #38bdf8; font-weight: 600; }
+
+                    /* Barra Flutuante de Selecao em Lote */
+                    .batch-bar { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #0f2942; color: #fff; padding: 12px 22px; border-radius: 16px; display: none; align-items: center; gap: 14px; z-index: 900; box-shadow: 0 20px 35px rgba(0,0,0,0.55); border: 1px solid #38bdf8; flex-wrap: wrap; }
+                    .batch-bar.visible { display: flex; }
+
+                    /* Zona Drag & Drop */
+                    .drop-overlay { position: fixed; inset: 0; background: rgba(2, 132, 199, 0.88); color: #fff; z-index: 9500; display: none; flex-direction: column; align-items: center; justify-content: center; font-size: 24px; font-weight: 800; border: 6px dashed #fff; }
+                    .drop-overlay.active { display: flex; }
+
+                    /* Modais Customizados */
+                    .modal-backdrop { position: fixed; inset: 0; background: rgba(5, 10, 20, 0.78); z-index: 9200; display: none; align-items: center; justify-content: center; padding: 16px; }
+                    .modal-backdrop.open { display: flex; }
+                    .modal-card { background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 16px; padding: 24px; width: 100%; max-width: 440px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+                    .modal-card h3 { margin: 0 0 10px; font-size: 17px; color: var(--text-primary); }
+                    .modal-card input { width: 100%; padding: 11px 14px; border-radius: 10px; border: 1px solid var(--border-color); background: var(--bg-main); color: var(--text-primary); font-size: 14px; margin: 10px 0 16px; outline: none; }
+                    .preset-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+                    .preset-chip { background: var(--bg-elevated); color: var(--brand-accent); border: 1px solid var(--border-color); padding: 5px 11px; border-radius: 16px; font-size: 12px; font-weight: 600; cursor: pointer; }
+                    .modal-footer { display: flex; justify-content: flex-end; gap: 8px; }
 
                     /* Modal de Tela Cheia (Lightbox) */
                     .lightbox { display: none; position: fixed; inset: 0; background: rgba(5, 10, 20, 0.96); z-index: 9999; flex-direction: column; justify-content: space-between; }
                     .lightbox.open { display: flex; }
-                    .lb-top { padding: 14px 22px; background: rgba(30, 41, 59, 0.85); display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid #334155; }
+                    .lb-top { padding: 14px 22px; background: rgba(15, 23, 42, 0.9); display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid #334155; }
                     .lb-title { font-size: 15px; font-weight: 600; color: #f8fafc; word-break: break-all; }
                     .lb-counter { color: #38bdf8; font-weight: 700; margin-right: 10px; }
                     .lb-actions { display: flex; gap: 8px; align-items: center; }
                     .lb-stage { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; padding: 16px 70px; }
-                    .lb-stage img, .lb-stage video { max-width: 100%; max-height: 82vh; object-fit: contain; border-radius: 6px; box-shadow: 0 12px 30px rgba(0,0,0,0.6); }
+                    .lb-stage img, .lb-stage video { max-width: 100%; max-height: 82vh; object-fit: contain; border-radius: 6px; transition: transform 0.2s; }
+                    .lb-stage img.zoomed { transform: scale(1.75); cursor: zoom-out; }
                     .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(30, 41, 59, 0.85); color: #fff; border: 1px solid #475569; width: 52px; height: 52px; border-radius: 50%; font-size: 22px; cursor: pointer; display: flex; align-items: center; justify-content: center; user-select: none; }
-                    .lb-nav:hover { background: #3b82f6; }
+                    .lb-nav:hover { background: #0284c7; }
                     .lb-prev { left: 16px; }
                     .lb-next { right: 16px; }
-                    .lb-footer { padding: 10px; text-align: center; font-size: 12px; color: #94a3b8; background: rgba(30, 41, 59, 0.6); }
+                    .lb-footer { padding: 10px; text-align: center; font-size: 12px; color: #94a3b8; background: rgba(15, 23, 42, 0.8); }
                 </style>
             </head>
             <body>
+            <div id="dropOverlay" class="drop-overlay">
+                ⬆️ Solte os arquivos aqui para enviar diretamente para esta pasta do celular
+            </div>
+
             <div class="container">
+                <!-- Cabecalho Corporativo com Armazenamento e Tema -->
                 <div class="header">
-                    <div class="title">
-                        <h1>📱 IFGestor — Gerenciador Web Seguro</h1>
-                        <p>Pasta Ativa da Câmera: <strong>${SettingsManager.formatShortPath(activeCameraDir)}</strong> | Prefixo Atual: <strong>$activePrefix</strong></p>
-                    </div>
-                    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-                        <div class="size-group" title="Ajustar tamanho das miniaturas">
-                            <button type="button" class="size-btn" id="btnSizeS" onclick="setThumbSize('small')">Pequenas</button>
-                            <button type="button" class="size-btn active" id="btnSizeM" onclick="setThumbSize('medium')">Médias</button>
-                            <button type="button" class="size-btn" id="btnSizeL" onclick="setThumbSize('large')">Grandes</button>
+                    <div class="brand-row">
+                        <div class="brand-logo">📷</div>
+                        <div class="title">
+                            <h1>IFGestor — Gestor Corporativo de Fotos e Vídeos</h1>
+                            <p>Destino da Câmera: <strong>${SettingsManager.formatShortPath(activeCameraDir)}</strong> • Prefixo Ativo: <strong style="color:var(--brand-accent);">$activePrefix</strong></p>
                         </div>
-                        <button class="btn-sec" onclick="changePrefix('${escapeJs(activePrefix)}')">✏️ Prefixo</button>
-                        <a class="btn btn-sec" href="/?dir=${urlEncode(rootStoragePath)}">🏠 Raiz</a>
+                    </div>
+
+                    <div class="storage-widget">
+                        <div class="storage-top">
+                            <span>💾 Memória do Dispositivo</span>
+                            <span>${storageStats.usedPercent}%</span>
+                        </div>
+                        <div class="storage-bar-bg"><div class="storage-bar-fill"></div></div>
+                        <div style="font-size:11px; color:var(--text-secondary); margin-top:5px;">${storageStats.formattedSummary}</div>
+                    </div>
+
+                    <div class="btn-cluster">
+                        <button type="button" class="btn-sec" id="themeToggleBtn" onclick="toggleTheme()">☀️ Claro / 🌙 Escuro</button>
+                        <button type="button" class="btn-sec" onclick="openPrefixModal()">🏷️ Prefixo ($activePrefix)</button>
                         ${if (SettingsManager.isWebAuthEnabled(context)) """<a class="btn btn-danger" href="/auth/logout">🔒 Sair</a>""" else ""}
                     </div>
                 </div>
 
+                <!-- Barra de Caminho (Breadcrumbs) e Acoes Principais -->
                 <div class="toolbar">
-                    <div class="path-box">
-                        <div>
-                            📂 <strong>Local Atual:</strong> ${SettingsManager.formatShortPath(currentDir.absolutePath)}
-                            ${if (isCurrentActiveCamera) "<span class='badge' style='margin-left:8px;'>★ Destino Atual da Câmera</span>" else ""}
+                    <div class="crumbs-row">
+                        <div class="crumbs">
+                            $breadcrumbsHtml
+                            ${if (isCurrentActiveCamera) "<span class='badge-active' style='margin-left:8px;'>★ Pasta Ativa da Câmera</span>" else ""}
                         </div>
-                        <span style="font-size:12px; color:#94a3b8;">Dica: Clique em qualquer foto ou vídeo para abrir em <strong>Tela Cheia</strong></span>
+                        <span id="uploadStatus" style="font-size:12px; font-weight:700; color:var(--brand-accent);"></span>
                     </div>
-            """.trimIndent()
-        )
 
-        if (parentDir != null) {
-            sb.append("""<a class="btn btn-sec" href="/?dir=${urlEncode(parentDir.absolutePath)}">⬅️ Pasta Acima</a>""")
-        }
+                    <div class="actions-row">
+                        <div class="btn-cluster">
+                            ${if (parentDir != null) """<a class="btn btn-sec" href="/?dir=${urlEncode(parentDir.absolutePath)}">⬅️ Acima</a>""" else ""}
+                            <button type="button" onclick="openMkdirModal()">➕ Nova Pasta</button>
+                            <button type="button" class="btn-ok" onclick="setCameraHere()">📷 Definir como Destino da Câmera</button>
+                            <a class="btn btn-sec" href="/zip?dir=$encodedCurrentDir">📦 Baixar Tudo (.ZIP)</a>
+                            <label class="btn btn-sec" style="cursor:pointer;">
+                                ⬆️ Enviar Arquivos
+                                <input type="file" id="fileInput" multiple style="display:none" onchange="uploadFiles(this.files)">
+                            </label>
+                        </div>
 
-        sb.append(
-            """
-                    <button onclick="createNewFolder()">➕ Nova Pasta</button>
-                    <button class="btn-ok" onclick="setCameraHere()">📷 Usar Esta Pasta na Câmera</button>
-                    <a class="btn btn-sec" href="/zip?dir=$encodedCurrentDir">📦 Baixar Pasta (.ZIP)</a>
-                    <label class="btn btn-sec" style="cursor:pointer;">
-                        ⬆️ Enviar do PC para cá
-                        <input type="file" id="fileInput" multiple style="display:none" onchange="uploadFiles(this.files)">
-                    </label>
-                    <a class="btn btn-sec" href="/?dir=$encodedCurrentDir">🔄 Atualizar</a>
-                    <span id="uploadStatus"></span>
+                        <div class="btn-cluster">
+                            <button type="button" class="btn-sec" onclick="toggleSelectAll()">☑️ Selecionar Tudo</button>
+                            <a class="btn btn-sec" href="/?dir=$encodedCurrentDir">🔄 Atualizar</a>
+                        </div>
+                    </div>
                 </div>
 
-                <div class="grid">
+                <!-- Barra de Busca, Filtro por Tipo e Tamanho de Miniaturas -->
+                <div class="filter-bar">
+                    <div class="search-box">
+                        <span class="search-icon">🔍</span>
+                        <input type="text" id="searchInput" placeholder="Buscar fotos, vídeos ou pastas pelo nome..." oninput="applyFilters()">
+                    </div>
+
+                    <div class="pill-group">
+                        <button type="button" class="pill-btn active" id="fltAll" onclick="setCategoryFilter('all')">Todos (${children.size})</button>
+                        <button type="button" class="pill-btn" id="fltImage" onclick="setCategoryFilter('image')">Fotos ($totalPhotos)</button>
+                        <button type="button" class="pill-btn" id="fltVideo" onclick="setCategoryFilter('video')">Vídeos ($totalVideos)</button>
+                        <button type="button" class="pill-btn" id="fltFolder" onclick="setCategoryFilter('folder')">Pastas ($totalFolders)</button>
+                    </div>
+
+                    <div class="pill-group" title="Tamanho das Miniaturas">
+                        <button type="button" class="pill-btn" id="btnSizeS" onclick="setThumbSize('small')">P</button>
+                        <button type="button" class="pill-btn active" id="btnSizeM" onclick="setThumbSize('medium')">M</button>
+                        <button type="button" class="pill-btn" id="btnSizeL" onclick="setThumbSize('large')">G</button>
+                    </div>
+                </div>
+
+                <!-- Grade Principal -->
+                <div class="grid" id="itemsGrid">
             """.trimIndent()
         )
 
         if (children.isEmpty()) {
-            sb.append("""<p style="color:#94a3b8; grid-column: 1/-1;">Esta pasta está vazia.</p>""")
+            sb.append("""<p style="color:var(--text-secondary); grid-column: 1/-1; text-align:center; padding: 40px 0;">Esta pasta está vazia. Tire fotos com a câmera ou arraste arquivos do PC para cá.</p>""")
         }
 
         for (item in children) {
             val encodedPath = urlEncode(item.absolutePath)
             val dateStr = dateFormat.format(Date(item.lastModified()))
+            val safeNameLower = escapeHtml(item.name.lowercase())
 
             if (item.isDirectory) {
                 val countInside = item.listFiles()?.size ?: 0
                 sb.append(
                     """
-                    <div class="card">
+                    <div class="card item-card" data-name="$safeNameLower" data-type="folder" data-filename="${escapeHtml(item.name)}">
+                        <input type="checkbox" class="select-check" onchange="onCardSelectChange(this)">
                         <div>
                             <a href="/?dir=$encodedPath" style="text-decoration:none;">
                                 <div class="thumb-box"><span class="icon-big">📁</span></div>
-                                <div class="item-name">${escapeHtml(item.name)}</div>
+                                <span class="item-name">${escapeHtml(item.name)}</span>
                             </a>
                             <div class="item-meta">Pasta ($countInside itens) • $dateStr</div>
                         </div>
                         <div class="card-actions">
                             <a class="btn" href="/?dir=$encodedPath">Abrir</a>
-                            <button class="btn-sec" onclick="renameItem('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">Renomear</button>
-                            <button class="btn-danger" onclick="deleteItem('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">Excluir</button>
+                            <button type="button" class="btn-sec" onclick="openRenameModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">✏️</button>
+                            <button type="button" class="btn-danger" onclick="openDeleteModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">🗑️</button>
                         </div>
                     </div>
                     """.trimIndent()
@@ -865,6 +1049,11 @@ private class PhoneHttpServer(
             } else {
                 val isImg = isImageFile(item.name)
                 val isVid = isVideoFile(item.name)
+                val category = when {
+                    isImg -> "image"
+                    isVid -> "video"
+                    else -> "doc"
+                }
                 val sizeStr = formatSize(item.length())
                 val mIdx = filePathToMediaIndex[item.absolutePath]
 
@@ -876,23 +1065,24 @@ private class PhoneHttpServer(
 
                 val previewHtml = when {
                     isImg -> """<img src="/file?path=$encodedPath" loading="lazy" alt="${escapeHtml(item.name)}">"""
-                    isVid -> """<span class="icon-big">🎬</span><span class="play-badge">▶ TELA CHEIA</span>"""
+                    isVid -> """<span class="icon-big">🎬</span><span class="play-badge">▶ VÍDEO</span>"""
                     else -> """<span class="icon-big">📄</span>"""
                 }
 
                 sb.append(
                     """
-                    <div class="card">
+                    <div class="card item-card" data-name="$safeNameLower" data-type="$category" data-filename="${escapeHtml(item.name)}">
+                        <input type="checkbox" class="select-check" onchange="onCardSelectChange(this)">
                         <div>
                             <div class="thumb-box" onclick="$clickAction">$previewHtml</div>
                             <div class="item-name" onclick="$clickAction">${escapeHtml(item.name)}</div>
                             <div class="item-meta">$sizeStr • $dateStr</div>
                         </div>
                         <div class="card-actions">
-                            ${if (mIdx != null) """<button onclick="openLightbox($mIdx)">🔍 Tela Cheia</button>""" else ""}
-                            <a class="btn btn-ok" href="/file?path=$encodedPath&download=1">⬇️ Baixar</a>
-                            <button class="btn-sec" onclick="renameItem('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">✏️</button>
-                            <button class="btn-danger" onclick="deleteItem('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">🗑️</button>
+                            ${if (mIdx != null) """<button type="button" onclick="openLightbox($mIdx)">🔍 Ver</button>""" else ""}
+                            <a class="btn btn-ok" href="/file?path=$encodedPath&download=1">⬇️</a>
+                            <button type="button" class="btn-sec" onclick="openRenameModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">✏️</button>
+                            <button type="button" class="btn-danger" onclick="openDeleteModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">🗑️</button>
                         </div>
                     </div>
                     """.trimIndent()
@@ -905,6 +1095,28 @@ private class PhoneHttpServer(
                 </div>
             </div>
 
+            <!-- Barra Flutuante de Acoes em Lote -->
+            <div id="batchBar" class="batch-bar">
+                <strong id="batchCountText">0 selecionados</strong>
+                <button type="button" class="btn-ok" onclick="downloadSelectedZip()">📦 Baixar Selecionados (.ZIP)</button>
+                <button type="button" class="btn-danger" onclick="deleteSelectedBatch()">🗑️ Excluir Selecionados</button>
+                <button type="button" class="btn-sec" onclick="clearAllSelection()">✖ Limpar</button>
+            </div>
+
+            <!-- Modal Customizado Universal -->
+            <div id="customModal" class="modal-backdrop">
+                <div class="modal-card">
+                    <h3 id="modalTitle">Título</h3>
+                    <p id="modalDesc" style="font-size:13px; color:var(--text-secondary); margin:0 0 8px;"></p>
+                    <div id="modalPresetsBox" class="preset-chips" style="display:none;"></div>
+                    <input type="text" id="modalInput" placeholder="">
+                    <div class="modal-footer">
+                        <button type="button" class="btn-sec" onclick="closeCustomModal()">Cancelar</button>
+                        <button type="button" id="modalConfirmBtn">Confirmar</button>
+                    </div>
+                </div>
+            </div>
+
             <!-- Modal Visualizador em Tela Cheia (Lightbox) -->
             <div id="lightboxModal" class="lightbox">
                 <div class="lb-top">
@@ -913,19 +1125,20 @@ private class PhoneHttpServer(
                         <span id="lbTitle" class="lb-title">Arquivo</span>
                     </div>
                     <div class="lb-actions">
+                        <button type="button" class="btn-sec" onclick="toggleLightboxZoom()">🔍 Zoom</button>
                         <a id="lbDownloadBtn" class="btn btn-ok" href="#">⬇️ Baixar</a>
-                        <button class="btn-sec" onclick="renameCurrentLightboxItem()">✏️ Renomear</button>
-                        <button class="btn-danger" onclick="deleteCurrentLightboxItem()">🗑️ Excluir</button>
-                        <button class="btn-sec" onclick="closeLightbox()">✖ Fechar (Esc)</button>
+                        <button type="button" class="btn-sec" onclick="renameCurrentLightboxItem()">✏️ Renomear</button>
+                        <button type="button" class="btn-danger" onclick="deleteCurrentLightboxItem()">🗑️ Excluir</button>
+                        <button type="button" class="btn-sec" onclick="closeLightbox()">✖ Fechar</button>
                     </div>
                 </div>
                 <div class="lb-stage" onclick="if(event.target === this) closeLightbox()">
-                    <button class="lb-nav lb-prev" onclick="stepLightbox(-1)" title="Anterior (Seta Esquerda)">◀</button>
+                    <button type="button" class="lb-nav lb-prev" onclick="stepLightbox(-1)">◀</button>
                     <div id="lbMediaHolder" style="display:flex; align-items:center; justify-content:center; width:100%; height:100%;"></div>
-                    <button class="lb-nav lb-next" onclick="stepLightbox(1)" title="Próximo (Seta Direita)">▶</button>
+                    <button type="button" class="lb-nav lb-next" onclick="stepLightbox(1)">▶</button>
                 </div>
                 <div class="lb-footer">
-                    Use os botões <strong>◀ Anterior</strong> / <strong>Próximo ▶</strong> ou as teclas <strong>⬅️ ➡️</strong> do teclado para navegar pelos arquivos • <strong>ESC</strong> para sair
+                    Use <strong>◀ Anterior</strong> / <strong>Próximo ▶</strong> ou as setas <strong>⬅️ ➡️</strong> do teclado • Clique em <strong>Zoom</strong> para ampliar detalhes da vistoria
                 </div>
             </div>
 
@@ -933,9 +1146,22 @@ private class PhoneHttpServer(
                 const currentDir = "$encodedCurrentDir";
                 const csrfToken = "$csrfToken";
                 const mediaList = $mediaItemsJsArray;
+                const quickPresets = $presetsJsArray;
                 let currentLightboxIndex = 0;
+                let activeCategory = 'all';
 
-                // Ajuste de Tamanho das Miniaturas (Pequenas, Medias, Grandes)
+                // Tema Dinamico Claro / Escuro
+                function applyTheme(theme) {
+                    document.documentElement.setAttribute('data-theme', theme);
+                    localStorage.setItem('ifg_web_theme', theme);
+                }
+                function toggleTheme() {
+                    const current = document.documentElement.getAttribute('data-theme') || 'dark';
+                    applyTheme(current === 'dark' ? 'light' : 'dark');
+                }
+                applyTheme(localStorage.getItem('ifg_web_theme') || 'dark');
+
+                // Tamanho das Miniaturas (P, M, G)
                 function setThumbSize(size) {
                     const root = document.documentElement;
                     document.getElementById('btnSizeS').classList.remove('active');
@@ -944,24 +1170,197 @@ private class PhoneHttpServer(
 
                     if (size === 'small') {
                         root.style.setProperty('--card-min', '155px');
-                        root.style.setProperty('--thumb-h', '105px');
+                        root.style.setProperty('--thumb-h', '110px');
                         document.getElementById('btnSizeS').classList.add('active');
                     } else if (size === 'large') {
-                        root.style.setProperty('--card-min', '340px');
-                        root.style.setProperty('--thumb-h', '250px');
+                        root.style.setProperty('--card-min', '330px');
+                        root.style.setProperty('--thumb-h', '245px');
                         document.getElementById('btnSizeL').classList.add('active');
                     } else {
-                        root.style.setProperty('--card-min', '230px');
-                        root.style.setProperty('--thumb-h', '160px');
+                        root.style.setProperty('--card-min', '220px');
+                        root.style.setProperty('--thumb-h', '165px');
                         document.getElementById('btnSizeM').classList.add('active');
                     }
                     localStorage.setItem('ifg_thumb_size', size);
                 }
+                setThumbSize(localStorage.getItem('ifg_thumb_size') || 'medium');
 
-                const savedSize = localStorage.getItem('ifg_thumb_size') || 'medium';
-                setThumbSize(savedSize);
+                // Busca Instantanea e Filtros por Categoria
+                function setCategoryFilter(cat) {
+                    activeCategory = cat;
+                    ['All', 'Image', 'Video', 'Folder'].forEach(id => {
+                        const el = document.getElementById('flt' + id);
+                        if (el) el.classList.remove('active');
+                    });
+                    const activeBtnId = cat === 'all' ? 'fltAll' : cat === 'image' ? 'fltImage' : cat === 'video' ? 'fltVideo' : 'fltFolder';
+                    document.getElementById(activeBtnId).classList.add('active');
+                    applyFilters();
+                }
 
-                // Funcoes do Modo Tela Cheia (Lightbox)
+                function applyFilters() {
+                    const q = (document.getElementById('searchInput').value || '').toLowerCase().trim();
+                    const cards = document.querySelectorAll('.item-card');
+                    cards.forEach(card => {
+                        const name = card.getAttribute('data-name') || '';
+                        const type = card.getAttribute('data-type') || '';
+                        const matchQuery = q === '' || name.includes(q);
+                        const matchCat = activeCategory === 'all' || type === activeCategory;
+                        card.style.display = (matchQuery && matchCat) ? 'flex' : 'none';
+                    });
+                }
+
+                // Selecao Multipla em Lote
+                function getSelectedFilenames() {
+                    const selected = [];
+                    document.querySelectorAll('.item-card').forEach(card => {
+                        const cb = card.querySelector('.select-check');
+                        if (cb && cb.checked && card.style.display !== 'none') {
+                            selected.push(card.getAttribute('data-filename'));
+                        }
+                    });
+                    return selected;
+                }
+
+                function onCardSelectChange(cb) {
+                    const card = cb.closest('.item-card');
+                    if (cb.checked) card.classList.add('selected');
+                    else card.classList.remove('selected');
+                    updateBatchBar();
+                }
+
+                function updateBatchBar() {
+                    const sel = getSelectedFilenames();
+                    const bar = document.getElementById('batchBar');
+                    if (sel.length > 0) {
+                        document.getElementById('batchCountText').innerText = sel.length + " selecionado(s)";
+                        bar.classList.add('visible');
+                    } else {
+                        bar.classList.remove('visible');
+                    }
+                }
+
+                function toggleSelectAll() {
+                    const visibleCards = Array.from(document.querySelectorAll('.item-card')).filter(c => c.style.display !== 'none');
+                    const allChecked = visibleCards.length > 0 && visibleCards.every(c => c.querySelector('.select-check').checked);
+                    visibleCards.forEach(c => {
+                        const cb = c.querySelector('.select-check');
+                        cb.checked = !allChecked;
+                        if (cb.checked) c.classList.add('selected');
+                        else c.classList.remove('selected');
+                    });
+                    updateBatchBar();
+                }
+
+                function clearAllSelection() {
+                    document.querySelectorAll('.item-card').forEach(c => {
+                        c.querySelector('.select-check').checked = false;
+                        c.classList.remove('selected');
+                    });
+                    updateBatchBar();
+                }
+
+                function downloadSelectedZip() {
+                    const sel = getSelectedFilenames();
+                    if (sel.length === 0) return;
+                    window.location.href = "/zip?dir=" + currentDir + "&files=" + encodeURIComponent(sel.join("|"));
+                }
+
+                function deleteSelectedBatch() {
+                    const sel = getSelectedFilenames();
+                    if (sel.length === 0) return;
+                    openConfirmModal(
+                        "Excluir " + sel.length + " item(ns)?",
+                        "Os itens selecionados serão removidos permanentemente da memória do celular.",
+                        async () => {
+                            await postAction("cmd=batch_delete&dir=" + currentDir, sel.join("|"));
+                        }
+                    );
+                }
+
+                // Modais Elegantes (Sem prompt/confirm nativos)
+                function openInputModal(title, desc, initialValue, showPresets, onConfirm) {
+                    document.getElementById('modalTitle').innerText = title;
+                    document.getElementById('modalDesc').innerText = desc;
+                    const input = document.getElementById('modalInput');
+                    input.style.display = 'block';
+                    input.value = initialValue || '';
+
+                    const presetsBox = document.getElementById('modalPresetsBox');
+                    if (showPresets && quickPresets.length > 0) {
+                        presetsBox.style.display = 'flex';
+                        presetsBox.innerHTML = '';
+                        quickPresets.forEach(p => {
+                            const chip = document.createElement('span');
+                            chip.className = 'preset-chip';
+                            chip.innerText = p;
+                            chip.onclick = () => { input.value = p; };
+                            presetsBox.appendChild(chip);
+                        });
+                    } else {
+                        presetsBox.style.display = 'none';
+                    }
+
+                    const btn = document.getElementById('modalConfirmBtn');
+                    btn.className = 'btn';
+                    btn.innerText = 'Salvar';
+                    btn.onclick = () => {
+                        const val = input.value.trim();
+                        closeCustomModal();
+                        onConfirm(val);
+                    };
+
+                    document.getElementById('customModal').classList.add('open');
+                    setTimeout(() => input.focus(), 60);
+                }
+
+                function openConfirmModal(title, desc, onConfirm) {
+                    document.getElementById('modalTitle').innerText = title;
+                    document.getElementById('modalDesc').innerText = desc;
+                    document.getElementById('modalInput').style.display = 'none';
+                    document.getElementById('modalPresetsBox').style.display = 'none';
+
+                    const btn = document.getElementById('modalConfirmBtn');
+                    btn.className = 'btn-danger';
+                    btn.innerText = 'Confirmar Exclusão';
+                    btn.onclick = () => {
+                        closeCustomModal();
+                        onConfirm();
+                    };
+
+                    document.getElementById('customModal').classList.add('open');
+                }
+
+                function closeCustomModal() {
+                    document.getElementById('customModal').classList.remove('open');
+                }
+
+                function openMkdirModal() {
+                    openInputModal("Criar Nova Pasta", "Digite o nome da nova pasta ou subpasta:", "", false, (val) => {
+                        if (val) postAction("cmd=mkdir&dir=" + currentDir + "&name=" + encodeURIComponent(val));
+                    });
+                }
+
+                function openPrefixModal() {
+                    openInputModal("Prefixo de Captura da Câmera", "Toque em uma etiqueta rápida ou digite um novo prefixo:", "${escapeJs(activePrefix)}", true, (val) => {
+                        postAction("cmd=set_prefix&dir=" + currentDir + "&name=" + encodeURIComponent(val));
+                    });
+                }
+
+                function openRenameModal(targetPath, oldName) {
+                    openInputModal("Renomear Item", "Novo nome para '" + oldName + "':", oldName, false, (val) => {
+                        if (val && val !== oldName) {
+                            postAction("cmd=rename&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath) + "&name=" + encodeURIComponent(val));
+                        }
+                    });
+                }
+
+                function openDeleteModal(targetPath, name) {
+                    openConfirmModal("Excluir '" + name + "'?", "Este item será apagado permanentemente do armazenamento do celular.", () => {
+                        postAction("cmd=delete&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath));
+                    });
+                }
+
+                // Lightbox em Tela Cheia com Zoom e Teclado
                 function openLightbox(index) {
                     if (mediaList.length === 0) return;
                     currentLightboxIndex = index;
@@ -970,8 +1369,7 @@ private class PhoneHttpServer(
                 }
 
                 function closeLightbox() {
-                    const holder = document.getElementById('lbMediaHolder');
-                    holder.innerHTML = '';
+                    document.getElementById('lbMediaHolder').innerHTML = '';
                     document.getElementById('lightboxModal').classList.remove('open');
                 }
 
@@ -981,28 +1379,33 @@ private class PhoneHttpServer(
                     renderLightboxItem();
                 }
 
+                function toggleLightboxZoom() {
+                    const img = document.querySelector('#lbMediaHolder img');
+                    if (img) img.classList.toggle('zoomed');
+                }
+
                 function renderLightboxItem() {
                     const item = mediaList[currentLightboxIndex];
                     document.getElementById('lbCounter').innerText = (currentLightboxIndex + 1) + " / " + mediaList.length;
-                    document.getElementById('lbTitle').innerText = item.name + " (" + item.size + ")";
+                    document.getElementById('lbTitle').innerText = item.name + " (" + item.size + " • " + item.date + ")";
                     document.getElementById('lbDownloadBtn').href = item.download;
 
                     const holder = document.getElementById('lbMediaHolder');
                     if (item.type === 'video') {
                         holder.innerHTML = '<video src="' + item.url + '" controls autoplay></video>';
                     } else {
-                        holder.innerHTML = '<img src="' + item.url + '" alt="' + item.name + '">';
+                        holder.innerHTML = '<img src="' + item.url + '" alt="' + item.name + '" onclick="this.classList.toggle(\'zoomed\')">';
                     }
                 }
 
                 function renameCurrentLightboxItem() {
                     const item = mediaList[currentLightboxIndex];
-                    if (item) renameItem(item.path, item.name);
+                    if (item) openRenameModal(item.path, item.name);
                 }
 
                 function deleteCurrentLightboxItem() {
                     const item = mediaList[currentLightboxIndex];
-                    if (item) deleteItem(item.path, item.name);
+                    if (item) openDeleteModal(item.path, item.name);
                 }
 
                 document.addEventListener('keydown', function(e) {
@@ -1013,24 +1416,37 @@ private class PhoneHttpServer(
                     else if (e.key === 'Escape') closeLightbox();
                 });
 
-                // Acoes Protegidas via POST + CSRF Token
-                async function postAction(queryParams) {
+                // Drag & Drop de Arquivos na Janela
+                window.addEventListener('dragover', function(e) {
+                    e.preventDefault();
+                    document.getElementById('dropOverlay').classList.add('active');
+                });
+                document.getElementById('dropOverlay').addEventListener('dragleave', function(e) {
+                    e.preventDefault();
+                    document.getElementById('dropOverlay').classList.remove('active');
+                });
+                window.addEventListener('drop', function(e) {
+                    e.preventDefault();
+                    document.getElementById('dropOverlay').classList.remove('active');
+                    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                        uploadFiles(e.dataTransfer.files);
+                    }
+                });
+
+                async function postAction(queryParams, bodyPayload = "") {
                     const resp = await fetch("/action?" + queryParams, {
                         method: "POST",
-                        headers: { "X-CSRF-Token": csrfToken }
+                        headers: {
+                            "X-CSRF-Token": csrfToken,
+                            "Content-Type": "text/plain; charset=utf-8"
+                        },
+                        body: bodyPayload
                     });
                     if (resp.ok) {
                         window.location.reload();
                     } else {
-                        alert("Sessão expirada ou sem permissão. Recarregue a página.");
+                        alert("Sessão expirada. Recarregue a página.");
                         window.location.reload();
-                    }
-                }
-
-                function createNewFolder() {
-                    const name = prompt("Digite o nome da nova pasta:");
-                    if (name && name.trim() !== "") {
-                        postAction("cmd=mkdir&dir=" + currentDir + "&name=" + encodeURIComponent(name.trim()));
                     }
                 }
 
@@ -1038,39 +1454,19 @@ private class PhoneHttpServer(
                     postAction("cmd=set_camera&dir=" + currentDir);
                 }
 
-                function changePrefix(currentPrefix) {
-                    const name = prompt("Novo prefixo para fotos e vídeos da câmera:", currentPrefix);
-                    if (name !== null) {
-                        postAction("cmd=set_prefix&dir=" + currentDir + "&name=" + encodeURIComponent(name.trim()));
-                    }
-                }
-
-                function renameItem(targetPath, oldName) {
-                    const newName = prompt("Renomear '" + oldName + "' para:", oldName);
-                    if (newName && newName.trim() !== "" && newName.trim() !== oldName) {
-                        postAction("cmd=rename&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath) + "&name=" + encodeURIComponent(newName.trim()));
-                    }
-                }
-
-                function deleteItem(targetPath, name) {
-                    if (confirm("Tem certeza que deseja excluir permanentemente '" + name + "' do celular?")) {
-                        postAction("cmd=delete&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath));
-                    }
-                }
-
                 async function uploadFiles(files) {
                     if (!files || files.length === 0) return;
                     const status = document.getElementById("uploadStatus");
                     for (let i = 0; i < files.length; i++) {
                         const file = files[i];
-                        status.innerText = "Enviando (" + (i + 1) + "/" + files.length + "): " + file.name + "...";
+                        status.innerText = "⬆️ Enviando (" + (i + 1) + "/" + files.length + "): " + file.name + "...";
                         await fetch("/upload?dir=" + currentDir + "&name=" + encodeURIComponent(file.name), {
                             method: "POST",
                             headers: { "X-CSRF-Token": csrfToken },
                             body: file
                         });
                     }
-                    status.innerText = "Concluído! Recarregando...";
+                    status.innerText = "✅ Upload concluído!";
                     window.location.reload();
                 }
             </script>
