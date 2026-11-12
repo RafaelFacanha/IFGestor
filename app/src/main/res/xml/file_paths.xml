@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Sandbox principal (padrao fisico do Android em DCIM/Camera/IFgestor) -->
+    <external-path
+        name="ifgestor_sandbox_camera"
+        path="DCIM/Camera/IFgestor/" />
+
+    <!-- Compatibilidade para fabricantes que utilizam acento no diretorio fisico -->
+    <external-path
+        name="ifgestor_sandbox_camera_pt"
+        path="DCIM/Câmera/IFgestor/" />
+
+    <!-- Escopo de seguranca restrito ao diretorio DCIM para subpastas de captura -->
+    <external-path
+        name="ifgestor_dcim_scope"
+        path="DCIM/" />
+
+    <!-- Diretorio de cache interno para arquivos temporarios de exportacao -->
+    <cache-path
+        name="ifgestor_temp_cache"
+        path="." />
+
+</paths>
