@@ -1,12 +1,12 @@
 package com.ifgestor.app
 
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
-import android.os.Build
+import android.content.SharedPreferences
 import android.os.Environment
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -19,526 +19,555 @@ import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
 
-enum class NamingFormat(val label: String, val example: String) {
-    PREFIX_NUMBER("Prefixo + Sequencial", "Vistoria_001.jpg"),
-    PREFIX_DATETIME("Prefixo + Data/Hora", "Vistoria_20261112_143022.jpg"),
-    DATETIME_PREFIX("Data/Hora + Prefixo", "20261112_143022_Vistoria.jpg")
-}
+object SettingsManager {
 
-data class AuditLogEntry(
-    val timestamp: String,
-    val ip: String,
-    val action: String,
-    val details: String,
-    val status: String
-)
+    private const val PREFS_NAME = "ifgestor_secure_prefs"
 
-data class TaskItem(
-    val id: String,
-    val title: String,
-    val type: String, // UPLOAD, P2P_SEND, P2P_RECV, MOVE, DELETE, ZIP
-    val current: Int,
-    val total: Int,
-    val progressPercent: Int,
-    val speedOrDetail: String = "",
-    val status: String = "RUNNING", // RUNNING, DONE, ERROR
-    val updatedAt: Long = System.currentTimeMillis()
-)
+    // Chaves de Motores Independentes (Item 12)
+    private const val KEY_CAMERA_INTERCEPTOR_ACTIVE = "camera_interceptor_active"
+    private const val KEY_WEB_SERVER_ACTIVE = "web_server_active"
+    private const val KEY_FLOATING_WIDGET_ENABLED = "floating_widget_enabled"
+    private const val KEY_VOLUME_SHUTTER_ENABLED = "volume_shutter_enabled"
 
-data class PeerDevice(
-    val name: String,
-    val host: String,
-    val port: Int,
-    val useHttps: Boolean = true,
-    val isSelf: Boolean = false
-)
+    // Chaves de Pasta, Prefixo e Contadores (Itens 3, 8 e 13)
+    private const val KEY_TARGET_SUBFOLDER = "target_subfolder"
+    private const val KEY_FILE_PREFIX = "file_prefix"
+    private const val KEY_SESSION_COUNT = "session_intercept_count"
 
-class SettingsManager private constructor(private val appContext: Context) {
+    // Chaves de Seguranca PBKDF2 e Rede Local (Itens 1, 5 e 6)
+    private const val KEY_PIN_HASH_PBKDF2 = "pin_hash_pbkdf2"
+    private const val KEY_PIN_SALT = "pin_salt_hex"
+    private const val KEY_FORCE_PIN_CHANGE = "force_pin_change"
+    private const val KEY_SERVER_PORT = "server_port"
+    private const val KEY_HTTPS_ENABLED = "https_enabled"
+    private const val KEY_MDNS_ENABLED = "mdns_enabled"
+    private const val KEY_DEVICE_ALIAS = "device_alias"
+    private const val KEY_ACTIVE_MDNS_DOMAIN = "active_mdns_domain"
 
-    private val prefs = appContext.getSharedPreferences("ifgestor_secure_prefs", Context.MODE_PRIVATE)
-    private val auditFile = File(appContext.filesDir, "ifgestor_audit_log.json")
+    private const val PBKDF2_ITERATIONS = 15000
+    private const val PBKDF2_KEY_LENGTH = 256
+    private const val DEFAULT_PIN = "1234"
+    private const val AUDIT_LOG_FILE = "ifgestor_audit.log"
+    private const val MAX_AUDIT_ENTRIES = 400
 
-    // Deteccao automatica do diretorio fisico da camera (DCIM/Camera ou DCIM/Câmera) + Sandbox IFgestor
-    val sandboxRootDir: File by lazy {
+    // Controle de Concorrencia (File Locking) e Central de Tarefas Multitarefa (Itens 10 e 11)
+    private val lockedCanonicalPaths = ConcurrentHashMap.newKeySet<String>()
+    private val activeTasks = ConcurrentHashMap<String, ActiveTask>()
+    private val auditLock = Any()
+
+    data class AuditEntry(
+        val timestamp: String,
+        val ip: String,
+        val category: String,
+        val action: String,
+        val details: String,
+        val success: Boolean
+    )
+
+    data class ActiveTask(
+        val id: String,
+        val title: String,
+        val subtitle: String,
+        val type: String, // UPLOAD, DOWNLOAD, P2P_SEND, P2P_RECEIVE, MOVE, DELETE, WHATSAPP
+        val currentItems: Int,
+        val totalItems: Int,
+        val bytesProcessed: Long,
+        val totalBytes: Long,
+        val progressPercent: Int,
+        val status: String, // RUNNING, COMPLETED, FAILED
+        val updatedAt: Long = System.currentTimeMillis()
+    )
+
+    private fun prefs(context: Context): SharedPreferences {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    // =========================================================================
+    // 1. CRIPTOGRAFIA PBKDF2 COM SALT E TROCA OBRIGATORIA DO PIN 1234 (ITEM 1)
+    // =========================================================================
+
+    private fun ensurePinInitialized(context: Context) {
+        val p = prefs(context)
+        if (!p.contains(KEY_PIN_HASH_PBKDF2) || !p.contains(KEY_PIN_SALT)) {
+            val salt = generateRandomSalt()
+            val hash = hashPinPbkdf2(DEFAULT_PIN, salt)
+            p.edit()
+                .putString(KEY_PIN_SALT, bytesToHex(salt))
+                .putString(KEY_PIN_HASH_PBKDF2, bytesToHex(hash))
+                .putBoolean(KEY_FORCE_PIN_CHANGE, true)
+                .apply()
+        }
+    }
+
+    fun verifyPin(context: Context, inputPin: String): Boolean {
+        ensurePinInitialized(context)
+        val cleanPin = inputPin.trim()
+        if (cleanPin.isEmpty()) return false
+
+        val p = prefs(context)
+        val saltHex = p.getString(KEY_PIN_SALT, null) ?: return false
+        val expectedHashHex = p.getString(KEY_PIN_HASH_PBKDF2, null) ?: return false
+
+        return try {
+            val salt = hexToBytes(saltHex)
+            val expectedHash = hexToBytes(expectedHashHex)
+            val actualHash = hashPinPbkdf2(cleanPin, salt)
+            MessageDigest.isEqual(expectedHash, actualHash)
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    fun updatePin(context: Context, newPin: String): Boolean {
+        val clean = newPin.trim()
+        if (clean.length < 4 || clean.length > 8 || !clean.all { it.isDigit() }) {
+            return false
+        }
+        val salt = generateRandomSalt()
+        val hash = hashPinPbkdf2(clean, salt)
+        val isStillDefault = (clean == DEFAULT_PIN)
+
+        prefs(context).edit()
+            .putString(KEY_PIN_SALT, bytesToHex(salt))
+            .putString(KEY_PIN_HASH_PBKDF2, bytesToHex(hash))
+            .putBoolean(KEY_FORCE_PIN_CHANGE, isStillDefault)
+            .apply()
+
+        appendAuditLog(
+            context = context,
+            ip = "LOCAL/APP",
+            category = "SEGURANCA",
+            action = "ALTERACAO_PIN",
+            details = if (isStillDefault) "PIN redefinido para o padrao" else "PIN personalizado atualizado com PBKDF2",
+            success = true
+        )
+        return true
+    }
+
+    fun setServerPin(context: Context, newPin: String) {
+        updatePin(context, newPin)
+    }
+
+    fun isPinChangeRequired(context: Context): Boolean {
+        ensurePinInitialized(context)
+        return prefs(context).getBoolean(KEY_FORCE_PIN_CHANGE, true)
+    }
+
+    private fun generateRandomSalt(): ByteArray {
+        val salt = ByteArray(16)
+        SecureRandom().nextBytes(salt)
+        return salt
+    }
+
+    private fun hashPinPbkdf2(pin: String, salt: ByteArray): ByteArray {
+        val spec = PBEKeySpec(pin.toCharArray(), salt, PBKDF2_ITERATIONS, PBKDF2_KEY_LENGTH)
+        val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        return factory.generateSecret(spec).encoded
+    }
+
+    private fun bytesToHex(bytes: ByteArray): String {
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            sb.append(String.format("%02x", b))
+        }
+        return sb.toString()
+    }
+
+    private fun hexToBytes(hex: String): ByteArray {
+        val len = hex.length
+        val data = ByteArray(len / 2)
+        var i = 0
+        while (i < len) {
+            data[i / 2] = ((Character.digit(hex[i], 16) shl 4) + Character.digit(hex[i + 1], 16)).toByte()
+            i += 2
+        }
+        return data
+    }
+
+    // =========================================================================
+    // 2. SANDBOX ESTRITO EM DCIM/Camera/IFgestor (ITEM 3)
+    // =========================================================================
+
+    /**
+     * Detecta automaticamente se o aparelho utiliza "DCIM/Câmera" ou "DCIM/Camera"
+     * e garante o isolamento de seguranca dentro da subpasta "IFgestor".
+     */
+    fun getPhysicalCameraRootDir(): File {
         val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
         val cameraWithAccent = File(dcim, "Câmera")
         val cameraStandard = File(dcim, "Camera")
-        val baseCameraDir = when {
+        return when {
             cameraWithAccent.exists() && cameraWithAccent.isDirectory -> cameraWithAccent
-            else -> cameraStandard
-        }
-        File(baseCameraDir, "IFgestor").apply {
-            if (!exists()) mkdirs()
-        }
-    }
-
-    // Estados Independentes dos Motores (Interceptador de Camera vs. Servidor Web)
-    private val _isCameraInterceptorEnabled = MutableStateFlow(prefs.getBoolean(KEY_CAMERA_INTERCEPTOR, false))
-    val isCameraInterceptorEnabled: StateFlow<Boolean> = _isCameraInterceptorEnabled.asStateFlow()
-
-    private val _isWebServerEnabled = MutableStateFlow(prefs.getBoolean(KEY_WEB_SERVER, false))
-    val isWebServerEnabled: StateFlow<Boolean> = _isWebServerEnabled.asStateFlow()
-
-    // Mantido por compatibilidade: verdadeiro se pelo menos um motor estiver ativo
-    private val _isServiceRunning = MutableStateFlow(
-        _isCameraInterceptorEnabled.value || _isWebServerEnabled.value
-    )
-    val isServiceRunning: StateFlow<Boolean> = _isServiceRunning.asStateFlow()
-
-    // Pasta e Prefixo Ativos (Restritos ao Sandbox DCIM/Camera/IFgestor)
-    private val _targetFolderName = MutableStateFlow(loadValidatedFolder())
-    val targetFolderName: StateFlow<String> = _targetFolderName.asStateFlow()
-
-    private val _filePrefix = MutableStateFlow(prefs.getString(KEY_FILE_PREFIX, "Foto_") ?: "Foto_")
-    val filePrefix: StateFlow<String> = _filePrefix.asStateFlow()
-
-    private val _namingFormat = MutableStateFlow(loadNamingFormat())
-    val namingFormat: StateFlow<NamingFormat> = _namingFormat.asStateFlow()
-
-    private val _interceptVideos = MutableStateFlow(prefs.getBoolean(KEY_INTERCEPT_VIDEOS, true))
-    val interceptVideos: StateFlow<Boolean> = _interceptVideos.asStateFlow()
-
-    private val _showFloatingOverlay = MutableStateFlow(prefs.getBoolean(KEY_FLOATING_OVERLAY, true))
-    val showFloatingOverlay: StateFlow<Boolean> = _showFloatingOverlay.asStateFlow()
-
-    // Contadores Duplos: Sessao Atual e Total na Pasta Ativa
-    private val _sessionInterceptedCount = MutableStateFlow(0)
-    val sessionInterceptedCount: StateFlow<Int> = _sessionInterceptedCount.asStateFlow()
-
-    private val _currentFolderTotalCount = MutableStateFlow(0)
-    val currentFolderTotalCount: StateFlow<Int> = _currentFolderTotalCount.asStateFlow()
-
-    private val _lastInterceptedFile = MutableStateFlow<String?>(null)
-    val lastInterceptedFile: StateFlow<String?> = _lastInterceptedFile.asStateFlow()
-
-    // Seguranca: Troca Obrigatoria do PIN Inicial (1234)
-    private val _mustChangeDefaultPin = MutableStateFlow(prefs.getBoolean(KEY_MUST_CHANGE_PIN, true))
-    val mustChangeDefaultPin: StateFlow<Boolean> = _mustChangeDefaultPin.asStateFlow()
-
-    // Configuracoes de Rede, HTTPS, mDNS (ifgestor.local) e Descoberta P2P
-    private val _useHttps = MutableStateFlow(prefs.getBoolean(KEY_USE_HTTPS, true))
-    val useHttps: StateFlow<Boolean> = _useHttps.asStateFlow()
-
-    private val _enableMdns = MutableStateFlow(prefs.getBoolean(KEY_ENABLE_MDNS, true))
-    val enableMdns: StateFlow<Boolean> = _enableMdns.asStateFlow()
-
-    private val _deviceAlias = MutableStateFlow(
-        prefs.getString(KEY_DEVICE_ALIAS, defaultDeviceAlias()) ?: defaultDeviceAlias()
-    )
-    val deviceAlias: StateFlow<String> = _deviceAlias.asStateFlow()
-
-    private val _activeMdnsDomain = MutableStateFlow("ifgestor.local")
-    val activeMdnsDomain: StateFlow<String> = _activeMdnsDomain.asStateFlow()
-
-    private val _discoveredPeers = MutableStateFlow<List<PeerDevice>>(emptyList())
-    val discoveredPeers: StateFlow<List<PeerDevice>> = _discoveredPeers.asStateFlow()
-
-    // Central de Tarefas Multitarefa e Recolhivel (Mobile + Web)
-    private val activeTasksMap = ConcurrentHashMap<String, TaskItem>()
-    private val _activeTasks = MutableStateFlow<List<TaskItem>>(emptyList())
-    val activeTasks: StateFlow<List<TaskItem>> = _activeTasks.asStateFlow()
-
-    private val _isTaskCenterCollapsed = MutableStateFlow(false)
-    val isTaskCenterCollapsed: StateFlow<Boolean> = _isTaskCenterCollapsed.asStateFlow()
-
-    // File Locks em Memoria (Impede excluir ou mover um arquivo que esta sendo enviado/recebido)
-    private val lockedCanonicalPaths = ConcurrentHashMap.newKeySet<String>()
-
-    // Trilha de Auditoria (Audit Log LGPD)
-    private val _auditLogs = MutableStateFlow<List<AuditLogEntry>>(emptyList())
-    val auditLogs: StateFlow<List<AuditLogEntry>> = _auditLogs.asStateFlow()
-
-    // Lista de Subpastas do Sandbox para o Dropdown Flutuante e Widgets
-    private val _sandboxSubfolders = MutableStateFlow<List<String>>(emptyList())
-    val sandboxSubfolders: StateFlow<List<String>> = _sandboxSubfolders.asStateFlow()
-
-    init {
-        ensurePinInitialized()
-        loadAuditLogsFromDisk()
-        refreshSandboxSubfolders()
-        refreshCurrentFolderCount()
-    }
-
-    private fun defaultDeviceAlias(): String {
-        val model = Build.MODEL.replace(Regex("[^a-zA-Z0-9]"), "").take(10).lowercase(Locale.ROOT)
-        return if (model.isNotBlank()) "ifgestor-$model" else "ifgestor"
-    }
-
-    private fun loadValidatedFolder(): String {
-        val saved = prefs.getString(KEY_TARGET_FOLDER, "") ?: ""
-        val sanitized = sanitizeSubfolderRelativePath(saved)
-        return sanitized
-    }
-
-    private fun loadNamingFormat(): NamingFormat {
-        val saved = prefs.getString(KEY_NAMING_FORMAT, NamingFormat.PREFIX_NUMBER.name)
-        return try {
-            NamingFormat.valueOf(saved ?: NamingFormat.PREFIX_NUMBER.name)
-        } catch (_: Exception) {
-            NamingFormat.PREFIX_NUMBER
-        }
-    }
-
-    // =========================================================================
-    // 1. ISOLAMENTO DE SANDBOX (DCIM/Camera/IFgestor) E ANTI-LOOP
-    // =========================================================================
-
-    fun sanitizeSubfolderRelativePath(rawRelative: String): String {
-        val cleaned = rawRelative
-            .replace("\\", "/")
-            .trim()
-            .trim('/')
-            .split("/")
-            .map { segment ->
-                segment.replace(Regex("[^a-zA-Z0-9_\\-\\.\\sÀ-ÿ]"), "_").trim()
+            else -> {
+                if (!cameraStandard.exists()) cameraStandard.mkdirs()
+                cameraStandard
             }
-            .filter { it.isNotEmpty() && it != "." && it != ".." }
-            .joinToString("/")
-
-        // Se o usuario digitou o caminho legado completo, extrai apenas a subpasta interna
-        val withoutLegacyPrefix = cleaned
-            .removePrefix("DCIM/Camera/IFgestor")
-            .removePrefix("DCIM/Câmera/IFgestor")
-            .removePrefix("DCIM/IFGestor_Capturas")
-            .trim('/')
-
-        return withoutLegacyPrefix
+        }
     }
 
-    fun getTargetDirectory(): File {
-        val relative = _targetFolderName.value
-        val dir = if (relative.isBlank()) {
-            sandboxRootDir
+    fun getSandboxRootDir(): File {
+        val sandbox = File(getPhysicalCameraRootDir(), "IFgestor")
+        if (!sandbox.exists()) {
+            sandbox.mkdirs()
+        }
+        return try {
+            sandbox.canonicalFile
+        } catch (e: Exception) {
+            sandbox
+        }
+    }
+
+    fun getSandboxDisplayPath(context: Context): String {
+        val camName = getPhysicalCameraRootDir().name
+        val sub = getTargetSubfolder(context)
+        return if (sub.isEmpty()) {
+            "DCIM/$camName/IFgestor"
         } else {
-            File(sandboxRootDir, relative)
-        }
-        val canonicalRoot = sandboxRootDir.canonicalFile
-        val canonicalTarget = dir.canonicalFile
-        val safeDir = if (canonicalTarget.path.startsWith(canonicalRoot.path)) {
-            canonicalTarget
-        } else {
-            canonicalRoot
-        }
-        if (!safeDir.exists()) safeDir.mkdirs()
-        return safeDir
-    }
-
-    fun resolveInsideSandbox(relativePath: String?): File? {
-        val rootCanonical = sandboxRootDir.canonicalFile
-        if (!rootCanonical.exists()) rootCanonical.mkdirs()
-        val cleanRel = (relativePath ?: "").replace("\\", "/").trim().trimStart('/')
-        val candidate = if (cleanRel.isEmpty()) rootCanonical else File(rootCanonical, cleanRel)
-        return try {
-            val canonical = candidate.canonicalFile
-            if (canonical.path == rootCanonical.path ||
-                canonical.path.startsWith(rootCanonical.path + File.separator)
-            ) {
-                canonical
-            } else {
-                null
-            }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    fun getRelativeSandboxPath(file: File): String {
-        return try {
-            val rootPath = sandboxRootDir.canonicalFile.path
-            val filePath = file.canonicalFile.path
-            if (filePath == rootPath) {
-                ""
-            } else if (filePath.startsWith(rootPath + File.separator)) {
-                filePath.substring(rootPath.length + 1).replace("\\", "/")
-            } else {
-                ""
-            }
-        } catch (_: Exception) {
-            ""
+            "DCIM/$camName/IFgestor/$sub"
         }
     }
 
     fun isInsideSandbox(file: File): Boolean {
         return try {
-            val rootPath = sandboxRootDir.canonicalFile.path
-            val filePath = file.canonicalFile.path
-            filePath == rootPath || filePath.startsWith(rootPath + File.separator)
-        } catch (_: Exception) {
+            val rootPath = getSandboxRootDir().canonicalPath
+            val targetPath = file.canonicalPath
+            targetPath == rootPath || targetPath.startsWith("$rootPath${File.separator}")
+        } catch (e: Exception) {
             false
         }
     }
 
-    fun getDisplaySandboxPath(): String {
-        val rel = _targetFolderName.value
-        val rootLabel = if (sandboxRootDir.absolutePath.contains("Câmera")) {
-            "DCIM/Câmera/IFgestor"
-        } else {
-            "DCIM/Camera/IFgestor"
+    /**
+     * Resolve qualquer caminho relativo vindo da Web, Galeria ou P2P garantindo
+     * que jamais saia de DCIM/Camera/IFgestor (Bloqueio Total de Path Traversal).
+     */
+    fun resolveSafeSandboxFile(relativePath: String?): File? {
+        val root = getSandboxRootDir()
+        val cleanRel = (relativePath ?: "")
+            .trim()
+            .replace('\\', '/')
+            .trimStart('/')
+
+        val candidate = if (cleanRel.isEmpty()) root else File(root, cleanRel)
+        return try {
+            val canonical = candidate.canonicalFile
+            if (isInsideSandbox(canonical)) canonical else null
+        } catch (e: Exception) {
+            null
         }
-        return if (rel.isBlank()) rootLabel else "$rootLabel/$rel"
     }
 
-    fun refreshSandboxSubfolders() {
-        try {
-            if (!sandboxRootDir.exists()) sandboxRootDir.mkdirs()
-            val folders = mutableListOf("") // "" representa a raiz DCIM/Camera/IFgestor
-            fun scanRecursive(dir: File, depth: Int) {
-                if (depth > 3) return
-                val children = dir.listFiles()?.filter { it.isDirectory && !it.name.startsWith(".") }
-                    ?.sortedBy { it.name.lowercase(Locale.ROOT) } ?: return
-                for (child in children) {
-                    val rel = getRelativeSandboxPath(child)
-                    if (rel.isNotBlank()) {
-                        folders.add(rel)
-                        scanRecursive(child, depth + 1)
+    fun sanitizeSubfolderName(raw: String): String {
+        return raw.trim()
+            .replace('\\', '/')
+            .split('/')
+            .map { segment ->
+                segment.replace(Regex("[^a-zA-Z0-9_\\-\\. ]"), "_").trim()
+            }
+            .filter { it.isNotEmpty() && it != "." && it != ".." }
+            .joinToString("/")
+    }
+
+    fun sanitizeFileName(raw: String): String {
+        val clean = raw.trim().replace(Regex("[^a-zA-Z0-9_\\-\\. ]"), "_")
+        return if (clean.isEmpty() || clean == "." || clean == "..") {
+            "arquivo_${System.currentTimeMillis()}"
+        } else {
+            clean
+        }
+    }
+
+    fun getTargetSubfolder(context: Context): String {
+        val raw = prefs(context).getString(KEY_TARGET_SUBFOLDER, "") ?: ""
+        return sanitizeSubfolderName(raw)
+    }
+
+    fun setTargetSubfolder(context: Context, subfolder: String) {
+        val clean = sanitizeSubfolderName(subfolder)
+        prefs(context).edit().putString(KEY_TARGET_SUBFOLDER, clean).apply()
+        val dir = getTargetDirectory(context)
+        if (!dir.exists()) dir.mkdirs()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+    }
+
+    // Compatibilidade direta com chamadas de nome de pasta
+    fun getCustomFolderName(context: Context): String = getTargetSubfolder(context)
+    fun setCustomFolderName(context: Context, folderName: String) = setTargetSubfolder(context, folderName)
+
+    fun getTargetDirectory(context: Context): File {
+        val root = getSandboxRootDir()
+        val sub = getTargetSubfolder(context)
+        val dir = if (sub.isEmpty()) root else File(root, sub)
+        if (!dir.exists()) dir.mkdirs()
+        return try {
+            val canonical = dir.canonicalFile
+            if (isInsideSandbox(canonical)) canonical else root
+        } catch (e: Exception) {
+            root
+        }
+    }
+
+    /**
+     * Lista todas as subpastas dentro de DCIM/Camera/IFgestor para o Dropdown
+     * do Widget Flutuante, Dialogo do Home Widget, Galeria e Servidor Web.
+     */
+    fun getSandboxSubfolders(context: Context): List<String> {
+        val root = getSandboxRootDir()
+        val result = mutableListOf("") // "" representa a pasta Raiz (IFgestor)
+        val currentActive = getTargetSubfolder(context)
+
+        fun scanRecursive(dir: File, prefix: String, depth: Int) {
+            if (depth > 3) return
+            val children = dir.listFiles { f -> f.isDirectory && !f.name.startsWith(".") }
+                ?.sortedBy { it.name.lowercase(Locale.getDefault()) }
+                ?: return
+            for (child in children) {
+                val rel = if (prefix.isEmpty()) child.name else "$prefix/${child.name}"
+                result.add(rel)
+                scanRecursive(child, rel, depth + 1)
+            }
+        }
+
+        scanRecursive(root, "", 1)
+        if (currentActive.isNotEmpty() && !result.contains(currentActive)) {
+            result.add(1, currentActive)
+        }
+        return result.distinct()
+    }
+
+    fun getFilePrefix(context: Context): String {
+        val raw = prefs(context).getString(KEY_FILE_PREFIX, "IFG_") ?: "IFG_"
+        return raw.replace(Regex("[^a-zA-Z0-9_\\-]"), "_")
+    }
+
+    fun setFilePrefix(context: Context, prefix: String) {
+        val clean = prefix.trim().replace(Regex("[^a-zA-Z0-9_\\-]"), "_")
+        prefs(context).edit().putString(KEY_FILE_PREFIX, clean).apply()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+    }
+
+    // =========================================================================
+    // 3. CONTADOR DUPLO: SESSAO ATUAL E TOTAL NA PASTA (ITENS 13 E 14)
+    // =========================================================================
+
+    fun getSessionInterceptCount(context: Context): Int {
+        return prefs(context).getInt(KEY_SESSION_COUNT, 0)
+    }
+
+    fun incrementSessionInterceptCount(context: Context): Int {
+        val next = getSessionInterceptCount(context) + 1
+        prefs(context).edit().putInt(KEY_SESSION_COUNT, next).apply()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+        return next
+    }
+
+    fun resetSessionInterceptCount(context: Context) {
+        prefs(context).edit().putInt(KEY_SESSION_COUNT, 0).apply()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+    }
+
+    fun getFolderMediaCount(context: Context, subfolder: String = getTargetSubfolder(context)): Int {
+        val dir = resolveSafeSandboxFile(subfolder) ?: getSandboxRootDir()
+        if (!dir.exists() || !dir.isDirectory) return 0
+        return dir.listFiles { f ->
+            f.isFile && !f.name.startsWith(".") && !f.name.endsWith(".part") && isMediaFile(f.name)
+        }?.size ?: 0
+    }
+
+    fun isMediaFile(fileName: String): Boolean {
+        val lower = fileName.lowercase(Locale.getDefault())
+        return lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+            lower.endsWith(".png") || lower.endsWith(".webp") ||
+            lower.endsWith(".mp4") || lower.endsWith(".mov") ||
+            lower.endsWith(".mkv") || lower.endsWith(".3gp") ||
+            lower.endsWith(".pdf") || lower.endsWith(".txt")
+    }
+
+    // =========================================================================
+    // 4. MOTORES INDEPENDENTES E CONFIGURACOES DE REDE / mDNS (ITENS 6 E 12)
+    // =========================================================================
+
+    fun isCameraInterceptorEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_CAMERA_INTERCEPTOR_ACTIVE, false)
+    }
+
+    fun setCameraInterceptorEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_CAMERA_INTERCEPTOR_ACTIVE, enabled).apply()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+    }
+
+    fun isWebServerEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_WEB_SERVER_ACTIVE, false)
+    }
+
+    fun setWebServerEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_WEB_SERVER_ACTIVE, enabled).apply()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+    }
+
+    fun isFloatingWidgetEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_FLOATING_WIDGET_ENABLED, true)
+    }
+
+    fun setFloatingWidgetEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_FLOATING_WIDGET_ENABLED, enabled).apply()
+    }
+
+    fun isVolumeShutterEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_VOLUME_SHUTTER_ENABLED, true)
+    }
+
+    fun setVolumeShutterEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_VOLUME_SHUTTER_ENABLED, enabled).apply()
+    }
+
+    fun getServerPort(context: Context): Int {
+        return prefs(context).getInt(KEY_SERVER_PORT, 8080).coerceIn(1025, 65534)
+    }
+
+    fun setServerPort(context: Context, port: Int) {
+        prefs(context).edit().putInt(KEY_SERVER_PORT, port.coerceIn(1025, 65534)).apply()
+    }
+
+    fun isHttpsEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_HTTPS_ENABLED, true)
+    }
+
+    fun setHttpsEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_HTTPS_ENABLED, enabled).apply()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+    }
+
+    fun isMdnsEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_MDNS_ENABLED, true)
+    }
+
+    fun setMdnsEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_MDNS_ENABLED, enabled).apply()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+    }
+
+    fun getDeviceAlias(context: Context): String {
+        val raw = prefs(context).getString(KEY_DEVICE_ALIAS, "ifgestor") ?: "ifgestor"
+        val clean = raw.lowercase(Locale.getDefault())
+            .replace(Regex("[^a-z0-9\\-]"), "")
+            .trim('-')
+        return if (clean.isEmpty()) "ifgestor" else clean
+    }
+
+    fun setDeviceAlias(context: Context, alias: String) {
+        val clean = alias.lowercase(Locale.getDefault())
+            .replace(Regex("[^a-z0-9\\-]"), "")
+            .trim('-')
+            .ifEmpty { "ifgestor" }
+        prefs(context).edit().putString(KEY_DEVICE_ALIAS, clean).apply()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+    }
+
+    fun getActiveMdnsDomain(context: Context): String {
+        val saved = prefs(context).getString(KEY_ACTIVE_MDNS_DOMAIN, null)
+        return if (!saved.isNullOrBlank()) saved else "${getDeviceAlias(context)}.local"
+    }
+
+    fun setActiveMdnsDomain(context: Context, domain: String) {
+        prefs(context).edit().putString(KEY_ACTIVE_MDNS_DOMAIN, domain).apply()
+        IFGestorHomeWidget.requestWidgetUpdate(context)
+    }
+
+    // =========================================================================
+    // 5. TRILHA DE AUDITORIA (AUDIT LOG - COMPLIANCE & LGPD - ITEM 4)
+    // =========================================================================
+
+    fun appendAuditLog(
+        context: Context,
+        ip: String,
+        category: String,
+        action: String,
+        details: String,
+        success: Boolean = true
+    ) {
+        synchronized(auditLock) {
+            try {
+                val logFile = File(context.filesDir, AUDIT_LOG_FILE)
+                val timestamp = SimpleDateFormat("dd/MM/yyyy HH:mm:ss", Locale.getDefault()).format(Date())
+                val item = JSONObject().apply {
+                    put("timestamp", timestamp)
+                    put("ip", ip.ifBlank { "LOCAL" })
+                    put("category", category)
+                    put("action", action)
+                    put("details", details.take(300))
+                    put("success", success)
+                }
+
+                val existingLines = if (logFile.exists()) {
+                    logFile.readLines().toMutableList()
+                } else {
+                    mutableListOf()
+                }
+                existingLines.add(item.toString())
+                val trimmed = if (existingLines.size > MAX_AUDIT_ENTRIES) {
+                    existingLines.takeLast(MAX_AUDIT_ENTRIES)
+                } else {
+                    existingLines
+                }
+                logFile.writeText(trimmed.joinToString("\n"))
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun getAuditLogs(context: Context): List<AuditEntry> {
+        synchronized(auditLock) {
+            val logFile = File(context.filesDir, AUDIT_LOG_FILE)
+            if (!logFile.exists()) return emptyList()
+            val list = mutableListOf<AuditEntry>()
+            try {
+                logFile.readLines().asReversed().forEach { line ->
+                    if (line.isNotBlank()) {
+                        val obj = JSONObject(line)
+                        list.add(
+                            AuditEntry(
+                                timestamp = obj.optString("timestamp", "-"),
+                                ip = obj.optString("ip", "-"),
+                                category = obj.optString("category", "GERAL"),
+                                action = obj.optString("action", "-"),
+                                details = obj.optString("details", ""),
+                                success = obj.optBoolean("success", true)
+                            )
+                        )
                     }
                 }
+            } catch (_: Exception) {
             }
-            scanRecursive(sandboxRootDir, 1)
-            val current = _targetFolderName.value
-            if (current.isNotBlank() && !folders.contains(current)) {
-                folders.add(1, current)
+            return list
+        }
+    }
+
+    fun clearAuditLogs(context: Context) {
+        synchronized(auditLock) {
+            try {
+                File(context.filesDir, AUDIT_LOG_FILE).delete()
+                appendAuditLog(
+                    context = context,
+                    ip = "LOCAL/APP",
+                    category = "AUDITORIA",
+                    action = "LIMPEZA_LOGS",
+                    details = "Historico de auditoria reiniciado pelo usuario no aparelho",
+                    success = true
+                )
+            } catch (_: Exception) {
             }
-            _sandboxSubfolders.value = folders.distinct()
-        } catch (_: Exception) {
-            _sandboxSubfolders.value = listOf("")
-        }
-    }
-
-    fun createSandboxSubfolder(folderName: String): Boolean {
-        val clean = sanitizeSubfolderRelativePath(folderName)
-        if (clean.isBlank()) return false
-        val dir = resolveInsideSandbox(clean) ?: return false
-        val ok = dir.exists() || dir.mkdirs()
-        if (ok) {
-            refreshSandboxSubfolders()
-            setTargetFolderName(clean)
-        }
-        return ok
-    }
-
-    // Resolve colisoes de nome automaticamente (ex: Foto_1.jpg) para nao travar filas paralelas
-    fun resolveNonConflictingFile(targetDir: File, desiredName: String): File {
-        val safeName = desiredName.replace(Regex("[^a-zA-Z0-9_\\-\\.\\sÀ-ÿ]"), "_").trim()
-            .ifBlank { "Arquivo_${System.currentTimeMillis()}" }
-        var candidate = File(targetDir, safeName)
-        if (!candidate.exists() && !isFileLocked(candidate)) {
-            return candidate
-        }
-        val dotIndex = safeName.lastIndexOf('.')
-        val base = if (dotIndex > 0) safeName.substring(0, dotIndex) else safeName
-        val ext = if (dotIndex > 0) safeName.substring(dotIndex) else ""
-        var counter = 1
-        while (candidate.exists() || isFileLocked(candidate)) {
-            candidate = File(targetDir, "${base}_$counter$ext")
-            counter++
-        }
-        return candidate
-    }
-
-    // =========================================================================
-    // 2. CONTROLES DOS MOTORES INDEPENDENTES E CONFIGURACOES DE CAPTURA
-    // =========================================================================
-
-    fun setCameraInterceptorEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_CAMERA_INTERCEPTOR, enabled).apply()
-        _isCameraInterceptorEnabled.value = enabled
-        _isServiceRunning.value = enabled || _isWebServerEnabled.value
-        notifyHomeWidgetUpdate()
-    }
-
-    fun setWebServerEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_WEB_SERVER, enabled).apply()
-        _isWebServerEnabled.value = enabled
-        _isServiceRunning.value = _isCameraInterceptorEnabled.value || enabled
-        notifyHomeWidgetUpdate()
-    }
-
-    fun setServiceRunning(running: Boolean) {
-        setCameraInterceptorEnabled(running)
-        setWebServerEnabled(running)
-    }
-
-    fun setTargetFolderName(folderSubpath: String) {
-        val clean = sanitizeSubfolderRelativePath(folderSubpath)
-        prefs.edit().putString(KEY_TARGET_FOLDER, clean).apply()
-        _targetFolderName.value = clean
-        getTargetDirectory() // Garante criacao fisica da subpasta
-        refreshSandboxSubfolders()
-        refreshCurrentFolderCount()
-        notifyHomeWidgetUpdate()
-    }
-
-    fun setFilePrefix(prefix: String) {
-        val clean = prefix.replace(Regex("[^a-zA-Z0-9_\\-]"), "_").ifBlank { "Foto_" }
-        prefs.edit().putString(KEY_FILE_PREFIX, clean).apply()
-        _filePrefix.value = clean
-        notifyHomeWidgetUpdate()
-    }
-
-    fun setNamingFormat(format: NamingFormat) {
-        prefs.edit().putString(KEY_NAMING_FORMAT, format.name).apply()
-        _namingFormat.value = format
-    }
-
-    fun setInterceptVideos(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_INTERCEPT_VIDEOS, enabled).apply()
-        _interceptVideos.value = enabled
-    }
-
-    fun setShowFloatingOverlay(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_FLOATING_OVERLAY, enabled).apply()
-        _showFloatingOverlay.value = enabled
-    }
-
-    fun setUseHttps(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_USE_HTTPS, enabled).apply()
-        _useHttps.value = enabled
-        notifyHomeWidgetUpdate()
-    }
-
-    fun setEnableMdns(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_ENABLE_MDNS, enabled).apply()
-        _enableMdns.value = enabled
-        notifyHomeWidgetUpdate()
-    }
-
-    fun setDeviceAlias(alias: String) {
-        val clean = alias.lowercase(Locale.ROOT)
-            .replace(Regex("[^a-z0-9\\-]"), "-")
-            .trim('-')
-            .ifBlank { "ifgestor" }
-        prefs.edit().putString(KEY_DEVICE_ALIAS, clean).apply()
-        _deviceAlias.value = clean
-        notifyHomeWidgetUpdate()
-    }
-
-    fun setActiveMdnsDomain(domain: String) {
-        _activeMdnsDomain.value = domain
-        notifyHomeWidgetUpdate()
-    }
-
-    fun updateDiscoveredPeers(peers: List<PeerDevice>) {
-        _discoveredPeers.value = peers
-    }
-
-    fun recordInterceptedMedia(fileName: String) {
-        _sessionInterceptedCount.value += 1
-        _lastInterceptedFile.value = fileName
-        refreshCurrentFolderCount()
-        notifyHomeWidgetUpdate()
-    }
-
-    fun resetSessionCounter() {
-        _sessionInterceptedCount.value = 0
-        notifyHomeWidgetUpdate()
-    }
-
-    fun refreshCurrentFolderCount(): Int {
-        val dir = getTargetDirectory()
-        val count = dir.listFiles()?.count { file ->
-            file.isFile && !file.name.startsWith(".") && !file.name.endsWith(".part")
-        } ?: 0
-        _currentFolderTotalCount.value = count
-        return count
-    }
-
-    fun generateNextFileName(extension: String): String {
-        val cleanExt = extension.trimStart('.').lowercase(Locale.ROOT).ifBlank { "jpg" }
-        val prefix = _filePrefix.value
-        val targetDir = getTargetDirectory()
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date())
-
-        val desiredName = when (_namingFormat.value) {
-            NamingFormat.PREFIX_NUMBER -> {
-                val existingCount = targetDir.listFiles()?.count {
-                    it.isFile && !it.name.endsWith(".part")
-                } ?: 0
-                val nextNum = (existingCount + 1).toString().padStart(3, '0')
-                "${prefix}${nextNum}.$cleanExt"
-            }
-            NamingFormat.PREFIX_DATETIME -> "${prefix}${timestamp}.$cleanExt"
-            NamingFormat.DATETIME_PREFIX -> "${timestamp}_${prefix.trimEnd('_')}.$cleanExt"
-        }
-        return resolveNonConflictingFile(targetDir, desiredName).name
-    }
-
-    // =========================================================================
-    // 3. CRIPTOGRAFIA PBKDF2 COM SALT ALEATORIO (PADRAO OWASP MASVS)
-    // =========================================================================
-
-    private fun ensurePinInitialized() {
-        val hasPbkdf2 = prefs.contains(KEY_PIN_HASH_PBKDF2) && prefs.contains(KEY_PIN_SALT)
-        if (!hasPbkdf2) {
-            setPinInternal("1234", isInitialDefault = true)
-        }
-    }
-
-    private fun setPinInternal(newPin: String, isInitialDefault: Boolean) {
-        val salt = ByteArray(16)
-        SecureRandom().nextBytes(salt)
-        val hashHex = pbkdf2Hex(newPin, salt)
-        val saltHex = bytesToHex(salt)
-        prefs.edit()
-            .putString(KEY_PIN_HASH_PBKDF2, hashHex)
-            .putString(KEY_PIN_SALT, saltHex)
-            .putBoolean(KEY_MUST_CHANGE_PIN, isInitialDefault || newPin == "1234")
-            .apply()
-        _mustChangeDefaultPin.value = isInitialDefault || newPin == "1234"
-    }
-
-    fun updateServerPin(newPin: String): Boolean {
-        val trimmed = newPin.trim()
-        if (trimmed.length < 4 || trimmed.length > 12 || !trimmed.all { it.isDigit() }) {
-            return false
-        }
-        setPinInternal(trimmed, isInitialDefault = false)
-        appendAuditLog("LOCAL_APP", "PIN_UPDATED", "PIN de seguranca atualizado pelo usuario", "SUCCESS")
-        return true
-    }
-
-    fun verifyServerPin(inputPin: String): Boolean {
-        val saltHex = prefs.getString(KEY_PIN_SALT, null) ?: return false
-        val storedHashHex = prefs.getString(KEY_PIN_HASH_PBKDF2, null) ?: return false
-        val salt = hexToBytes(saltHex)
-        val candidateHashHex = pbkdf2Hex(inputPin.trim(), salt)
-        return MessageDigest.isEqual(
-            storedHashHex.toByteArray(Charsets.UTF_8),
-            candidateHashHex.toByteArray(Charsets.UTF_8)
-        )
-    }
-
-    private fun pbkdf2Hex(pin: String, salt: ByteArray): String {
-        return try {
-            val spec = PBEKeySpec(pin.toCharArray(), salt, 12000, 256)
-            val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
-            val bytes = factory.generateSecret(spec).encoded
-            bytesToHex(bytes)
-        } catch (_: Exception) {
-            val md = MessageDigest.getInstance("SHA-256")
-            md.update(salt)
-            bytesToHex(md.digest(pin.toByteArray(Charsets.UTF_8)))
-        }
-    }
-
-    private fun bytesToHex(bytes: ByteArray): String =
-        bytes.joinToString("") { "%02x".format(it) }
-
-    private fun hexToBytes(hex: String): ByteArray {
-        val clean = if (hex.length % 2 == 0) hex else "0$hex"
-        return ByteArray(clean.length / 2) { i ->
-            clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
         }
     }
 
     // =========================================================================
-    // 4. BLOQUEIO DE ARQUIVOS EM TRANSITO (FILE LOCKING) E CENTRAL DE TAREFAS
+    // 6. BLOQUEIO DE ARQUIVOS EM TRANSITO (FILE LOCK) E DUPLICADOS (ITEM 11)
     // =========================================================================
 
     fun tryLockFile(file: File): Boolean {
         return try {
             lockedCanonicalPaths.add(file.canonicalPath)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             false
         }
     }
@@ -546,165 +575,213 @@ class SettingsManager private constructor(private val appContext: Context) {
     fun unlockFile(file: File) {
         try {
             lockedCanonicalPaths.remove(file.canonicalPath)
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
     }
 
     fun isFileLocked(file: File): Boolean {
         return try {
             lockedCanonicalPaths.contains(file.canonicalPath)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             false
         }
     }
 
+    /**
+     * Caso ja exista um arquivo com o mesmo nome na pasta de destino,
+     * gera automaticamente Foto_1.jpg, Foto_2.jpg, etc. sem travar lotes paralelos.
+     */
+    fun resolveUniqueFile(directory: File, desiredFileName: String): File {
+        if (!directory.exists()) directory.mkdirs()
+        val safeName = sanitizeFileName(desiredFileName)
+        var candidate = File(directory, safeName)
+        if (!candidate.exists() && !File(directory, "$safeName.part").exists()) {
+            return candidate
+        }
+
+        val dotIndex = safeName.lastIndexOf('.')
+        val baseName = if (dotIndex > 0) safeName.substring(0, dotIndex) else safeName
+        val extension = if (dotIndex > 0) safeName.substring(dotIndex) else ""
+
+        var counter = 1
+        while (true) {
+            val numberedName = "${baseName}_$counter$extension"
+            candidate = File(directory, numberedName)
+            if (!candidate.exists() && !File(directory, "$numberedName.part").exists()) {
+                return candidate
+            }
+            counter++
+        }
+    }
+
+    // =========================================================================
+    // 7. CENTRAL DE TAREFAS MULTITAREFA (WEB & MOBILE - ITEM 10)
+    // =========================================================================
+
     fun upsertTask(
         id: String,
         title: String,
+        subtitle: String,
         type: String,
-        current: Int,
-        total: Int,
-        speedOrDetail: String = "",
+        currentItems: Int,
+        totalItems: Int,
+        bytesProcessed: Long = 0L,
+        totalBytes: Long = 0L,
         status: String = "RUNNING"
-    ) {
-        val safeTotal = if (total <= 0) 1 else total
-        val pct = ((current.toDouble() / safeTotal.toDouble()) * 100.0).toInt().coerceIn(0, 100)
-        val item = TaskItem(
+    ): ActiveTask {
+        val percent = when {
+            status == "COMPLETED" -> 100
+            totalBytes > 0L -> ((bytesProcessed * 100L) / totalBytes).toInt().coerceIn(0, 99)
+            totalItems > 0 -> ((currentItems * 100) / totalItems).coerceIn(0, 99)
+            else -> 0
+        }
+        val task = ActiveTask(
             id = id,
             title = title,
+            subtitle = subtitle,
             type = type,
-            current = current,
-            total = total,
-            progressPercent = if (status == "DONE") 100 else pct,
-            speedOrDetail = speedOrDetail,
+            currentItems = currentItems,
+            totalItems = totalItems,
+            bytesProcessed = bytesProcessed,
+            totalBytes = totalBytes,
+            progressPercent = percent,
             status = status,
             updatedAt = System.currentTimeMillis()
         )
-        activeTasksMap[id] = item
-        publishTasksState()
+        activeTasks[id] = task
+        return task
     }
 
-    fun removeTask(id: String) {
-        activeTasksMap.remove(id)
-        publishTasksState()
+    fun getTasksSnapshot(): List<ActiveTask> {
+        val now = System.currentTimeMillis()
+        // Remove tarefas finalizadas ha mais de 3 minutos para manter a fila limpa
+        activeTasks.entries.removeIf { (_, task) ->
+            task.status != "RUNNING" && (now - task.updatedAt) > 180_000L
+        }
+        return activeTasks.values.sortedByDescending { it.updatedAt }
     }
 
     fun clearCompletedTasks() {
-        val iterator = activeTasksMap.entries.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (entry.value.status != "RUNNING") {
-                iterator.remove()
-            }
-        }
-        publishTasksState()
+        activeTasks.entries.removeIf { (_, task) -> task.status != "RUNNING" }
     }
 
-    fun setTaskCenterCollapsed(collapsed: Boolean) {
-        _isTaskCenterCollapsed.value = collapsed
-    }
-
-    private fun publishTasksState() {
-        _activeTasks.value = activeTasksMap.values.sortedByDescending { it.updatedAt }
-    }
-
-    // =========================================================================
-    // 5. TRILHA DE AUDITORIA PERSISTENTE (AUDIT LOG - COMPLIANCE LGPD)
-    // =========================================================================
-
-    @Synchronized
-    fun appendAuditLog(ip: String, action: String, details: String, status: String = "SUCCESS") {
-        val timestamp = SimpleDateFormat("dd/MM/yyyy HH:mm:ss", Locale.ROOT).format(Date())
-        val entry = AuditLogEntry(
-            timestamp = timestamp,
-            ip = ip,
-            action = action,
-            details = details.take(220),
-            status = status
-        )
-        val updated = (listOf(entry) + _auditLogs.value).take(250)
-        _auditLogs.value = updated
-        saveAuditLogsToDisk(updated)
-    }
-
-    @Synchronized
-    fun clearAuditLogs() {
-        _auditLogs.value = emptyList()
-        if (auditFile.exists()) auditFile.delete()
-        appendAuditLog("LOCAL_APP", "AUDIT_CLEARED", "Historico de auditoria limpo no dispositivo", "INFO")
-    }
-
-    private fun loadAuditLogsFromDisk() {
-        if (!auditFile.exists()) return
-        try {
-            val raw = auditFile.readText(Charsets.UTF_8)
-            val arr = JSONArray(raw)
-            val list = mutableListOf<AuditLogEntry>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                list.add(
-                    AuditLogEntry(
-                        timestamp = obj.optString("timestamp"),
-                        ip = obj.optString("ip"),
-                        action = obj.optString("action"),
-                        details = obj.optString("details"),
-                        status = obj.optString("status", "INFO")
-                    )
-                )
-            }
-            _auditLogs.value = list
-        } catch (_: Exception) {
-            _auditLogs.value = emptyList()
-        }
-    }
-
-    private fun saveAuditLogsToDisk(entries: List<AuditLogEntry>) {
-        try {
-            val arr = JSONArray()
-            for (e in entries) {
-                val obj = JSONObject().apply {
-                    put("timestamp", e.timestamp)
-                    put("ip", e.ip)
-                    put("action", e.action)
-                    put("details", e.details)
-                    put("status", e.status)
+    fun getTasksJsonArray(): JSONArray {
+        val arr = JSONArray()
+        for (t in getTasksSnapshot()) {
+            arr.put(
+                JSONObject().apply {
+                    put("id", t.id)
+                    put("title", t.title)
+                    put("subtitle", t.subtitle)
+                    put("type", t.type)
+                    put("currentItems", t.currentItems)
+                    put("totalItems", t.totalItems)
+                    put("bytesProcessed", t.bytesProcessed)
+                    put("totalBytes", t.totalBytes)
+                    put("progressPercent", t.progressPercent)
+                    put("status", t.status)
                 }
-                arr.put(obj)
-            }
-            auditFile.writeText(arr.toString(), Charsets.UTF_8)
-        } catch (_: Exception) {}
+            )
+        }
+        return arr
     }
 
-    fun notifyHomeWidgetUpdate() {
-        try {
-            val intent = Intent("com.ifgestor.app.ACTION_WIDGET_REFRESH").apply {
-                setPackage(appContext.packageName)
+    // =========================================================================
+    // 8. COMPARTILHAMENTO SEGURO VIA WHATSAPP / WHATSAPP BUSINESS (ITEM 16)
+    // =========================================================================
+
+    fun shareFilesToWhatsApp(
+        context: Context,
+        files: List<File>,
+        specificPackage: String? = null
+    ): Boolean {
+        val validFiles = files.filter { it.exists() && it.isFile && isInsideSandbox(it) }
+        if (validFiles.isEmpty()) return false
+
+        return try {
+            val authority = "${context.packageName}.fileprovider"
+            val uris = ArrayList(validFiles.map { FileProvider.getUriForFile(context, authority, it) })
+
+            val intent = if (uris.size == 1) {
+                Intent(Intent.ACTION_SEND).apply {
+                    type = getMimeType(validFiles.first())
+                    putExtra(Intent.EXTRA_STREAM, uris.first())
+                }
+            } else {
+                Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                    type = "*/*"
+                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                }
             }
-            appContext.sendBroadcast(intent)
-        } catch (_: Exception) {}
+
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+
+            // ClipData e exigido a partir do Android 11 para conceder permissao de leitura em lotes
+            val clipData = ClipData.newUri(context.contentResolver, "IFGestor Media", uris.first())
+            for (i in 1 until uris.size) {
+                clipData.addItem(ClipData.Item(uris[i]))
+            }
+            intent.clipData = clipData
+
+            val pm = context.packageManager
+            val targetPkg = when {
+                !specificPackage.isNullOrBlank() && isPackageInstalled(pm, specificPackage) -> specificPackage
+                isPackageInstalled(pm, "com.whatsapp") -> "com.whatsapp"
+                isPackageInstalled(pm, "com.whatsapp.w4b") -> "com.whatsapp.w4b"
+                else -> null
+            }
+
+            if (targetPkg != null) {
+                intent.setPackage(targetPkg)
+                context.startActivity(intent)
+            } else {
+                val chooser = Intent.createChooser(intent, "Compartilhar arquivos via...").apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(chooser)
+            }
+
+            appendAuditLog(
+                context = context,
+                ip = "LOCAL/WHATSAPP",
+                category = "COMPARTILHAMENTO",
+                action = "ENVIO_WHATSAPP",
+                details = "Compartilhado(s) ${validFiles.size} arquivo(s) para ${targetPkg ?: "seletor nativo"}",
+                success = true
+            )
+            true
+        } catch (e: Exception) {
+            appendAuditLog(
+                context = context,
+                ip = "LOCAL/WHATSAPP",
+                category = "COMPARTILHAMENTO",
+                action = "ERRO_WHATSAPP",
+                details = "Falha ao compartilhar: ${e.message}",
+                success = false
+            )
+            false
+        }
     }
 
-    companion object {
-        private const val KEY_CAMERA_INTERCEPTOR = "key_camera_interceptor_enabled"
-        private const val KEY_WEB_SERVER = "key_web_server_enabled"
-        private const val KEY_TARGET_FOLDER = "key_target_folder_sandbox"
-        private const val KEY_FILE_PREFIX = "key_file_prefix"
-        private const val KEY_NAMING_FORMAT = "key_naming_format"
-        private const val KEY_INTERCEPT_VIDEOS = "key_intercept_videos"
-        private const val KEY_FLOATING_OVERLAY = "key_floating_overlay"
-        private const val KEY_PIN_HASH_PBKDF2 = "key_pin_hash_pbkdf2"
-        private const val KEY_PIN_SALT = "key_pin_salt_hex"
-        private const val KEY_MUST_CHANGE_PIN = "key_must_change_default_pin"
-        private const val KEY_USE_HTTPS = "key_use_https"
-        private const val KEY_ENABLE_MDNS = "key_enable_mdns"
-        private const val KEY_DEVICE_ALIAS = "key_device_alias"
+    private fun isPackageInstalled(pm: android.content.pm.PackageManager, pkg: String): Boolean {
+        return try {
+            pm.getPackageInfo(pkg, 0)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
 
-        @Volatile
-        private var INSTANCE: SettingsManager? = null
-
-        fun getInstance(context: Context): SettingsManager {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: SettingsManager(context.applicationContext).also { INSTANCE = it }
-            }
+    fun getMimeType(file: File): String {
+        val ext = file.extension.lowercase(Locale.getDefault())
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: when (ext) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "webp" -> "image/webp"
+            "mp4" -> "video/mp4"
+            "mov" -> "video/quicktime"
+            "pdf" -> "application/pdf"
+            else -> "application/octet-stream"
         }
     }
 }
