@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Base Corporativa Arredondada (Grafite Profundo) -->
+    <path
+        android:fillColor="#0B1120"
+        android:pathData="M24,4 L84,4 A20,20 0 0,1 104,24 L104,84 A20,20 0 0,1 84,104 L24,104 A20,20 0 0,1 4,84 L4,24 A20,20 0 0,1 24,4 Z" />
+
+    <!-- Borda Sutil Externa do Icone -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1E293B"
+        android:strokeWidth="2"
+        android:pathData="M24,6 L84,6 A18,18 0 0,1 102,24 L102,84 A18,18 0 0,1 84,102 L24,102 A18,18 0 0,1 6,84 L6,24 A18,18 0 0,1 24,6 Z" />
+
+    <!-- Contorno Luminoso do Escudo (Ciano Corporativo) -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M54,14 L86,26 L86,52 C86,73 72,88 54,95 C36,88 22,73 22,52 L22,26 Z" />
+
+    <!-- Corpo Interno do Escudo (Azul Marinho Executivo) -->
+    <path
+        android:fillColor="#0F2942"
+        android:pathData="M54,18 L82,28.5 L82,52 C82,70.5 69.5,84 54,90.5 C38.5,84 26,70.5 26,52 L26,28.5 Z" />
+
+    <!-- Pasta de Gestao de Arquivos no Centro do Escudo -->
+    <path
+        android:fillColor="#0284C7"
+        android:pathData="M34,35 L46,35 L51,40 L74,40 A3,3 0 0,1 77,43 L77,69 A4,4 0 0,1 73,73 L35,73 A4,4 0 0,1 31,69 L31,38 A3,3 0 0,1 34,35 Z" />
+
+    <!-- Aba Superior Iluminada da Pasta -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M34,35 L46,35 L50,39 L31,39 L31,38 A3,3 0 0,1 34,35 Z" />
+
+    <!-- Aro Externo da Lente Fotografica -->
+    <path
+        android:fillColor="#0B1120"
+        android:pathData="M54,41 A15,15 0 1,1 53.99,41 Z" />
+
+    <!-- Anel Metalico Ciano da Lente -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M54,43.5 A12.5,12.5 0 1,1 53.99,43.5 Z" />
+
+    <!-- Camara Escura Interna do Obturador -->
+    <path
+        android:fillColor="#0F2942"
+        android:pathData="M54,45.5 A10.5,10.5 0 1,1 53.99,45.5 Z" />
+
+    <!-- Laminas do Obturador (Verde Esmeralda e Ciano) -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M54,47 L61.5,50.5 L56,54.5 Z" />
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M63,56 L59.5,63.5 L55.5,58 Z" />
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M54,65 L46.5,61.5 L52,57.5 Z" />
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M45,56 L48.5,48.5 L52.5,54 Z" />
+
+    <!-- Ponto Central de Foco da Lente -->
+    <path
+        android:fillColor="#F8FAFC"
+        android:pathData="M54,54.2 A1.8,1.8 0 1,1 53.99,54.2 Z" />
+
+</vector>

@@ -18,6 +18,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.MediaStore
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,6 +36,7 @@ class MediaInterceptorService : Service() {
         const val ACTION_STOP = "com.ifgestor.app.ACTION_STOP"
         const val ACTION_TOGGLE_OVERLAY = "com.ifgestor.app.ACTION_TOGGLE_OVERLAY"
         const val ACTION_REFRESH_CONFIG = "com.ifgestor.app.ACTION_REFRESH_CONFIG"
+        const val ACTION_APPROVE_2FA = "com.ifgestor.app.ACTION_APPROVE_2FA"
         private const val CHANNEL_ID = "ifgestor_interceptor_channel"
         private const val AUTH_CHANNEL_ID = "ifgestor_2fa_channel"
         private const val NOTIFICATION_ID = 1001
@@ -61,9 +63,8 @@ class MediaInterceptorService : Service() {
             updateNotification()
         }
 
-        // Dispara notificacao com o codigo 2FA sempre que um PC solicitar acesso
-        SettingsManager.onTwoFactorCodeGenerated = { code, clientIp ->
-            showTwoFactorNotification(code, clientIp)
+        SettingsManager.onTwoFactorRequestWithAction = { code, clientIp, actionDesc ->
+            showTwoFactorNotification(code, clientIp, actionDesc)
         }
 
         registerMediaObservers()
@@ -83,6 +84,21 @@ class MediaInterceptorService : Service() {
                 syncWebServerState()
                 overlayManager?.refreshBubbleLabel()
                 updateNotification()
+                return START_STICKY
+            }
+            ACTION_APPROVE_2FA -> {
+                val approvedCode = SettingsManager.approvePendingTwoFactor()
+                val manager = getSystemService(NotificationManager::class.java)
+                manager?.cancel(TWO_FA_NOTIFICATION_ID)
+                if (approvedCode != null) {
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(
+                            this,
+                            "✓ Operação autorizada no computador!",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
                 return START_STICKY
             }
         }
@@ -111,7 +127,7 @@ class MediaInterceptorService : Service() {
         return START_STICKY
     }
 
-    private fun showTwoFactorNotification(code: String, clientIp: String) {
+    private fun showTwoFactorNotification(code: String, clientIp: String, actionDesc: String) {
         val openAppIntent = Intent(this, MainActivity::class.java)
         val openAppPending = PendingIntent.getActivity(
             this,
@@ -120,13 +136,35 @@ class MediaInterceptorService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val approveIntent = Intent(this, MediaInterceptorService::class.java).apply {
+            action = ACTION_APPROVE_2FA
+        }
+        val approvePending = PendingIntent.getService(
+            this,
+            4,
+            approveIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         val notification = NotificationCompat.Builder(this, AUTH_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
-            .setContentTitle("Código 2FA IFGestor: $code")
-            .setContentText("Solicitação de acesso no PC ($clientIp). Expira em 2 min.")
+            .setSmallIcon(R.drawable.ic_ifgestor_logo)
+            .setContentTitle("Código 2FA: $code • $actionDesc")
+            .setContentText("PC ($clientIp) aguarda confirmação. Digite o código ou aprove abaixo.")
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    "Operação solicitada: $actionDesc\n" +
+                        "Computador: $clientIp\n" +
+                        "Código 2FA: $code (ou toque em 'Aprovar Agora')"
+                )
+            )
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(openAppPending)
+            .addAction(
+                android.R.drawable.checkbox_on_background,
+                "✓ Aprovar Agora",
+                approvePending
+            )
             .build()
 
         val manager = getSystemService(NotificationManager::class.java)
@@ -357,7 +395,7 @@ class MediaInterceptorService : Service() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setSmallIcon(R.drawable.ic_ifgestor_logo)
             .setContentTitle("IFGestor Ativo ($count capturados)")
             .setContentText("Prefixo: $prefix | $webInfo")
             .setOngoing(true)
@@ -394,10 +432,10 @@ class MediaInterceptorService : Service() {
 
             val authChannel = NotificationChannel(
                 AUTH_CHANNEL_ID,
-                "Códigos de Segurança 2FA",
+                "Autorizações 2FA de Segurança",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "Exibe o código de verificação em duas etapas quando um PC solicita acesso"
+                description = "Exibe solicitações de aprovação em duas etapas do computador"
             }
 
             manager?.createNotificationChannel(serviceChannel)
@@ -407,6 +445,7 @@ class MediaInterceptorService : Service() {
 
     private fun stopInterceptorService() {
         SettingsManager.onTwoFactorCodeGenerated = null
+        SettingsManager.onTwoFactorRequestWithAction = null
         overlayManager?.hide()
         WebServerManager.stopServer()
         releaseLocks()
@@ -417,6 +456,7 @@ class MediaInterceptorService : Service() {
 
     override fun onDestroy() {
         SettingsManager.onTwoFactorCodeGenerated = null
+        SettingsManager.onTwoFactorRequestWithAction = null
         overlayManager?.hide()
         WebServerManager.stopServer()
         releaseLocks()
