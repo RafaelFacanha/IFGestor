@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root_container"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0F172A"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <!-- Cabecalho Corporativo: Logo, Titulo e Status dos Motores (Interceptador e Web mDNS) -->
+    <LinearLayout
+        android:id="@+id/widget_header_box"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingBottom="8dp">
+
+        <ImageView
+            android:id="@+id/widget_logo"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
+            android:contentDescription="Logo IFGestor"
+            android:src="@drawable/ic_ifgestor_logo" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/widget_title"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="IFGestor"
+                android:textColor="#F8FAFC"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/widget_status_badge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="⚪ CÂMERA: OFF • WEB: OFF"
+                android:textColor="#10B981"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Barra de Telemetria: Pasta/Prefixo Ativos e Contador Duplo (Sessao | Pasta) -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="10dp"
+        android:background="#1E293B"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingLeft="10dp"
+        android:paddingTop="6dp"
+        android:paddingRight="10dp"
+        android:paddingBottom="6dp">
+
+        <TextView
+            android:id="@+id/widget_folder_text"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="middle"
+            android:singleLine="true"
+            android:text="Pasta: DCIM/Camera/IFgestor"
+            android:textColor="#38BDF8"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/widget_counter_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="Sessão: 0 | Pasta: 0"
+            android:textColor="#F8FAFC"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- Grade com os 4 Botoes de Acao Direta na Tela Inicial -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android: baselineAligned="false"
+        android:orientation="horizontal"
+        android:weightSum="4">
+
+        <!-- Botao 1: Escolher Subpasta -->
+        <LinearLayout
+            android:id="@+id/widget_btn_folder"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_marginEnd="4dp"
+            android:layout_weight="1"
+            android:background="#0284C7"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="4dp">
+
+            <ImageView
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:contentDescription="Escolher Pasta"
+                android:src="@android:drawable/ic_menu_view"
+                android:tint="#FFFFFF" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:singleLine="true"
+                android:text="Pasta"
+                android:textColor="#FFFFFF"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <!-- Botao 2: Editar Prefixo -->
+        <LinearLayout
+            android:id="@+id/widget_btn_prefix"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_marginStart="2dp"
+            android:layout_marginEnd="2dp"
+            android:layout_weight="1"
+            android:background="#334155"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="4dp">
+
+            <ImageView
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:contentDescription="Editar Prefixo"
+                android:src="@android:drawable/ic_menu_edit"
+                android:tint="#38BDF8" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:singleLine="true"
+                android:text="Prefixo"
+                android:textColor="#F8FAFC"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <!-- Botao 3: Iniciar Camera + Interceptacao -->
+        <LinearLayout
+            android:id="@+id/widget_btn_camera"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_marginStart="2dp"
+            android:layout_marginEnd="2dp"
+            android:layout_weight="1"
+            android:background="#059669"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="4dp">
+
+            <ImageView
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:contentDescription="Iniciar Câmera"
+                android:src="@android:drawable/ic_menu_camera"
+                android:tint="#FFFFFF" />
+
+            <TextView
+                android:id="@+id/widget_btn_camera_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:singleLine="true"
+                android:text="Câmera"
+                android:textColor="#FFFFFF"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <!-- Botao 4: Ligar / Desligar Compartilhamento via Site Web -->
+        <LinearLayout
+            android:id="@+id/widget_btn_web"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_marginStart="4dp"
+            android:layout_weight="1"
+            android:background="#0F2942"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="4dp">
+
+            <ImageView
+                android:layout_width="20dp"
+                android:layout_height="20dp"
+                android:contentDescription="Alternar Site Web"
+                android:src="@android:drawable/ic_menu_share"
+                android:tint="#38BDF8" />
+
+            <TextView
+                android:id="@+id/widget_btn_web_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:singleLine="true"
+                android:text="Site Web"
+                android:textColor="#38BDF8"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+    </LinearLayout>
+
+</LinearLayout>
