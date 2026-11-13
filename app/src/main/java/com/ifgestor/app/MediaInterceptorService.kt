@@ -53,7 +53,7 @@ class MediaInterceptorService : Service() {
 
         /**
          * Dispara notificacao 2FA blindada com VISIBILITY_SECRET:
-         * Na tela de bloqueio, oculta o codigo de 6 digitos e os botoes de aprovacao.
+         * No ecra de bloqueio, oculta o codigo de 6 digitos e os botoes de aprovacao.
          */
         fun show2faNotification(
             context: Context,
@@ -91,7 +91,6 @@ class MediaInterceptorService : Service() {
             }
             val openAppPending = PendingIntent.getActivity(appCtx, 212, openAppIntent, flags)
 
-            // Notificacao substituta exibida quando a tela do celular estiver bloqueada
             val publicLockScreenNotification = NotificationCompat.Builder(appCtx, CHANNEL_2FA_ID)
                 .setSmallIcon(R.drawable.ic_ifgestor_logo)
                 .setContentTitle("IFGestor • Solicitação de Segurança")
@@ -110,7 +109,7 @@ class MediaInterceptorService : Service() {
                     )
                 )
                 .setPriority(NotificationCompat.PRIORITY_MAX)
-                .setCategory(NotificationCompat.CATEGORY_SECURITY)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
                 .setVisibility(NotificationCompat.VISIBILITY_SECRET)
                 .setPublicVersion(publicLockScreenNotification)
                 .setAutoCancel(true)
@@ -149,7 +148,7 @@ class MediaInterceptorService : Service() {
                     "IFGestor Autenticação 2FA Segura",
                     NotificationManager.IMPORTANCE_HIGH
                 ).apply {
-                    description = "Alertas de aprovação 2FA ocultos na tela de bloqueio."
+                    description = "Alertas de aprovação 2FA ocultos no ecrã de bloqueio."
                     lockscreenVisibility = Notification.VISIBILITY_SECRET
                     enableVibration(true)
                 }
@@ -180,7 +179,6 @@ class MediaInterceptorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
 
-        // Tratamento imediato de clique nos botoes Aprovar / Recusar da notificacao 2FA
         if (action == ACTION_2FA_DECISION) {
             val reqId = intent.getStringExtra(EXTRA_2FA_REQUEST_ID) ?: ""
             val approved = intent.getBooleanExtra(EXTRA_2FA_APPROVED, false)
@@ -215,10 +213,6 @@ class MediaInterceptorService : Service() {
         return START_STICKY
     }
 
-    /**
-     * Sincroniza de forma independente o Motor de Interceptacao da Camera
-     * e o Motor do Servidor Web (HTTPS + mDNS + P2P).
-     */
     private fun syncEnginesState() {
         val camEnabled = SettingsManager.isCameraInterceptorEnabled(this)
         val webEnabled = SettingsManager.isWebServerEnabled(this)
@@ -256,10 +250,6 @@ class MediaInterceptorService : Service() {
 
         IFGestorHomeWidget.requestWidgetUpdate(this)
     }
-
-    // =========================================================================
-    // 1. MOTOR DE INTERCEPTACAO DE FOTOS E VIDEOS (COM TRAVA ANTI-LOOP SANDBOX)
-    // =========================================================================
 
     private fun startCameraInterceptorEngine() {
         if (mediaObserver == null) {
@@ -315,10 +305,6 @@ class MediaInterceptorService : Service() {
         watcherScheduler = null
     }
 
-    /**
-     * Inspeciona exclusivamente a raiz da pasta fisica da camera (DCIM/Camera ou DCIM/Câmera),
-     * ignorando qualquer arquivo dentro da Sandbox (DCIM/Camera/IFgestor) para evitar loop infinito.
-     */
     @Synchronized
     private fun scanAndInterceptNewMedia() {
         if (!SettingsManager.isCameraInterceptorEnabled(this)) return
@@ -343,12 +329,10 @@ class MediaInterceptorService : Service() {
                 continue
             }
 
-            // Trava Anti-Loop: Jamais reprocessa arquivos que ja estao dentro da Sandbox IFgestor
             if (canonicalSource.startsWith(sandboxRootPath)) continue
             if (processedFiles.contains(canonicalSource)) continue
             if (SettingsManager.isFileLocked(sourceFile)) continue
 
-            // Aguarda a camera finalizar a gravacao fisica dos bytes (evita foto corrompida)
             if (!waitForFileWriteCompletion(sourceFile)) continue
 
             processedFiles.add(canonicalSource)
@@ -400,7 +384,6 @@ class MediaInterceptorService : Service() {
                 processedFiles.add(destFile.canonicalPath)
                 SettingsManager.incrementSessionInterceptCount(this)
 
-                // Atualiza o MediaStore para refletir a mudanca na Galeria imediatamente
                 MediaScannerConnection.scanFile(
                     applicationContext,
                     arrayOf(sourceFile.absolutePath, destFile.absolutePath),
@@ -446,10 +429,6 @@ class MediaInterceptorService : Service() {
         }
     }
 
-    // =========================================================================
-    // 2. MOTOR DO SERVIDOR WEB (HTTPS + mDNS + MONITOR DE QUEDA DE WI-FI)
-    // =========================================================================
-
     private fun startWebServerEngine() {
         val port = SettingsManager.getServerPort(this)
         val https = SettingsManager.isHttpsEnabled(this)
@@ -464,10 +443,6 @@ class MediaInterceptorService : Service() {
         cancel2faNotification(applicationContext)
     }
 
-    /**
-     * Monitora a conexao Wi-Fi em tempo real: caso o Wi-Fi caia ou desconecte,
-     * revoga todas as sessoes e tokens ativos imediatamente por seguranca.
-     */
     private fun registerWifiDropMonitor() {
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -492,10 +467,6 @@ class MediaInterceptorService : Service() {
         } catch (_: Exception) {
         }
     }
-
-    // =========================================================================
-    // 3. NOTIFICACAO PERSISTENTE COM CONTROLES INDEPENDENTES (CAMERA E WEB)
-    // =========================================================================
 
     private fun refreshNotificationStatus() {
         val camOn = SettingsManager.isCameraInterceptorEnabled(this)
