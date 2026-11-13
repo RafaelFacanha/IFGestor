@@ -20,7 +20,6 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.math.BigInteger
@@ -44,9 +43,9 @@ import javax.security.auth.x500.X500Principal
 object WebServerManager {
 
     private const val KEYSTORE_ALIAS = "ifgestor_local_https_key"
-    private const val SESSION_TTL_MS = 30 * 60 * 1000L // 30 minutos de sessao
-    private const val ACTION_GRANT_TTL_MS = 90 * 1000L // Janela de 90s apos aprovar 2FA para lotes paralelos
-    private const val P2P_TOKEN_TTL_MS = 10 * 60 * 1000L // 10 minutos para concluir lote P2P autorizado
+    private const val SESSION_TTL_MS = 30 * 60 * 1000L
+    private const val ACTION_GRANT_TTL_MS = 90 * 1000L
+    private const val P2P_TOKEN_TTL_MS = 10 * 60 * 1000L
     private const val MAX_FAILED_ATTEMPTS = 5
     private const val LOCKOUT_DURATION_MS = 60 * 1000L
 
@@ -336,7 +335,6 @@ object WebServerManager {
             sslContext.init(kmf.keyManagers, null, SecureRandom())
             val factory = sslContext.serverSocketFactory
 
-            // Valida criacao de socket TLS antes de ativar
             factory.createServerSocket().use { }
             factory
         } catch (_: Exception) {
@@ -362,12 +360,9 @@ object WebServerManager {
 
             return try {
                 when {
-                    // Pagina Principal SPA (Single Page Application)
                     uri == "/" && method == Method.GET -> {
                         htmlResponse(buildSinglePageWebAppHtml())
                     }
-
-                    // Endpoints de Autenticacao (POST com body oculto - Item 1)
                     uri == "/api/auth/login" && method == Method.POST -> {
                         handleAuthLogin(session, clientIp)
                     }
@@ -380,16 +375,12 @@ object WebServerManager {
                     uri == "/api/auth/logout" && method == Method.POST -> {
                         handleLogout(session, clientIp)
                     }
-
-                    // Endpoints de Recebimento P2P entre Celulares (Item 8)
                     uri == "/api/p2p/handshake" && method == Method.POST -> {
                         handleP2pHandshake(session, clientIp)
                     }
                     uri == "/api/p2p/upload" && method == Method.POST -> {
                         handleP2pIncomingUpload(session, clientIp)
                     }
-
-                    // Endpoints Protegidos da Sessao Web
                     uri == "/api/list" && method == Method.GET -> {
                         val sess = requireValidSession(session) ?: return unauthorizedJson()
                         handleApiList(session, sess)
@@ -450,7 +441,6 @@ object WebServerManager {
                         }
                         handleApiStreamZip(session, clientIp)
                     }
-
                     else -> jsonResponse(
                         Response.Status.NOT_FOUND,
                         JSONObject().put("error", "Rota não encontrada")
@@ -463,10 +453,6 @@ object WebServerManager {
                 )
             }
         }
-
-        // =====================================================================
-        // 4. AUTENTICACAO POST (PIN PBKDF2 + 2FA) E PROTECAO FORCA BRUTA
-        // =====================================================================
 
         private fun handleAuthLogin(session: IHTTPSession, clientIp: String): Response {
             val now = System.currentTimeMillis()
@@ -486,7 +472,7 @@ object WebServerManager {
                     Response.Status.FORBIDDEN,
                     JSONObject()
                         .put("ok", false)
-                        .put("error", "Por segurança (OWASP), altere o PIN padrão (1234) na aba Servidor PC do celular antes do primeiro acesso web.")
+                        .put("error", "Por segurança (OWASP), altere o PIN padrão (1234) na aba Servidor & 2FA do celular antes do primeiro acesso web.")
                 )
             }
 
@@ -678,10 +664,6 @@ object WebServerManager {
             return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
         }
 
-        // =====================================================================
-        // 5. RECEBIMENTO P2P ENTRE CELULARES COM 2FA E ESCRITA ATOMICA (.part)
-        // =====================================================================
-
         private fun handleP2pHandshake(session: IHTTPSession, clientIp: String): Response {
             val params = parseFormBody(session)
             val senderAlias = params["sender"] ?: clientIp
@@ -710,7 +692,6 @@ object WebServerManager {
                 clientIp = clientIp
             )
 
-            // Aguarda ate 60 segundos pela aprovacao na notificacao ou no painel do celular de destino
             val deadline = System.currentTimeMillis() + 60_000L
             while (System.currentTimeMillis() < deadline) {
                 val st = challenge.status
@@ -860,10 +841,6 @@ object WebServerManager {
                 SettingsManager.unlockFile(finalFile)
             }
         }
-
-        // =====================================================================
-        // 6. API JSON ASSINCRONA (SPA): LISTAGEM, UPLOAD ATOMICO, LOTES E ZIP
-        // =====================================================================
 
         private fun handleApiList(session: IHTTPSession, sess: SessionInfo): Response {
             val requestedRel = SettingsManager.sanitizeSubfolderName(session.parms["folder"] ?: "")
@@ -1020,10 +997,6 @@ object WebServerManager {
             )
         }
 
-        /**
-         * Upload binario em streaming paginado com escrita atomica (.part)
-         * e telemetria simultanea na Central de Tarefas (Mobile e Web).
-         */
         private fun handleApiRawUpload(session: IHTTPSession, sess: SessionInfo, clientIp: String): Response {
             if (!isActionAuthorized(sess)) {
                 return jsonResponse(
@@ -1160,7 +1133,7 @@ object WebServerManager {
             }
 
             val params = parseFormBody(session)
-            val actionType = (params["action"] ?: "").uppercase(Locale.US) // DELETE ou MOVE
+            val actionType = (params["action"] ?: "").uppercase(Locale.US)
             val targetSub = SettingsManager.sanitizeSubfolderName(params["targetFolder"] ?: "")
             val pathsRaw = params["paths"] ?: "[]"
             val arr = JSONArray(pathsRaw)
@@ -1438,9 +1411,6 @@ object WebServerManager {
             return res
         }
 
-        /**
-         * Streaming direto de arquivo .ZIP sem gravar arquivo temporario no disco (Item 11).
-         */
         private fun handleApiStreamZip(session: IHTTPSession, clientIp: String): Response {
             val folderRel = SettingsManager.sanitizeSubfolderName(session.parms["folder"] ?: "")
             val pathsParam = session.parms["paths"] ?: ""
@@ -1533,10 +1503,6 @@ object WebServerManager {
             return res
         }
 
-        // =====================================================================
-        // 7. UTILITARIOS DE SESSAO, PARSE FORM BODY E HEADERS DE SEGURANCA
-        // =====================================================================
-
         private fun parseFormBody(session: IHTTPSession): Map<String, String> {
             val result = mutableMapOf<String, String>()
             try {
@@ -1607,10 +1573,6 @@ object WebServerManager {
                 addHeader("X-Frame-Options", "DENY")
             }
         }
-
-        // =====================================================================
-        // 8. INTERFACE WEB SPA ASSINCRONA COM CENTRAL DE TAREFAS, P2P E WHATSAPP
-        // =====================================================================
 
         private fun buildSinglePageWebAppHtml(): String {
             return """
@@ -1722,7 +1684,6 @@ object WebServerManager {
   .card-actions { display: flex; gap: 4px; margin-top: 6px; }
   .card-actions button { flex: 1; padding: 5px; font-size: 11px; }
 
-  /* Central de Tarefas Multitarefa e Recolhivel (Item 10) */
   .task-drawer {
     position: fixed; right: 18px; bottom: 18px; width: 360px; max-width: calc(100vw - 36px);
     background: var(--card); border: 1px solid var(--accent); border-radius: 14px;
@@ -1741,7 +1702,6 @@ object WebServerManager {
   .task-bar-bg { width: 100%; height: 7px; background: #1e293b; border-radius: 99px; overflow: hidden; margin-top: 6px; }
   .task-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--emerald)); transition: width 0.15s; }
 
-  /* Modais (Login, 2FA, P2P, Visualizador) */
   .modal-backdrop {
     position: fixed; inset: 0; background: rgba(2,6,23,0.82);
     display: none; align-items: center; justify-content: center; z-index: 100; padding: 16px;
@@ -1755,7 +1715,6 @@ object WebServerManager {
 </head>
 <body>
 
-<!-- Barra Superior com Seletor de Dispositivos na Rede (Item 7) -->
 <header class="topbar">
   <div class="brand-row">
     <div class="brand-badge">🛡️ IFGestor Web</div>
@@ -1772,7 +1731,6 @@ object WebServerManager {
 </header>
 
 <main class="container">
-  <!-- Faixa de Telemetria Dupla e Armazenamento -->
   <section class="status-strip">
     <div>
       <div style="font-weight:700;font-size:14px;" id="currentPathLabel">📂 Pasta: DCIM/Camera/IFgestor</div>
@@ -1789,7 +1747,6 @@ object WebServerManager {
     </div>
   </section>
 
-  <!-- Barra de Ferramentas Multitarefa, P2P e WhatsApp -->
   <section class="toolbar">
     <input type="file" id="uploadInput" multiple style="display:none" onchange="startParallelUpload(this.files)">
     <button class="btn btn-primary" onclick="document.getElementById('uploadInput').click()">⬆️ Enviar Arquivos</button>
@@ -1804,14 +1761,10 @@ object WebServerManager {
     <input type="text" id="searchBox" placeholder="🔍 Filtrar por nome..." oninput="renderFilteredFiles()" style="margin-left:auto;">
   </section>
 
-  <!-- Subpastas da Sandbox -->
   <div class="folders-row" id="foldersContainer"></div>
-
-  <!-- Grade de Fotos e Videos -->
   <div class="grid" id="filesGrid"></div>
 </main>
 
-<!-- Central de Tarefas Paralelas e Recolhivel (Item 10) -->
 <aside class="task-drawer" id="taskDrawer">
   <div class="task-drawer-header" onclick="toggleTaskDrawer()">
     <span id="taskHeaderTitle">🔄 Central de Tarefas (0 ativas)</span>
@@ -1822,7 +1775,6 @@ object WebServerManager {
   </div>
 </aside>
 
-<!-- Modal de Login Seguro (POST + PBKDF2 + 2FA) -->
 <div class="modal-backdrop active" id="loginModal">
   <div class="modal-card">
     <h3 style="font-size:18px;">🔐 Acesso Seguro IFGestor</h3>
@@ -1839,7 +1791,6 @@ object WebServerManager {
   </div>
 </div>
 
-<!-- Modal de Autorizacao 2FA para Operacoes Sensíveis -->
 <div class="modal-backdrop" id="action2faModal">
   <div class="modal-card">
     <h3>🛡️ Confirmação 2FA Necessária</h3>
@@ -1855,7 +1806,6 @@ object WebServerManager {
   </div>
 </div>
 
-<!-- Modal de Transferencia P2P entre Celulares (Item 8) -->
 <div class="modal-backdrop" id="p2pModal">
   <div class="modal-card">
     <h3>📲 Transferência P2P entre Celulares</h3>
@@ -1891,8 +1841,8 @@ object WebServerManager {
   let currentActionReqId = '';
   let pendingActionCallback = null;
 
-  function apiHeaders(extra = {}) {
-    return Object.assign({ 'X-IFGestor-Token': authToken }, extra);
+  function apiHeaders(extra) {
+    return Object.assign({ 'X-IFGestor-Token': authToken }, extra || {});
   }
 
   function toggleTheme() {
@@ -1912,10 +1862,6 @@ object WebServerManager {
     }
   }
 
-  // =========================================================================
-  // 1. FLUXO DE LOGIN POST + 2FA SEM EXPOR CREDENCIAIS NA URL
-  // =========================================================================
-
   async function submitPinLogin() {
     const pin = document.getElementById('pinInput').value.trim();
     const errEl = document.getElementById('loginErrorText');
@@ -1931,7 +1877,7 @@ object WebServerManager {
 
     if (!pin) { errEl.textContent = 'Informe o PIN.'; return; }
 
-    const body = new URLSearchParams({ pin });
+    const body = new URLSearchParams({ pin: pin });
     const res = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
@@ -1948,7 +1894,7 @@ object WebServerManager {
     document.getElementById('btnSubmitLogin').textContent = 'Validar Código 2FA';
 
     if (loginPollTimer) clearInterval(loginPollTimer);
-    loginPollTimer = setInterval(() => pollLogin2faStatus(''), 1200);
+    loginPollTimer = setInterval(function() { pollLogin2faStatus(''); }, 1200);
   }
 
   async function pollLogin2faStatus(typedCode) {
@@ -1986,12 +1932,8 @@ object WebServerManager {
     location.reload();
   }
 
-  // =========================================================================
-  // 2. AUTORIZACAO 2FA PARA OPERACOES (COM JANELA DE LOTE PARA MULTITAREFA)
-  // =========================================================================
-
   async function ensure2faAuthorized(description, onAuthorized) {
-    const body = new URLSearchParams({ description });
+    const body = new URLSearchParams({ description: description });
     const res = await fetch('/api/auth/request-action-2fa', {
       method: 'POST',
       headers: apiHeaders({ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }),
@@ -2009,13 +1951,14 @@ object WebServerManager {
 
     currentActionReqId = data.requestId;
     pendingActionCallback = onAuthorized;
-    document.getElementById('action2faDesc').textContent = 'Operação: ' + description + '. Aprove na notificação do celular ou digite o código de 6 dígitos:';
+    document.getElementById('action2faDesc').textContent =
+      'Operação: ' + description + '. Aprove na notificação do celular ou digite o código de 6 dígitos:';
     document.getElementById('action2faCodeInput').value = '';
     document.getElementById('action2faError').textContent = '';
     document.getElementById('action2faModal').classList.add('active');
 
     if (actionPollTimer) clearInterval(actionPollTimer);
-    actionPollTimer = setInterval(() => pollAction2fa(''), 1100);
+    actionPollTimer = setInterval(function() { pollAction2fa(''); }, 1100);
   }
 
   async function verifyAction2faCodeNow() {
@@ -2058,16 +2001,13 @@ object WebServerManager {
     document.getElementById('action2faModal').classList.remove('active');
   }
 
-  // =========================================================================
-  // 3. NAVEGACAO SPA ASSINCRONA (ZERO RELOAD DE PAGINA)
-  // =========================================================================
-
-  async function refreshCurrentFolder(targetSubfolder = currentFolder) {
+  async function refreshCurrentFolder(targetSubfolder) {
+    const folderToLoad = (targetSubfolder === undefined) ? currentFolder : targetSubfolder;
     if (!authToken) {
       document.getElementById('loginModal').classList.add('active');
       return;
     }
-    const res = await fetch('/api/list?folder=' + encodeURIComponent(targetSubfolder), {
+    const res = await fetch('/api/list?folder=' + encodeURIComponent(folderToLoad), {
       headers: apiHeaders()
     });
     if (res.status === 401) {
@@ -2084,7 +2024,8 @@ object WebServerManager {
     serverTasks = data.tasks || [];
 
     document.getElementById('sandboxBadge').textContent = '🔒 ' + data.sandboxDisplay;
-    document.getElementById('currentPathLabel').textContent = '📂 ' + data.sandboxDisplay + ' (Prefixo ativo: ' + data.activePrefix + ')';
+    document.getElementById('currentPathLabel').textContent =
+      '📂 ' + data.sandboxDisplay + ' (Prefixo ativo: ' + data.activePrefix + ')';
     document.getElementById('countersInfo').textContent =
       '🟢 Sessão Interceptada: ' + data.sessionInterceptCount + '  |  📁 Total nesta Pasta: ' + data.folderMediaCount;
 
@@ -2093,16 +2034,16 @@ object WebServerManager {
     document.getElementById('storageText').textContent =
       formatBytes(data.freeBytes) + ' livres (' + pct + '% usado)';
 
-    renderPeersDropdown(data.peers, data.ip, data.port);
+    renderPeersDropdown(data.peers);
     renderFoldersBar(data.folders);
     renderFilteredFiles();
     renderCombinedTasks();
   }
 
-  function renderPeersDropdown(peers, selfIp, selfPort) {
+  function renderPeersDropdown(peers) {
     const sel = document.getElementById('peerDeviceSelector');
     sel.innerHTML = '';
-    (peers || []).forEach(p => {
+    (peers || []).forEach(function(p) {
       const opt = document.createElement('option');
       opt.value = p.url;
       opt.textContent = (p.isSelf ? '🟢 ' : '📱 ') + p.domain + ' (' + p.ip + ':' + p.port + ')';
@@ -2131,15 +2072,15 @@ object WebServerManager {
       const backChip = document.createElement('div');
       backChip.className = 'folder-chip';
       backChip.textContent = '⬅️ Voltar (' + (parentRel || 'Raiz IFgestor') + ')';
-      backChip.onclick = () => { selectedPaths.clear(); refreshCurrentFolder(parentRel); };
+      backChip.onclick = function() { selectedPaths.clear(); refreshCurrentFolder(parentRel); };
       box.appendChild(backChip);
     }
 
-    (folders || []).forEach(f => {
+    (folders || []).forEach(function(f) {
       const chip = document.createElement('div');
       chip.className = 'folder-chip';
       chip.innerHTML = '📁 <span>' + escapeHtml(f.name) + '</span> <span style="color:var(--accent);font-size:11px;">(' + f.count + ')</span>';
-      chip.onclick = () => { selectedPaths.clear(); refreshCurrentFolder(f.relPath); };
+      chip.onclick = function() { selectedPaths.clear(); refreshCurrentFolder(f.relPath); };
       box.appendChild(chip);
     });
   }
@@ -2149,38 +2090,47 @@ object WebServerManager {
     const grid = document.getElementById('filesGrid');
     grid.innerHTML = '';
 
-    const list = cachedFiles.filter(f => !query || f.name.toLowerCase().includes(query));
+    const list = cachedFiles.filter(function(f) {
+      return !query || f.name.toLowerCase().indexOf(query) !== -1;
+    });
     if (list.length === 0) {
       grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:36px;color:var(--muted);">Nenhum arquivo nesta pasta da Sandbox.</div>';
       return;
     }
 
-    list.forEach(file => {
+    list.forEach(function(file) {
       const isSel = selectedPaths.has(file.relPath);
       const card = document.createElement('div');
       card.className = 'media-card' + (isSel ? ' selected' : '');
 
       const thumbUrl = '/api/thumb?path=' + encodeURIComponent(file.relPath) + '&token=' + encodeURIComponent(authToken);
       const rawUrl = '/api/raw?path=' + encodeURIComponent(file.relPath) + '&token=' + encodeURIComponent(authToken);
+      const safeRelQuote = escapeQuotes(file.relPath);
+      const safeNameQuote = escapeQuotes(file.name);
+      const safeNameHtml = escapeHtml(file.name);
+      const badgeLabel = file.isVideo ? '🎬 VÍDEO' : '📷 FOTO';
+      const checkedAttr = isSel ? 'checked' : '';
+      const isImgStr = file.isImage ? 'true' : 'false';
 
-      card.innerHTML = `
-        <div class="thumb-wrap" onclick="window.open('${rawUrl}', '_blank')">
-          <input type="checkbox" class="check-badge" ${isSel ? 'checked' : ''} onclick="event.stopPropagation(); toggleSelectFile('${escapeQuotes(file.relPath)}', this.checked)">
-          <img src="${thumbUrl}" loading="lazy" onerror="this.style.display='none'">
-          <span class="type-pill">${file.isVideo ? '🎬 VÍDEO' : '📷 FOTO'}</span>
-        </div>
-        <div class="card-body">
-          <div class="file-title" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
-          <div class="file-meta">
-            <span>${formatBytes(file.sizeBytes)}</span>
-            <span>${file.modified}</span>
-          </div>
-          <div class="card-actions">
-            <button class="btn" onclick="downloadSingleFile('${escapeQuotes(file.relPath)}')">⬇️</button>
-            <button class="btn btn-whatsapp" title="Copiar/Enviar para WhatsApp Web" onclick="shareSingleToWhatsAppWeb('${escapeQuotes(file.relPath)}', '${escapeQuotes(file.name)}', ${file.isImage})">💬 WA</button>
-          </div>
-        </div>
-      `;
+      card.innerHTML =
+        '<div class="thumb-wrap" onclick="window.open(\'' + rawUrl + '\', \'_blank\')">' +
+          '<input type="checkbox" class="check-badge" ' + checkedAttr +
+            ' onclick="event.stopPropagation(); toggleSelectFile(\'' + safeRelQuote + '\', this.checked)">' +
+          '<img src="' + thumbUrl + '" loading="lazy" onerror="this.style.display=\'none\'">' +
+          '<span class="type-pill">' + badgeLabel + '</span>' +
+        '</div>' +
+        '<div class="card-body">' +
+          '<div class="file-title" title="' + safeNameHtml + '">' + safeNameHtml + '</div>' +
+          '<div class="file-meta">' +
+            '<span>' + formatBytes(file.sizeBytes) + '</span>' +
+            '<span>' + file.modified + '</span>' +
+          '</div>' +
+          '<div class="card-actions">' +
+            '<button class="btn" onclick="downloadSingleFile(\'' + safeRelQuote + '\')">⬇️</button>' +
+            '<button class="btn btn-whatsapp" title="Copiar/Enviar para WhatsApp Web" onclick="shareSingleToWhatsAppWeb(\'' + safeRelQuote + '\', \'' + safeNameQuote + '\', ' + isImgStr + ')">💬 WA</button>' +
+          '</div>' +
+        '</div>';
+
       grid.appendChild(card);
     });
   }
@@ -2195,31 +2145,27 @@ object WebServerManager {
     if (selectedPaths.size === cachedFiles.length) {
       selectedPaths.clear();
     } else {
-      cachedFiles.forEach(f => selectedPaths.add(f.relPath));
+      cachedFiles.forEach(function(f) { selectedPaths.add(f.relPath); });
     }
     renderFilteredFiles();
   }
 
-  // =========================================================================
-  // 4. UPLOADS E OPERACOES PARALELAS COM BARRAS DE PROGRESSO INDIVIDUAIS
-  // =========================================================================
-
   function startParallelUpload(fileList) {
     if (!fileList || fileList.length === 0) return;
     const filesArray = Array.from(fileList);
-    ensure2faAuthorized('Enviar ' + filesArray.length + ' arquivo(s) para ' + (currentFolder || 'IFgestor'), () => {
+    ensure2faAuthorized('Enviar ' + filesArray.length + ' arquivo(s) para ' + (currentFolder || 'IFgestor'), function() {
       const batchId = 'up_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
       runUploadQueue(batchId, filesArray, currentFolder);
     });
   }
 
   async function runUploadQueue(batchId, files, targetSubfolder) {
-    const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
+    const totalBytes = files.reduce(function(acc, f) { return acc + f.size; }, 0);
     let completedBytes = 0;
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      await new Promise((resolve) => {
+      await new Promise(function(resolve) {
         const xhr = new XMLHttpRequest();
         const url = '/api/upload?folder=' + encodeURIComponent(targetSubfolder) +
           '&name=' + encodeURIComponent(file.name) +
@@ -2230,7 +2176,7 @@ object WebServerManager {
         xhr.setRequestHeader('X-IFGestor-Token', authToken);
         xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
-        xhr.upload.onprogress = (ev) => {
+        xhr.upload.onprogress = function(ev) {
           if (ev.lengthComputable) {
             const currentTotal = completedBytes + ev.loaded;
             const pct = Math.min(99, Math.round((currentTotal / Math.max(1, totalBytes)) * 100));
@@ -2245,11 +2191,11 @@ object WebServerManager {
           }
         };
 
-        xhr.onload = () => {
+        xhr.onload = function() {
           completedBytes += file.size;
           resolve();
         };
-        xhr.onerror = () => resolve();
+        xhr.onerror = function() { resolve(); };
         xhr.send(file);
       });
     }
@@ -2268,7 +2214,7 @@ object WebServerManager {
   function promptNewSubfolder() {
     const name = prompt('Nome da nova subpasta dentro de ' + (currentFolder || 'IFgestor') + ':');
     if (!name || !name.trim()) return;
-    ensure2faAuthorized('Criar subpasta ' + name.trim(), async () => {
+    ensure2faAuthorized('Criar subpasta ' + name.trim(), async function() {
       const body = new URLSearchParams({ parent: currentFolder, name: name.trim() });
       await fetch('/api/mkdir', {
         method: 'POST',
@@ -2284,7 +2230,7 @@ object WebServerManager {
     if (list.length === 0) { alert('Selecione ao menos um arquivo.'); return; }
     if (!confirm('Confirma a exclusão permanente de ' + list.length + ' arquivo(s)?')) return;
 
-    ensure2faAuthorized('Excluir ' + list.length + ' arquivo(s)', async () => {
+    ensure2faAuthorized('Excluir ' + list.length + ' arquivo(s)', async function() {
       const body = new URLSearchParams({
         action: 'DELETE',
         paths: JSON.stringify(list)
@@ -2308,7 +2254,7 @@ object WebServerManager {
     );
     if (dest === null) return;
 
-    ensure2faAuthorized('Mover ' + list.length + ' arquivo(s)', async () => {
+    ensure2faAuthorized('Mover ' + list.length + ' arquivo(s)', async function() {
       const body = new URLSearchParams({
         action: 'MOVE',
         targetFolder: dest.trim(),
@@ -2325,7 +2271,7 @@ object WebServerManager {
   }
 
   function downloadSingleFile(relPath) {
-    ensure2faAuthorized('Baixar arquivo ' + relPath, () => {
+    ensure2faAuthorized('Baixar arquivo ' + relPath, function() {
       window.location.href = '/api/download?path=' + encodeURIComponent(relPath) + '&token=' + encodeURIComponent(authToken);
     });
   }
@@ -2333,17 +2279,13 @@ object WebServerManager {
   function downloadSelectedZip() {
     const list = Array.from(selectedPaths);
     const desc = list.length > 0 ? ('Exportar ZIP com ' + list.length + ' arquivo(s)') : 'Exportar ZIP da pasta atual';
-    ensure2faAuthorized(desc, () => {
+    ensure2faAuthorized(desc, function() {
       const url = '/api/download-zip?folder=' + encodeURIComponent(currentFolder) +
         (list.length > 0 ? '&paths=' + encodeURIComponent(JSON.stringify(list)) : '') +
         '&token=' + encodeURIComponent(authToken);
       window.location.href = url;
     });
   }
-
-  // =========================================================================
-  // 5. TRANSFERENCIA P2P ENTRE CELULARES PELO NAVEGADOR (ITEM 8)
-  // =========================================================================
 
   function openP2pModal() {
     if (selectedPaths.size === 0) {
@@ -2352,7 +2294,7 @@ object WebServerManager {
     }
     const sel = document.getElementById('p2pTargetDeviceSelect');
     sel.innerHTML = '<option value="">-- Escolha um celular detectado na rede --</option>';
-    (cachedPeers || []).filter(p => !p.isSelf).forEach(p => {
+    (cachedPeers || []).filter(function(p) { return !p.isSelf; }).forEach(function(p) {
       const opt = document.createElement('option');
       opt.value = p.ip + ':' + p.port + ':' + p.https;
       opt.textContent = '📱 ' + p.domain + ' (' + p.ip + ':' + p.port + ')';
@@ -2368,7 +2310,8 @@ object WebServerManager {
 
     let ip = '', port = '8080', https = 'true';
     if (manualVal) {
-      const parts = manualVal.replace(/^https?:\/\//, '').split(':');
+      const cleanHost = manualVal.replace('https://', '').replace('http://', '');
+      const parts = cleanHost.split(':');
       ip = parts[0];
       port = parts[1] || '8080';
     } else if (dropdownVal) {
@@ -2386,7 +2329,7 @@ object WebServerManager {
     const list = Array.from(selectedPaths);
     document.getElementById('p2pModal').classList.remove('active');
 
-    ensure2faAuthorized('Enviar ' + list.length + ' arquivo(s) P2P para ' + ip, async () => {
+    ensure2faAuthorized('Enviar ' + list.length + ' arquivo(s) P2P para ' + ip, async function() {
       const body = new URLSearchParams({
         targetIp: ip,
         targetPort: port,
@@ -2405,12 +2348,8 @@ object WebServerManager {
     });
   }
 
-  // =========================================================================
-  // 6. COMPARTILHAMENTO VIA WHATSAPP WEB (PC) E WHATSAPP MOBILE (ITEM 16)
-  // =========================================================================
-
   async function shareSingleToWhatsAppWeb(relPath, fileName, isImage) {
-    ensure2faAuthorized('Compartilhar ' + fileName + ' no WhatsApp Web', async () => {
+    ensure2faAuthorized('Compartilhar ' + fileName + ' no WhatsApp Web', async function() {
       const rawUrl = '/api/raw?path=' + encodeURIComponent(relPath) + '&token=' + encodeURIComponent(authToken);
       try {
         const response = await fetch(rawUrl);
@@ -2442,7 +2381,7 @@ object WebServerManager {
       alert('Selecione uma foto ou vídeo para enviar ao WhatsApp Web.');
       return;
     }
-    const first = cachedFiles.find(f => f.relPath === list[0]);
+    const first = cachedFiles.find(function(f) { return f.relPath === list[0]; });
     if (first) {
       shareSingleToWhatsAppWeb(first.relPath, first.name, first.isImage);
     }
@@ -2454,7 +2393,7 @@ object WebServerManager {
       alert('Selecione os arquivos que deseja abrir no WhatsApp do aparelho celular.');
       return;
     }
-    ensure2faAuthorized('Abrir ' + list.length + ' arquivo(s) no WhatsApp do celular', async () => {
+    ensure2faAuthorized('Abrir ' + list.length + ' arquivo(s) no WhatsApp do celular', async function() {
       const body = new URLSearchParams({ paths: JSON.stringify(list) });
       const res = await fetch('/api/whatsapp/share', {
         method: 'POST',
@@ -2467,26 +2406,25 @@ object WebServerManager {
   }
 
   function convertImageBlobToPng(blob) {
-    return new Promise((resolve, reject) => {
+    return new Promise(function(resolve, reject) {
       const img = new Image();
       const url = URL.createObjectURL(blob);
-      img.onload = () => {
+      img.onload = function() {
         const canvas = document.createElement('canvas');
         canvas.width = img.width;
         canvas.height = img.height;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(img, 0, 0);
         URL.revokeObjectURL(url);
-        canvas.toBlob(b => b ? resolve(b) : reject(), 'image/png');
+        canvas.toBlob(function(b) {
+          if (b) resolve(b);
+          else reject();
+        }, 'image/png');
       };
       img.onerror = reject;
       img.src = url;
     });
   }
-
-  // =========================================================================
-  // 7. TELEMETRIA DA CENTRAL DE TAREFAS PARALELAS E RECOLHIVEL (ITEM 10)
-  // =========================================================================
 
   async function refreshTasksOnly() {
     if (!authToken) return;
@@ -2502,11 +2440,11 @@ object WebServerManager {
 
   function renderCombinedTasks() {
     const map = new Map();
-    (serverTasks || []).forEach(t => map.set(t.id, t));
-    Object.values(localClientTasks).forEach(t => map.set(t.id, t));
+    (serverTasks || []).forEach(function(t) { map.set(t.id, t); });
+    Object.values(localClientTasks).forEach(function(t) { map.set(t.id, t); });
 
     const all = Array.from(map.values());
-    const runningCount = all.filter(t => t.status === 'RUNNING').length;
+    const runningCount = all.filter(function(t) { return t.status === 'RUNNING'; }).length;
     document.getElementById('taskHeaderTitle').textContent =
       '🔄 Central de Tarefas (' + runningCount + ' ativa' + (runningCount === 1 ? '' : 's') + ')';
 
@@ -2517,21 +2455,21 @@ object WebServerManager {
     }
 
     body.innerHTML = '';
-    all.forEach(t => {
+    all.forEach(function(t) {
+      const pct = t.progressPercent || 0;
       const item = document.createElement('div');
       item.className = 'task-item';
-      item.innerHTML = `
-        <div style="display:flex;justify-content:space-between;font-weight:700;">
-          <span>${escapeHtml(t.title)}</span>
-          <span style="color:var(--accent);">${t.progressPercent || 0}%</span>
-        </div>
-        <div style="color:var(--muted);font-size:11px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-          ${escapeHtml(t.subtitle || '')}
-        </div>
-        <div class="task-bar-bg">
-          <div class="task-bar-fill" style="width:${t.progressPercent || 0}%"></div>
-        </div>
-      `;
+      item.innerHTML =
+        '<div style="display:flex;justify-content:space-between;font-weight:700;">' +
+          '<span>' + escapeHtml(t.title) + '</span>' +
+          '<span style="color:var(--accent);">' + pct + '%</span>' +
+        '</div>' +
+        '<div style="color:var(--muted);font-size:11px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' +
+          escapeHtml(t.subtitle || '') +
+        '</div>' +
+        '<div class="task-bar-bg">' +
+          '<div class="task-bar-fill" style="width:' + pct + '%"></div>' +
+        '</div>';
       body.appendChild(item);
     });
   }
@@ -2545,7 +2483,9 @@ object WebServerManager {
   }
 
   function escapeHtml(s) {
-    return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    return String(s || '').replace(/[&<>"']/g, function(c) {
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
   }
 
   function escapeQuotes(s) {
