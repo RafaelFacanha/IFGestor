@@ -2,59 +2,125 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Permissoes de Rede e Wi-Fi para o Servidor Web Local -->
+    <!-- Permissões de Rede, Servidor HTTPS Local, mDNS/NSD e P2P -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-
-    <!-- Permissoes para manter o servidor ativo com a tela apagada -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-    <!-- Permissao para exibir o Widget Flutuante sobre a Camera Nativa -->
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-
-    <!-- Permissoes de Servico em Segundo Plano -->
+    <!-- Permissões de Serviço em Segundo Plano e Notificações 2FA -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Permissao para gerenciar todas as pastas do celular e mover fotos silenciosamente -->
-    <uses-permission
-        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
-        tools:ignore="ScopedStorage" />
-    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <!-- Permissão de Sobreposição para o Widget Flutuante sobre a Câmera -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Permissões de Armazenamento e Mídia (Sandbox DCIM/Camera/IFgestor) -->
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
 
+    <!-- Visibilidade de Pacotes (Android 11+) para WhatsApp e Câmera Nativa -->
+    <queries>
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
+        <intent>
+            <action android:name="android.media.action.STILL_IMAGE_CAMERA" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="*/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND_MULTIPLE" />
+            <data android:mimeType="*/*" />
+        </intent>
+    </queries>
+
+    <!-- Blindagem OWASP MASVS / LGPD (Item 2): allowBackup="false" impede extração de hashes, salt, certificados TLS e logs via ADB/Nuvem -->
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:icon="@drawable/ic_ifgestor_logo"
-        android:roundIcon="@drawable/ic_ifgestor_logo"
         android:label="IFGestor"
+        android:requestLegacyExternalStorage="true"
+        android:roundIcon="@drawable/ic_ifgestor_logo"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.NoActionBar">
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:usesCleartextTraffic="false"
+        tools:targetApi="34">
 
+        <!-- Activity Principal -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
+        <!-- Janela Rápida Transparente para editar Pasta/Prefixo direto do Widget da Tela Inicial (Item 15) -->
+        <activity
+            android:name=".QuickWidgetDialogActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:windowSoftInputMode="stateVisible|adjustPan" />
+
+        <!-- Serviço de Motores Independentes: Interceptador de Mídia + Servidor Web HTTPS/mDNS (Item 12) -->
         <service
             android:name=".MediaInterceptorService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Widget de Tela Inicial (Home Screen Widget - Item 14) -->
+        <receiver
+            android:name=".IFGestorHomeWidgetProvider"
+            android:exported="true"
+            android:label="IFGestor Controle Rápido">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.ifgestor.app.ACTION_WIDGET_REFRESH" />
+                <action android:name="com.ifgestor.app.ACTION_WIDGET_OPEN_CAMERA" />
+                <action android:name="com.ifgestor.app.ACTION_WIDGET_OPEN_WEB" />
+                <action android:name="com.ifgestor.app.ACTION_WIDGET_TOGGLE_INTERCEPTOR" />
+                <action android:name="com.ifgestor.app.ACTION_WIDGET_TOGGLE_SERVER" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/ifgestor_widget_info" />
+        </receiver>
+
+        <!-- FileProvider Seguro e Isolado para Compartilhamento em Lote no WhatsApp (Item 16) -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 
