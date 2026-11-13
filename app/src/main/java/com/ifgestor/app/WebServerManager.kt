@@ -1,2114 +1,2565 @@
 package com.ifgestor.app
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaScannerConnection
-import android.net.wifi.WifiManager
+import android.media.ThumbnailUtils
+import android.os.Build
+import android.provider.MediaStore
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Size
 import fi.iki.elonen.NanoHTTPD
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.Inet4Address
-import java.net.NetworkInterface
+import java.io.InputStream
+import java.io.PipedInputStream
+import java.io.PipedOutputStream
+import java.math.BigInteger
 import java.net.URLDecoder
-import java.net.URLEncoder
+import java.security.KeyPairGenerator
+import java.security.KeyStore
 import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLServerSocketFactory
+import javax.security.auth.x500.X500Principal
 
 object WebServerManager {
-    private var serverInstance: PhoneHttpServer? = null
+
+    private const val KEYSTORE_ALIAS = "ifgestor_local_https_key"
+    private const val SESSION_TTL_MS = 30 * 60 * 1000L // 30 minutos de sessao
+    private const val ACTION_GRANT_TTL_MS = 90 * 1000L // Janela de 90s apos aprovar 2FA para lotes paralelos
+    private const val P2P_TOKEN_TTL_MS = 10 * 60 * 1000L // 10 minutos para concluir lote P2P autorizado
+    private const val MAX_FAILED_ATTEMPTS = 5
+    private const val LOCKOUT_DURATION_MS = 60 * 1000L
+
+    data class SessionInfo(
+        val token: String,
+        val ip: String,
+        var expiresAt: Long,
+        var actionAuthorizedUntil: Long = 0L
+    )
+
+    data class Pending2faChallenge(
+        val requestId: String,
+        val code: String,
+        val ip: String,
+        val purpose: String, // LOGIN, ACTION, P2P_RECEIVE
+        val description: String,
+        val createdAt: Long = System.currentTimeMillis(),
+        @Volatile var status: String = "PENDING", // PENDING, APPROVED, REJECTED
+        var sessionToken: String? = null
+    )
+
+    data class BruteForceRecord(
+        var failures: Int = 0,
+        var lockedUntil: Long = 0L
+    )
+
+    private var serverInstance: IFGestorHttpServer? = null
+    private val activeSessions = ConcurrentHashMap<String, SessionInfo>()
+    private val pendingChallenges = ConcurrentHashMap<String, Pending2faChallenge>()
+    private val p2pReceiveTokens = ConcurrentHashMap<String, Long>()
+    private val bruteForceMap = ConcurrentHashMap<String, BruteForceRecord>()
+    private val backgroundWorker = Executors.newCachedThreadPool()
+
+    @Volatile
+    private var runningHttps: Boolean = false
+
+    fun isRunning(): Boolean = serverInstance?.isAlive == true
+
+    fun isRunningHttps(): Boolean = runningHttps
+
+    fun getServerUrl(context: Context): String {
+        val scheme = if (isRunning() && runningHttps) {
+            "https"
+        } else if (SettingsManager.isHttpsEnabled(context)) {
+            "https"
+        } else {
+            "http"
+        }
+        val ip = NetworkDiscoveryManager.getLocalIpAddress(context)
+        val port = SettingsManager.getServerPort(context)
+        return "$scheme://$ip:$port"
+    }
+
+    fun getMdnsUrl(context: Context): String {
+        val scheme = if (isRunning() && runningHttps) {
+            "https"
+        } else if (SettingsManager.isHttpsEnabled(context)) {
+            "https"
+        } else {
+            "http"
+        }
+        val domain = SettingsManager.getActiveMdnsDomain(context)
+        val port = SettingsManager.getServerPort(context)
+        return "$scheme://$domain:$port"
+    }
 
     @Synchronized
-    fun startServer(context: Context, port: Int = 8080): Boolean {
-        if (serverInstance?.isAlive == true) return true
+    fun startServer(
+        context: Context,
+        port: Int = SettingsManager.getServerPort(context),
+        enableHttps: Boolean = SettingsManager.isHttpsEnabled(context)
+    ): Boolean {
+        val appCtx = context.applicationContext
+        if (serverInstance?.isAlive == true) {
+            return true
+        }
+        stopServer(appCtx)
+
         return try {
-            val server = PhoneHttpServer(context.applicationContext, port)
-            server.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-            serverInstance = server
-            SettingsManager.setWebServerRunning(true)
+            val srv = IFGestorHttpServer(appCtx, port)
+            var httpsConfigured = false
+
+            if (enableHttps) {
+                val sslFactory = buildSelfSignedServerSocketFactory()
+                if (sslFactory != null) {
+                    srv.makeSecure(sslFactory, null)
+                    httpsConfigured = true
+                }
+            }
+
+            srv.start(15000, false)
+            serverInstance = srv
+            runningHttps = httpsConfigured
+
+            SettingsManager.appendAuditLog(
+                context = appCtx,
+                ip = NetworkDiscoveryManager.getLocalIpAddress(appCtx),
+                category = "SERVIDOR_WEB",
+                action = "SERVIDOR_INICIADO",
+                details = "Porta $port (${if (httpsConfigured) "HTTPS/TLS" else "HTTP"}) • Dominio ${SettingsManager.getActiveMdnsDomain(appCtx)}",
+                success = true
+            )
             true
         } catch (e: Exception) {
-            e.printStackTrace()
-            SettingsManager.setWebServerRunning(false)
+            runningHttps = false
+            SettingsManager.appendAuditLog(
+                context = appCtx,
+                ip = "LOCAL",
+                category = "SERVIDOR_WEB",
+                action = "ERRO_INICIAR_SERVIDOR",
+                details = e.message ?: "Erro desconhecido ao iniciar NanoHTTPD",
+                success = false
+            )
             false
         }
     }
 
     @Synchronized
-    fun stopServer() {
+    fun stopServer(context: Context? = null) {
         try {
             serverInstance?.stop()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        } finally {
-            serverInstance = null
-            SettingsManager.setWebServerRunning(false)
+        } catch (_: Exception) {
+        }
+        serverInstance = null
+        runningHttps = false
+        activeSessions.clear()
+        pendingChallenges.clear()
+        p2pReceiveTokens.clear()
+        if (context != null) {
+            MediaInterceptorService.cancel2faNotification(context)
         }
     }
 
-    fun disconnectAllSessions() {
-        serverInstance?.clearAllSessions()
+    fun revokeAllSessions(context: Context? = null, reason: String = "Revogacao de Seguranca") {
+        activeSessions.clear()
+        pendingChallenges.clear()
+        p2pReceiveTokens.clear()
+        if (context != null) {
+            MediaInterceptorService.cancel2faNotification(context)
+            SettingsManager.appendAuditLog(
+                context = context,
+                ip = "SISTEMA",
+                category = "SEGURANCA",
+                action = "SESSOES_ENCERRADAS",
+                details = "Todas as sessoes web foram revogadas: $reason",
+                success = true
+            )
+        }
     }
 
-    fun isRunning(): Boolean = serverInstance?.isAlive == true
+    // =========================================================================
+    // 1. CONTROLE DE APROVACAO 2FA (NOTIFICACAO OU PAINEL DO APP)
+    // =========================================================================
 
-    fun getDeviceIpAddress(context: Context): String {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val networkInterface = interfaces.nextElement()
-                if (!networkInterface.isUp || networkInterface.isLoopback) continue
-                val addresses = networkInterface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val addr = addresses.nextElement()
-                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                        val ip = addr.hostAddress ?: continue
-                        if (ip.startsWith("192.") || ip.startsWith("10.") || ip.startsWith("172.")) {
-                            return ip
+    fun getLatestPendingChallenge(): Pending2faChallenge? {
+        val now = System.currentTimeMillis()
+        pendingChallenges.entries.removeIf { (_, ch) -> (now - ch.createdAt) > 120_000L }
+        return pendingChallenges.values
+            .filter { it.status == "PENDING" }
+            .maxByOrNull { it.createdAt }
+    }
+
+    fun handle2faDecisionFromNotification(context: Context, requestId: String, approved: Boolean) {
+        val challenge = if (requestId.isNotBlank()) {
+            pendingChallenges[requestId]
+        } else {
+            getLatestPendingChallenge()
+        } ?: return
+
+        applyChallengeDecision(context, challenge, approved, "NOTIFICACAO_APARELHO")
+    }
+
+    fun approveLatestChallengeFromApp(context: Context): Boolean {
+        val ch = getLatestPendingChallenge() ?: return false
+        applyChallengeDecision(context, ch, true, "PAINEL_APP")
+        MediaInterceptorService.cancel2faNotification(context)
+        return true
+    }
+
+    fun rejectLatestChallengeFromApp(context: Context): Boolean {
+        val ch = getLatestPendingChallenge() ?: return false
+        applyChallengeDecision(context, ch, false, "PAINEL_APP")
+        MediaInterceptorService.cancel2faNotification(context)
+        return true
+    }
+
+    private fun applyChallengeDecision(
+        context: Context,
+        challenge: Pending2faChallenge,
+        approved: Boolean,
+        source: String
+    ) {
+        val now = System.currentTimeMillis()
+        if (approved) {
+            challenge.status = "APPROVED"
+            when (challenge.purpose) {
+                "LOGIN" -> {
+                    val newToken = UUID.randomUUID().toString().replace("-", "")
+                    activeSessions[newToken] = SessionInfo(
+                        token = newToken,
+                        ip = challenge.ip,
+                        expiresAt = now + SESSION_TTL_MS,
+                        actionAuthorizedUntil = now + ACTION_GRANT_TTL_MS
+                    )
+                    challenge.sessionToken = newToken
+                }
+                "ACTION" -> {
+                    challenge.sessionToken?.let { tok ->
+                        activeSessions[tok]?.let { sess ->
+                            sess.expiresAt = now + SESSION_TTL_MS
+                            sess.actionAuthorizedUntil = now + ACTION_GRANT_TTL_MS
                         }
                     }
                 }
+                "P2P_RECEIVE" -> {
+                    val p2pToken = UUID.randomUUID().toString().replace("-", "")
+                    p2pReceiveTokens[p2pToken] = now + P2P_TOKEN_TTL_MS
+                    challenge.sessionToken = p2pToken
+                }
             }
-        } catch (_: Exception) {}
+        } else {
+            challenge.status = "REJECTED"
+        }
 
+        SettingsManager.appendAuditLog(
+            context = context,
+            ip = challenge.ip,
+            category = "2FA",
+            action = if (approved) "2FA_APROVADO" else "2FA_RECUSADO",
+            details = "${challenge.purpose} (${challenge.description}) via $source",
+            success = approved
+        )
+    }
+
+    // =========================================================================
+    // 2. GERACAO AUTOMATICA DE CERTIFICADO TLS AUTOASSINADO (ANDROID KEYSTORE)
+    // =========================================================================
+
+    private fun buildSelfSignedServerSocketFactory(): SSLServerSocketFactory? {
         return try {
-            val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            @Suppress("DEPRECATION")
-            val ipInt = wm.connectionInfo.ipAddress
-            if (ipInt != 0) {
-                String.format(
-                    Locale.US,
-                    "%d.%d.%d.%d",
-                    ipInt and 0xff,
-                    ipInt shr 8 and 0xff,
-                    ipInt shr 16 and 0xff,
-                    ipInt shr 24 and 0xff
-                )
-            } else {
-                "Sem conexão Wi-Fi"
+            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply {
+                load(null)
             }
+
+            if (!keyStore.containsAlias(KEYSTORE_ALIAS)) {
+                val kpg = KeyPairGenerator.getInstance(
+                    KeyProperties.KEY_ALGORITHM_RSA,
+                    "AndroidKeyStore"
+                )
+                val now = System.currentTimeMillis()
+                val spec = KeyGenParameterSpec.Builder(
+                    KEYSTORE_ALIAS,
+                    KeyProperties.PURPOSE_SIGN or
+                        KeyProperties.PURPOSE_VERIFY or
+                        KeyProperties.PURPOSE_ENCRYPT or
+                        KeyProperties.PURPOSE_DECRYPT
+                )
+                    .setKeySize(2048)
+                    .setDigests(
+                        KeyProperties.DIGEST_SHA256,
+                        KeyProperties.DIGEST_SHA384,
+                        KeyProperties.DIGEST_SHA512,
+                        KeyProperties.DIGEST_NONE
+                    )
+                    .setSignaturePaddings(
+                        KeyProperties.SIGNATURE_PADDING_RSA_PKCS1,
+                        KeyProperties.SIGNATURE_PADDING_RSA_PSS
+                    )
+                    .setEncryptionPaddings(
+                        KeyProperties.ENCRYPTION_PADDING_RSA_PKCS1,
+                        KeyProperties.ENCRYPTION_PADDING_NONE
+                    )
+                    .setCertificateSubject(X500Principal("CN=ifgestor.local, O=IFGestor Security"))
+                    .setCertificateSerialNumber(BigInteger.valueOf(now))
+                    .setCertificateNotBefore(Date(now - 86400_000L))
+                    .setCertificateNotAfter(Date(now + 315360000_000L))
+                    .build()
+
+                kpg.initialize(spec)
+                kpg.generateKeyPair()
+            }
+
+            val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+            kmf.init(keyStore, null)
+
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(kmf.keyManagers, null, SecureRandom())
+            val factory = sslContext.serverSocketFactory
+
+            // Valida criacao de socket TLS antes de ativar
+            factory.createServerSocket().use { }
+            factory
         } catch (_: Exception) {
-            "Sem conexão Wi-Fi"
+            null
         }
     }
-}
 
-private data class AuthSession(
-    val token: String,
-    val csrfToken: String,
-    val clientIp: String,
-    var lastActivityMs: Long,
-    var elevatedUntilMs: Long = 0L
-)
+    // =========================================================================
+    // 3. SERVIDOR HTTP/HTTPS EMBARCADO (NanoHTTPD)
+    // =========================================================================
 
-private data class Pending2FA(
-    val tempToken: String,
-    val code: String,
-    val clientIp: String,
-    val actionDesc: String,
-    val expiresAtMs: Long
-)
+    private class IFGestorHttpServer(
+        private val appContext: Context,
+        port: Int
+    ) : NanoHTTPD(port) {
 
-private data class BatchOpGrant(
-    val opToken: String,
-    var lastChunkActivityMs: Long
-)
+        override fun serve(session: IHTTPSession): Response {
+            val uri = session.uri ?: "/"
+            val method = session.method
+            val clientIp = (session.headers["remote-addr"]
+                ?: session.headers["http-client-ip"]
+                ?: "REDE_LOCAL").trim()
 
-private data class BruteForceRecord(
-    var failures: Int = 0,
-    var lockedUntilMs: Long = 0L
-)
-
-private class PhoneHttpServer(
-    private val context: Context,
-    port: Int
-) : NanoHTTPD(port) {
-
-    private val rootStoragePath: String = SettingsManager.getStorageRootPath()
-    private val secureRandom = SecureRandom()
-
-    private val activeSessions = ConcurrentHashMap<String, AuthSession>()
-    private val pendingLogin2faMap = ConcurrentHashMap<String, Pending2FA>()
-    private val pendingAction2faMap = ConcurrentHashMap<String, Pending2FA>()
-    private val activeBatchGrants = ConcurrentHashMap<String, BatchOpGrant>()
-    private val bruteForceMap = ConcurrentHashMap<String, BruteForceRecord>()
-
-    companion object {
-        private const val SESSION_TIMEOUT_MS = 30 * 60 * 1000L
-        private const val TWO_FA_EXPIRY_MS = 2 * 60 * 1000L
-        private const val ELEVATED_WINDOW_MS = 5 * 60 * 1000L
-        private const val BATCH_GRANT_IDLE_MS = 10 * 60 * 1000L
-        private const val MAX_ATTEMPTS = 5
-        private const val LOCKOUT_DURATION_MS = 5 * 60 * 1000L
-    }
-
-    fun clearAllSessions() {
-        activeSessions.clear()
-        pendingLogin2faMap.clear()
-        pendingAction2faMap.clear()
-        activeBatchGrants.clear()
-        SettingsManager.publishTwoFactorCode(null, null)
-        SettingsManager.updateActiveSessionsCount(0)
-    }
-
-    override fun serve(session: IHTTPSession): Response {
-        val uri = session.uri ?: "/"
-        val params = parseQueryParams(session.queryParameterString)
-        val clientIp = session.headers["remote-addr"]
-            ?: session.headers["http-client-ip"]
-            ?: "PC-Rede-Local"
-
-        if (isIpLockedOut(clientIp)) {
-            val remainingSec = ((bruteForceMap[clientIp]?.lockedUntilMs ?: 0L) - System.currentTimeMillis()) / 1000
-            return secureResponse(
-                newFixedLengthResponse(
-                    Response.Status.FORBIDDEN,
-                    MIME_HTML,
-                    renderLockoutPage(remainingSec.coerceAtLeast(1))
-                )
-            )
-        }
-
-        // Rotas de Login Inicial (PIN + 2FA de Entrada)
-        if (uri == "/auth/pin" && session.method == Method.POST) {
-            return secureResponse(handlePinSubmission(params, clientIp))
-        }
-        if (uri == "/auth/2fa" && session.method == Method.POST) {
-            return secureResponse(handleLogin2faSubmission(params, clientIp))
-        }
-        if (uri == "/auth/check_login_2fa") {
-            return secureResponse(handleCheckLogin2faPolling(params, clientIp))
-        }
-        if (uri == "/auth/logout") {
-            return secureResponse(handleLogout(session))
-        }
-
-        val authSession = getValidSession(session, clientIp)
-        if (SettingsManager.isWebAuthEnabled(context) && authSession == null) {
-            val step = params["step"]
-            val tempToken = params["temp"] ?: ""
-            val errorMsg = params["err"]
-            val pageHtml = if (step == "2fa" && pendingLogin2faMap.containsKey(tempToken)) {
-                render2faLoginPage(tempToken, errorMsg)
-            } else {
-                renderPinLoginPage(errorMsg)
-            }
-            return secureResponse(newFixedLengthResponse(Response.Status.OK, MIME_HTML, pageHtml))
-        }
-
-        val csrfToken = authSession?.csrfToken ?: "open-mode"
-
-        return try {
-            val response = when {
-                uri == "/dirs" -> handleListDirectoriesJson(params)
-                uri == "/action/request_2fa" && session.method == Method.POST -> {
-                    if (!verifyCsrf(session, params, authSession)) {
-                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "CSRF invalido")
-                    } else {
-                        handleRequestAction2fa(params, clientIp, authSession)
+            return try {
+                when {
+                    // Pagina Principal SPA (Single Page Application)
+                    uri == "/" && method == Method.GET -> {
+                        htmlResponse(buildSinglePageWebAppHtml())
                     }
-                }
-                uri == "/action/verify_2fa" && session.method == Method.POST -> {
-                    if (!verifyCsrf(session, params, authSession)) {
-                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "CSRF invalido")
-                    } else {
-                        handleVerifyAction2fa(params, clientIp, authSession)
+
+                    // Endpoints de Autenticacao (POST com body oculto - Item 1)
+                    uri == "/api/auth/login" && method == Method.POST -> {
+                        handleAuthLogin(session, clientIp)
                     }
-                }
-                uri == "/action/lock_window" && session.method == Method.POST -> {
-                    authSession?.elevatedUntilMs = 0L
-                    activeBatchGrants.clear()
-                    newFixedLengthResponse(Response.Status.OK, "application/json", """{"locked":true}""")
-                }
-                uri == "/upload" && session.method == Method.POST -> {
-                    if (!verifyCsrf(session, params, authSession)) {
-                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "CSRF invalido")
-                    } else if (!verifyOperationAuthorized(session, params, authSession)) {
-                        newFixedLengthResponse(Response.Status.UNAUTHORIZED, MIME_PLAINTEXT, "2FA_REQUIRED")
-                    } else {
-                        handleFileUpload(session, params, authSession)
+                    uri == "/api/auth/poll-2fa" && method == Method.POST -> {
+                        handlePoll2fa(session, clientIp)
                     }
-                }
-                uri == "/action" && session.method == Method.POST -> {
-                    if (!verifyCsrf(session, params, authSession)) {
-                        newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "CSRF invalido")
-                    } else if (!verifyOperationAuthorized(session, params, authSession)) {
-                        newFixedLengthResponse(Response.Status.UNAUTHORIZED, MIME_PLAINTEXT, "2FA_REQUIRED")
-                    } else {
-                        val bodyText = readUtf8Body(session)
-                        handleFileAction(params, bodyText, authSession)
+                    uri == "/api/auth/request-action-2fa" && method == Method.POST -> {
+                        handleRequestAction2fa(session, clientIp)
                     }
+                    uri == "/api/auth/logout" && method == Method.POST -> {
+                        handleLogout(session, clientIp)
+                    }
+
+                    // Endpoints de Recebimento P2P entre Celulares (Item 8)
+                    uri == "/api/p2p/handshake" && method == Method.POST -> {
+                        handleP2pHandshake(session, clientIp)
+                    }
+                    uri == "/api/p2p/upload" && method == Method.POST -> {
+                        handleP2pIncomingUpload(session, clientIp)
+                    }
+
+                    // Endpoints Protegidos da Sessao Web
+                    uri == "/api/list" && method == Method.GET -> {
+                        val sess = requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiList(session, sess)
+                    }
+                    uri == "/api/tasks" && method == Method.GET -> {
+                        requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiTasks()
+                    }
+                    uri == "/api/peers" && method == Method.GET -> {
+                        requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiPeers()
+                    }
+                    uri == "/api/mkdir" && method == Method.POST -> {
+                        val sess = requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiMkdir(session, sess, clientIp)
+                    }
+                    uri == "/api/upload" && method == Method.POST -> {
+                        val sess = requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiRawUpload(session, sess, clientIp)
+                    }
+                    uri == "/api/batch-action" && method == Method.POST -> {
+                        val sess = requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiBatchAction(session, sess, clientIp)
+                    }
+                    uri == "/api/p2p/send-from-web" && method == Method.POST -> {
+                        val sess = requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiP2pSendFromWeb(session, sess, clientIp)
+                    }
+                    uri == "/api/whatsapp/share" && method == Method.POST -> {
+                        val sess = requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiWhatsAppShareOnPhone(session, sess, clientIp)
+                    }
+                    uri == "/api/thumb" && method == Method.GET -> {
+                        requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiThumb(session)
+                    }
+                    uri == "/api/raw" && method == Method.GET -> {
+                        requireValidSession(session) ?: return unauthorizedJson()
+                        handleApiRawFile(session, clientIp, downloadAttachment = false)
+                    }
+                    uri == "/api/download" && method == Method.GET -> {
+                        val sess = requireValidSession(session) ?: return unauthorizedJson()
+                        if (!isActionAuthorized(sess)) {
+                            return jsonResponse(
+                                Response.Status.FORBIDDEN,
+                                JSONObject().put("error", "2FA_REQUIRED").put("message", "Autorização 2FA necessária para download.")
+                            )
+                        }
+                        handleApiRawFile(session, clientIp, downloadAttachment = true)
+                    }
+                    uri == "/api/download-zip" && method == Method.GET -> {
+                        val sess = requireValidSession(session) ?: return unauthorizedJson()
+                        if (!isActionAuthorized(sess)) {
+                            return jsonResponse(
+                                Response.Status.FORBIDDEN,
+                                JSONObject().put("error", "2FA_REQUIRED").put("message", "Autorização 2FA necessária para exportar ZIP.")
+                            )
+                        }
+                        handleApiStreamZip(session, clientIp)
+                    }
+
+                    else -> jsonResponse(
+                        Response.Status.NOT_FOUND,
+                        JSONObject().put("error", "Rota não encontrada")
+                    )
                 }
-                uri == "/file" -> handleFileStream(session, params)
-                uri == "/zip" -> handleFolderZipDownload(params)
-                else -> renderExplorerPage(params["dir"], csrfToken, authSession)
-            }
-            secureResponse(response)
-        } catch (e: Exception) {
-            secureResponse(
-                newFixedLengthResponse(
+            } catch (e: Exception) {
+                jsonResponse(
                     Response.Status.INTERNAL_ERROR,
-                    MIME_PLAINTEXT,
-                    "Erro interno: ${e.message}"
+                    JSONObject().put("error", e.message ?: "Erro interno no servidor")
                 )
-            )
+            }
         }
-    }
 
-    // Verifica se a operacao possui um BatchOpGrant ativo ou se esta na Janela Deslizante de 5 min
-    private fun verifyOperationAuthorized(
-        session: IHTTPSession,
-        params: Map<String, String>,
-        authSession: AuthSession?
-    ): Boolean {
-        val now = System.currentTimeMillis()
-        val opToken = session.headers["x-op-token"] ?: params["opToken"] ?: ""
+        // =====================================================================
+        // 4. AUTENTICACAO POST (PIN PBKDF2 + 2FA) E PROTECAO FORCA BRUTA
+        // =====================================================================
 
-        if (opToken.isNotBlank()) {
-            val grant = activeBatchGrants[opToken]
-            if (grant != null && (now - grant.lastChunkActivityMs) <= BATCH_GRANT_IDLE_MS) {
-                // Renova o token do lote a cada arquivo transferido (nunca interrompe lotes longos!)
-                grant.lastChunkActivityMs = now
-                if (authSession != null && authSession.elevatedUntilMs > now) {
-                    authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
+        private fun handleAuthLogin(session: IHTTPSession, clientIp: String): Response {
+            val now = System.currentTimeMillis()
+            val bf = bruteForceMap.getOrPut(clientIp) { BruteForceRecord() }
+            if (bf.lockedUntil > now) {
+                val waitSec = ((bf.lockedUntil - now) / 1000L).coerceAtLeast(1L)
+                return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject()
+                        .put("ok", false)
+                        .put("error", "Muitas tentativas incorretas. Aguarde ${waitSec}s.")
+                )
+            }
+
+            if (SettingsManager.isPinChangeRequired(appContext)) {
+                return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject()
+                        .put("ok", false)
+                        .put("error", "Por segurança (OWASP), altere o PIN padrão (1234) na aba Servidor PC do celular antes do primeiro acesso web.")
+                )
+            }
+
+            val params = parseFormBody(session)
+            val pin = params["pin"] ?: ""
+
+            if (!SettingsManager.verifyPin(appContext, pin)) {
+                bf.failures += 1
+                if (bf.failures >= MAX_FAILED_ATTEMPTS) {
+                    bf.lockedUntil = now + LOCKOUT_DURATION_MS
+                    bf.failures = 0
                 }
-                return true
-            }
-        }
-
-        if (authSession != null && authSession.elevatedUntilMs > now) {
-            // Janela deslizante: renova +5 min enquanto o usuario estiver operando ativamente
-            authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
-            return true
-        }
-
-        return false
-    }
-
-    private fun handleRequestAction2fa(
-        params: Map<String, String>,
-        clientIp: String,
-        authSession: AuthSession?
-    ): Response {
-        val now = System.currentTimeMillis()
-        // Se a janela deslizante de 5 min ja estiver ativa, libera o opToken imediatamente
-        if (authSession != null && authSession.elevatedUntilMs > now) {
-            authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
-            val opToken = issueBatchOpGrant()
-            val remSec = ((authSession.elevatedUntilMs - now) / 1000).coerceAtLeast(1)
-            return newFixedLengthResponse(
-                Response.Status.OK,
-                "application/json",
-                """{"status":"already_authorized","opToken":"$opToken","remainingSeconds":$remSec}"""
-            )
-        }
-
-        val actionDesc = (params["desc"] ?: "Operação de Arquivo no PC").trim()
-        val code6Digits = String.format(Locale.US, "%06d", secureRandom.nextInt(1_000_000))
-        val reqId = generateRandomHex(16)
-
-        pendingAction2faMap[reqId] = Pending2FA(
-            tempToken = reqId,
-            code = code6Digits,
-            clientIp = clientIp,
-            actionDesc = actionDesc,
-            expiresAtMs = now + TWO_FA_EXPIRY_MS
-        )
-
-        SettingsManager.publishTwoFactorCode(code6Digits, clientIp, actionDesc)
-
-        return newFixedLengthResponse(
-            Response.Status.OK,
-            "application/json",
-            """{"status":"pending","reqId":"$reqId"}"""
-        )
-    }
-
-    private fun handleVerifyAction2fa(
-        params: Map<String, String>,
-        clientIp: String,
-        authSession: AuthSession?
-    ): Response {
-        val reqId = params["reqId"] ?: ""
-        val inputCode = (params["code"] ?: "").trim()
-        val keep5Min = params["keep5m"] == "1"
-        val mode = params["mode"] ?: "manual" // "manual" ou "poll"
-
-        val pending = pendingAction2faMap[reqId]
-        val now = System.currentTimeMillis()
-
-        if (pending == null || now > pending.expiresAtMs) {
-            pendingAction2faMap.remove(reqId)
-            return newFixedLengthResponse(
-                Response.Status.OK,
-                "application/json",
-                """{"status":"expired"}"""
-            )
-        }
-
-        val approvedByPhoneButton = SettingsManager.isCodeApprovedByPhone(pending.code)
-        val approvedByTypedCode = inputCode.isNotEmpty() && pending.code == inputCode
-
-        if (!approvedByPhoneButton && !approvedByTypedCode) {
-            if (mode == "manual") {
-                registerAuthFailure(clientIp)
-                return newFixedLengthResponse(
-                    Response.Status.OK,
-                    "application/json",
-                    """{"status":"invalid_code"}"""
+                SettingsManager.appendAuditLog(
+                    context = appContext,
+                    ip = clientIp,
+                    category = "AUTENTICACAO",
+                    action = "PIN_INVALIDO",
+                    details = "Tentativa de login web com PIN incorreto",
+                    success = false
+                )
+                return jsonResponse(
+                    Response.Status.UNAUTHORIZED,
+                    JSONObject().put("ok", false).put("error", "PIN incorreto.")
                 )
             }
-            return newFixedLengthResponse(
+
+            bf.failures = 0
+            bf.lockedUntil = 0L
+
+            val reqId = UUID.randomUUID().toString().take(12)
+            val code6 = String.format(Locale.US, "%06d", SecureRandom().nextInt(1_000_000))
+            val challenge = Pending2faChallenge(
+                requestId = reqId,
+                code = code6,
+                ip = clientIp,
+                purpose = "LOGIN",
+                description = "Acesso ao Gerenciador Web IFGestor"
+            )
+            pendingChallenges[reqId] = challenge
+
+            MediaInterceptorService.show2faNotification(
+                context = appContext,
+                requestId = reqId,
+                code = code6,
+                title = "Login no Site Web",
+                description = "Solicitação de acesso ao painel de arquivos",
+                clientIp = clientIp
+            )
+
+            SettingsManager.appendAuditLog(
+                context = appContext,
+                ip = clientIp,
+                category = "AUTENTICACAO",
+                action = "DESAFIO_2FA_ENVIADO",
+                details = "PIN validado; aguardando confirmacao 2FA no aparelho",
+                success = true
+            )
+
+            return jsonResponse(
                 Response.Status.OK,
-                "application/json",
-                """{"status":"waiting"}"""
+                JSONObject()
+                    .put("ok", true)
+                    .put("requestId", reqId)
+                    .put("message", "Confirme na notificação do celular ou digite o código de 6 dígitos.")
             )
         }
 
-        // Autorizado com sucesso (pelo codigo digitado ou pelo botao da notificacao)!
-        pendingAction2faMap.remove(reqId)
-        SettingsManager.consumeApprovedCode(pending.code)
-        resetAuthFailures(clientIp)
+        private fun handleRequestAction2fa(session: IHTTPSession, clientIp: String): Response {
+            val sess = requireValidSession(session) ?: return unauthorizedJson()
+            val params = parseFormBody(session)
+            val actionLabel = params["description"] ?: "Operação em arquivos"
 
-        if (keep5Min && authSession != null) {
-            authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
-        }
+            if (isActionAuthorized(sess)) {
+                return jsonResponse(
+                    Response.Status.OK,
+                    JSONObject().put("ok", true).put("alreadyAuthorized", true)
+                )
+            }
 
-        val opToken = issueBatchOpGrant()
-        val remSec = if (authSession != null && authSession.elevatedUntilMs > now) {
-            ((authSession.elevatedUntilMs - now) / 1000).coerceAtLeast(0)
-        } else 0L
-
-        return newFixedLengthResponse(
-            Response.Status.OK,
-            "application/json",
-            """{"status":"approved","opToken":"$opToken","remainingSeconds":$remSec}"""
-        )
-    }
-
-    private fun issueBatchOpGrant(): String {
-        val token = generateRandomHex(24)
-        activeBatchGrants[token] = BatchOpGrant(
-            opToken = token,
-            lastChunkActivityMs = System.currentTimeMillis()
-        )
-        return token
-    }
-
-    private fun handleListDirectoriesJson(params: Map<String, String>): Response {
-        val dir = sanitizeFile(params["dir"])
-        val rootFile = File(rootStoragePath).canonicalFile
-        val parentPath = if (dir.canonicalPath != rootFile.path) {
-            dir.parentFile?.canonicalPath ?: ""
-        } else ""
-
-        val subDirs = dir.listFiles()
-            ?.filter { it.isDirectory && !it.name.startsWith(".") }
-            ?.sortedBy { it.name.lowercase() }
-            ?: emptyList()
-
-        val itemsJson = subDirs.joinToString(",") { folder ->
-            """{"name":"${escapeJs(folder.name)}","path":"${escapeJs(folder.absolutePath)}"}"""
-        }
-
-        val json = """{"currentPath":"${escapeJs(dir.absolutePath)}","shortPath":"${escapeJs(SettingsManager.formatShortPath(dir.absolutePath))}","parentPath":"${escapeJs(parentPath)}","folders":[$itemsJson]}"""
-        return newFixedLengthResponse(Response.Status.OK, "application/json", json)
-    }
-
-    private fun readUtf8Body(session: IHTTPSession): String {
-        val len = session.headers["content-length"]?.toIntOrNull() ?: 0
-        if (len <= 0 || len > 512 * 1024) return ""
-        val buf = ByteArray(len)
-        var readTotal = 0
-        val input = session.inputStream
-        while (readTotal < len) {
-            val r = input.read(buf, readTotal, len - readTotal)
-            if (r == -1) break
-            readTotal += r
-        }
-        return String(buf, 0, readTotal, Charsets.UTF_8)
-    }
-
-    private fun secureResponse(response: Response): Response {
-        response.addHeader("X-Frame-Options", "DENY")
-        response.addHeader("X-Content-Type-Options", "nosniff")
-        response.addHeader("Referrer-Policy", "no-referrer")
-        response.addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
-        return response
-    }
-
-    private fun isIpLockedOut(ip: String): Boolean {
-        val record = bruteForceMap[ip] ?: return false
-        if (record.lockedUntilMs > System.currentTimeMillis()) {
-            return true
-        }
-        if (record.lockedUntilMs != 0L) {
-            record.failures = 0
-            record.lockedUntilMs = 0L
-        }
-        return false
-    }
-
-    private fun registerAuthFailure(ip: String) {
-        val record = bruteForceMap.getOrPut(ip) { BruteForceRecord() }
-        record.failures += 1
-        if (record.failures >= MAX_ATTEMPTS) {
-            record.lockedUntilMs = System.currentTimeMillis() + LOCKOUT_DURATION_MS
-        }
-    }
-
-    private fun resetAuthFailures(ip: String) {
-        bruteForceMap.remove(ip)
-    }
-
-    private fun handlePinSubmission(params: Map<String, String>, clientIp: String): Response {
-        val inputPin = params["pin"] ?: ""
-        if (!SettingsManager.verifyWebPin(context, inputPin)) {
-            registerAuthFailure(clientIp)
-            val res = newFixedLengthResponse(Response.Status.REDIRECT, MIME_HTML, "")
-            res.addHeader("Location", "/?err=pin")
-            return res
-        }
-
-        resetAuthFailures(clientIp)
-
-        if (SettingsManager.isTwoFactorEnabled(context)) {
-            val code6Digits = String.format(Locale.US, "%06d", secureRandom.nextInt(1_000_000))
-            val tempToken = generateRandomHex(24)
-            pendingLogin2faMap[tempToken] = Pending2FA(
-                tempToken = tempToken,
-                code = code6Digits,
-                clientIp = clientIp,
-                actionDesc = "Login no Gerenciador Web",
-                expiresAtMs = System.currentTimeMillis() + TWO_FA_EXPIRY_MS
+            val reqId = UUID.randomUUID().toString().take(12)
+            val code6 = String.format(Locale.US, "%06d", SecureRandom().nextInt(1_000_000))
+            val challenge = Pending2faChallenge(
+                requestId = reqId,
+                code = code6,
+                ip = clientIp,
+                purpose = "ACTION",
+                description = actionLabel,
+                sessionToken = sess.token
             )
-            SettingsManager.publishTwoFactorCode(code6Digits, clientIp, "Login no Gerenciador Web")
+            pendingChallenges[reqId] = challenge
 
-            val res = newFixedLengthResponse(Response.Status.REDIRECT, MIME_HTML, "")
-            res.addHeader("Location", "/?step=2fa&temp=$tempToken")
-            return res
-        }
-
-        return createAuthenticatedSessionResponse(clientIp)
-    }
-
-    private fun handleCheckLogin2faPolling(params: Map<String, String>, clientIp: String): Response {
-        val tempToken = params["temp"] ?: ""
-        val pending = pendingLogin2faMap[tempToken]
-        if (pending == null || System.currentTimeMillis() > pending.expiresAtMs) {
-            return newFixedLengthResponse(Response.Status.OK, "application/json", """{"approved":false,"expired":true}""")
-        }
-        if (SettingsManager.isCodeApprovedByPhone(pending.code)) {
-            pendingLogin2faMap.remove(tempToken)
-            SettingsManager.consumeApprovedCode(pending.code)
-            resetAuthFailures(clientIp)
-            val sessionToken = generateRandomHex(32)
-            val csrfToken = generateRandomHex(24)
-            activeSessions[sessionToken] = AuthSession(
-                token = sessionToken,
-                csrfToken = csrfToken,
-                clientIp = clientIp,
-                lastActivityMs = System.currentTimeMillis()
+            MediaInterceptorService.show2faNotification(
+                context = appContext,
+                requestId = reqId,
+                code = code6,
+                title = "Autorizar Ação Web",
+                description = actionLabel,
+                clientIp = clientIp
             )
-            SettingsManager.updateActiveSessionsCount(activeSessions.size)
-            val res = newFixedLengthResponse(Response.Status.OK, "application/json", """{"approved":true}""")
-            res.addHeader("Set-Cookie", "IFG_SESSION=$sessionToken; Path=/; HttpOnly; SameSite=Strict")
+
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject()
+                    .put("ok", true)
+                    .put("alreadyAuthorized", false)
+                    .put("requestId", reqId)
+            )
+        }
+
+        private fun handlePoll2fa(session: IHTTPSession, clientIp: String): Response {
+            val params = parseFormBody(session)
+            val reqId = params["requestId"] ?: ""
+            val typedCode = (params["code"] ?: "").trim()
+
+            val challenge = pendingChallenges[reqId]
+                ?: return jsonResponse(
+                    Response.Status.NOT_FOUND,
+                    JSONObject().put("status", "EXPIRED").put("error", "Desafio 2FA expirado.")
+                )
+
+            if (System.currentTimeMillis() - challenge.createdAt > 120_000L) {
+                pendingChallenges.remove(reqId)
+                MediaInterceptorService.cancel2faNotification(appContext)
+                return jsonResponse(
+                    Response.Status.OK,
+                    JSONObject().put("status", "EXPIRED")
+                )
+            }
+
+            if (typedCode.length == 6 && challenge.status == "PENDING") {
+                if (typedCode == challenge.code) {
+                    applyChallengeDecision(appContext, challenge, true, "CODIGO_6_DIGITOS_WEB")
+                    MediaInterceptorService.cancel2faNotification(appContext)
+                } else {
+                    SettingsManager.appendAuditLog(
+                        context = appContext,
+                        ip = clientIp,
+                        category = "2FA",
+                        action = "CODIGO_2FA_INCORRETO",
+                        details = "Codigo de 6 digitos invalido para ${challenge.description}",
+                        success = false
+                    )
+                    return jsonResponse(
+                        Response.Status.OK,
+                        JSONObject().put("status", "INVALID_CODE").put("error", "Código 2FA incorreto.")
+                    )
+                }
+            }
+
+            return when (challenge.status) {
+                "APPROVED" -> {
+                    pendingChallenges.remove(reqId)
+                    jsonResponse(
+                        Response.Status.OK,
+                        JSONObject()
+                            .put("status", "APPROVED")
+                            .put("token", challenge.sessionToken ?: "")
+                    )
+                }
+                "REJECTED" -> {
+                    pendingChallenges.remove(reqId)
+                    jsonResponse(
+                        Response.Status.OK,
+                        JSONObject().put("status", "REJECTED")
+                    )
+                }
+                else -> {
+                    jsonResponse(
+                        Response.Status.OK,
+                        JSONObject().put("status", "PENDING")
+                    )
+                }
+            }
+        }
+
+        private fun handleLogout(session: IHTTPSession, clientIp: String): Response {
+            val token = extractToken(session)
+            if (token != null) {
+                activeSessions.remove(token)
+            }
+            SettingsManager.appendAuditLog(
+                context = appContext,
+                ip = clientIp,
+                category = "AUTENTICACAO",
+                action = "LOGOUT_WEB",
+                details = "Sessao encerrada pelo navegador",
+                success = true
+            )
+            return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
+        }
+
+        // =====================================================================
+        // 5. RECEBIMENTO P2P ENTRE CELULARES COM 2FA E ESCRITA ATOMICA (.part)
+        // =====================================================================
+
+        private fun handleP2pHandshake(session: IHTTPSession, clientIp: String): Response {
+            val params = parseFormBody(session)
+            val senderAlias = params["sender"] ?: clientIp
+            val fileCount = params["count"]?.toIntOrNull() ?: 1
+            val folder = params["folder"] ?: ""
+
+            val reqId = "p2p_${UUID.randomUUID().toString().take(10)}"
+            val code6 = String.format(Locale.US, "%06d", SecureRandom().nextInt(1_000_000))
+            val desc = "Receber $fileCount arquivo(s) de $senderAlias ($clientIp) na pasta ${folder.ifEmpty { "IFgestor (Raiz)" }}"
+
+            val challenge = Pending2faChallenge(
+                requestId = reqId,
+                code = code6,
+                ip = clientIp,
+                purpose = "P2P_RECEIVE",
+                description = desc
+            )
+            pendingChallenges[reqId] = challenge
+
+            MediaInterceptorService.show2faNotification(
+                context = appContext,
+                requestId = reqId,
+                code = code6,
+                title = "📲 Receber Arquivos P2P",
+                description = desc,
+                clientIp = clientIp
+            )
+
+            // Aguarda ate 60 segundos pela aprovacao na notificacao ou no painel do celular de destino
+            val deadline = System.currentTimeMillis() + 60_000L
+            while (System.currentTimeMillis() < deadline) {
+                val st = challenge.status
+                if (st == "APPROVED") {
+                    pendingChallenges.remove(reqId)
+                    return jsonResponse(
+                        Response.Status.OK,
+                        JSONObject()
+                            .put("approved", true)
+                            .put("token", challenge.sessionToken ?: "")
+                    )
+                } else if (st == "REJECTED") {
+                    pendingChallenges.remove(reqId)
+                    return jsonResponse(
+                        Response.Status.OK,
+                        JSONObject().put("approved", false)
+                    )
+                }
+                Thread.sleep(300L)
+            }
+
+            pendingChallenges.remove(reqId)
+            MediaInterceptorService.cancel2faNotification(appContext)
+            return jsonResponse(Response.Status.OK, JSONObject().put("approved", false))
+        }
+
+        private fun handleP2pIncomingUpload(session: IHTTPSession, clientIp: String): Response {
+            val token = session.parms["token"] ?: ""
+            val exp = p2pReceiveTokens[token] ?: 0L
+            if (exp < System.currentTimeMillis()) {
+                return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject().put("ok", false).put("error", "Token P2P inválido ou expirado.")
+                )
+            }
+
+            val rawName = session.parms["name"] ?: "p2p_${System.currentTimeMillis()}.jpg"
+            val folderRel = SettingsManager.sanitizeSubfolderName(session.parms["folder"] ?: "")
+            val index = session.parms["index"]?.toIntOrNull() ?: 1
+            val total = session.parms["total"]?.toIntOrNull() ?: 1
+
+            val targetDir = SettingsManager.resolveSafeSandboxFile(folderRel)
+                ?: SettingsManager.getSandboxRootDir()
+            if (!targetDir.exists()) targetDir.mkdirs()
+
+            val finalFile = SettingsManager.resolveUniqueFile(targetDir, rawName)
+            val partFile = File(targetDir, "${finalFile.name}.part")
+            val contentLen = session.headers["content-length"]?.toLongOrNull() ?: 0L
+            val taskId = "p2p_recv_$token"
+
+            SettingsManager.tryLockFile(finalFile)
+            return try {
+                var receivedBytes = 0L
+                BufferedOutputStream(FileOutputStream(partFile)).use { out ->
+                    val buf = ByteArray(32 * 1024)
+                    var remaining = contentLen
+                    var lastUpdate = 0L
+                    while (remaining > 0L) {
+                        val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                        val read = session.inputStream.read(buf, 0, toRead)
+                        if (read <= 0) break
+                        out.write(buf, 0, read)
+                        receivedBytes += read
+                        remaining -= read
+
+                        val now = System.currentTimeMillis()
+                        if (now - lastUpdate >= 120L) {
+                            lastUpdate = now
+                            SettingsManager.upsertTask(
+                                id = taskId,
+                                title = "📥 Recebendo P2P ($index/$total)",
+                                subtitle = "${finalFile.name} ← $clientIp",
+                                type = "P2P_RECEIVE",
+                                currentItems = index,
+                                totalItems = total,
+                                bytesProcessed = receivedBytes,
+                                totalBytes = contentLen.coerceAtLeast(1L),
+                                status = "RUNNING"
+                            )
+                        }
+                    }
+                    out.flush()
+                }
+
+                if (contentLen > 0L && partFile.length() < contentLen) {
+                    partFile.delete()
+                    throw IllegalStateException("Transferência P2P interrompida antes do fim.")
+                }
+
+                if (!partFile.renameTo(finalFile)) {
+                    partFile.copyTo(finalFile, overwrite = true)
+                    partFile.delete()
+                }
+
+                MediaScannerConnection.scanFile(
+                    appContext,
+                    arrayOf(finalFile.absolutePath),
+                    null,
+                    null
+                )
+
+                val doneAll = (index >= total)
+                SettingsManager.upsertTask(
+                    id = taskId,
+                    title = if (doneAll) "✅ P2P Recebido ($total arq.)" else "📥 Recebendo P2P ($index/$total)",
+                    subtitle = "${finalFile.name} salvo em ${folderRel.ifEmpty { "IFgestor" }}",
+                    type = "P2P_RECEIVE",
+                    currentItems = index,
+                    totalItems = total,
+                    bytesProcessed = contentLen,
+                    totalBytes = contentLen.coerceAtLeast(1L),
+                    status = if (doneAll) "COMPLETED" else "RUNNING"
+                )
+
+                SettingsManager.appendAuditLog(
+                    context = appContext,
+                    ip = clientIp,
+                    category = "P2P",
+                    action = "ARQUIVO_P2P_RECEBIDO",
+                    details = "Recebido ${finalFile.name} (${finalFile.length()} bytes) de $clientIp",
+                    success = true
+                )
+
+                IFGestorHomeWidget.requestWidgetUpdate(appContext)
+                FloatingOverlayManager.refresh(appContext)
+
+                jsonResponse(
+                    Response.Status.OK,
+                    JSONObject().put("ok", true).put("savedAs", finalFile.name)
+                )
+            } catch (e: Exception) {
+                partFile.delete()
+                SettingsManager.upsertTask(
+                    id = taskId,
+                    title = "❌ Erro ao Receber P2P",
+                    subtitle = e.message ?: "Falha na gravação atômica",
+                    type = "P2P_RECEIVE",
+                    currentItems = index,
+                    totalItems = total,
+                    status = "FAILED"
+                )
+                jsonResponse(
+                    Response.Status.INTERNAL_ERROR,
+                    JSONObject().put("ok", false).put("error", e.message)
+                )
+            } finally {
+                SettingsManager.unlockFile(finalFile)
+            }
+        }
+
+        // =====================================================================
+        // 6. API JSON ASSINCRONA (SPA): LISTAGEM, UPLOAD ATOMICO, LOTES E ZIP
+        // =====================================================================
+
+        private fun handleApiList(session: IHTTPSession, sess: SessionInfo): Response {
+            val requestedRel = SettingsManager.sanitizeSubfolderName(session.parms["folder"] ?: "")
+            val currentDir = SettingsManager.resolveSafeSandboxFile(requestedRel)
+                ?: SettingsManager.getSandboxRootDir()
+            if (!currentDir.exists()) currentDir.mkdirs()
+
+            val rootCanonical = SettingsManager.getSandboxRootDir().canonicalPath
+            val currentCanonical = currentDir.canonicalPath
+            val safeRelPath = if (currentCanonical == rootCanonical) {
+                ""
+            } else {
+                currentCanonical.removePrefix(rootCanonical).trimStart(File.separatorChar).replace('\\', '/')
+            }
+
+            val allChildren = currentDir.listFiles { f ->
+                !f.name.startsWith(".") && !f.name.endsWith(".part") && !f.name.endsWith(".tmp")
+            } ?: emptyArray()
+
+            val foldersJson = JSONArray()
+            val filesJson = JSONArray()
+            val dateFormat = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
+
+            allChildren.filter { it.isDirectory }
+                .sortedBy { it.name.lowercase(Locale.getDefault()) }
+                .forEach { folder ->
+                    val folderRel = if (safeRelPath.isEmpty()) folder.name else "$safeRelPath/${folder.name}"
+                    val count = SettingsManager.getFolderMediaCount(appContext, folderRel)
+                    foldersJson.put(
+                        JSONObject().apply {
+                            put("name", folder.name)
+                            put("relPath", folderRel)
+                            put("count", count)
+                        }
+                    )
+                }
+
+            allChildren.filter { it.isFile && SettingsManager.isMediaFile(it.name) }
+                .sortedByDescending { it.lastModified() }
+                .forEach { file ->
+                    val fileRel = if (safeRelPath.isEmpty()) file.name else "$safeRelPath/${file.name}"
+                    val ext = file.extension.lowercase(Locale.getDefault())
+                    val isVideo = ext in listOf("mp4", "mov", "mkv", "3gp")
+                    val isImage = ext in listOf("jpg", "jpeg", "png", "webp")
+                    filesJson.put(
+                        JSONObject().apply {
+                            put("name", file.name)
+                            put("relPath", fileRel)
+                            put("sizeBytes", file.length())
+                            put("modified", dateFormat.format(Date(file.lastModified())))
+                            put("timestamp", file.lastModified())
+                            put("isVideo", isVideo)
+                            put("isImage", isImage)
+                            put("locked", SettingsManager.isFileLocked(file))
+                        }
+                    )
+                }
+
+            val sandboxSubfolders = JSONArray()
+            SettingsManager.getSandboxSubfolders(appContext).forEach { sub ->
+                sandboxSubfolders.put(sub)
+            }
+
+            val rootDir = SettingsManager.getSandboxRootDir()
+            val totalSpace = rootDir.totalSpace.coerceAtLeast(1L)
+            val freeSpace = rootDir.usableSpace
+            val usedSpace = (totalSpace - freeSpace).coerceAtLeast(0L)
+
+            val responseObj = JSONObject().apply {
+                put("ok", true)
+                put("deviceAlias", SettingsManager.getActiveMdnsDomain(appContext).removeSuffix(".local"))
+                put("domain", SettingsManager.getActiveMdnsDomain(appContext))
+                put("ip", NetworkDiscoveryManager.getLocalIpAddress(appContext))
+                put("port", SettingsManager.getServerPort(appContext))
+                put("currentFolder", safeRelPath)
+                put("sandboxDisplay", if (safeRelPath.isEmpty()) "DCIM/Camera/IFgestor" else "DCIM/Camera/IFgestor/$safeRelPath")
+                put("activeCaptureSubfolder", SettingsManager.getTargetSubfolder(appContext))
+                put("activePrefix", SettingsManager.getFilePrefix(appContext))
+                put("sessionInterceptCount", SettingsManager.getSessionInterceptCount(appContext))
+                put("folderMediaCount", filesJson.length())
+                put("actionAuthorized", isActionAuthorized(sess))
+                put("totalBytes", totalSpace)
+                put("usedBytes", usedSpace)
+                put("freeBytes", freeSpace)
+                put("folders", foldersJson)
+                put("files", filesJson)
+                put("allSubfolders", sandboxSubfolders)
+                put("peers", NetworkDiscoveryManager.getDiscoveredPeersJson(appContext))
+                put("tasks", SettingsManager.getTasksJsonArray())
+            }
+
+            return jsonResponse(Response.Status.OK, responseObj)
+        }
+
+        private fun handleApiTasks(): Response {
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject()
+                    .put("ok", true)
+                    .put("tasks", SettingsManager.getTasksJsonArray())
+            )
+        }
+
+        private fun handleApiPeers(): Response {
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject()
+                    .put("ok", true)
+                    .put("peers", NetworkDiscoveryManager.getDiscoveredPeersJson(appContext))
+            )
+        }
+
+        private fun handleApiMkdir(session: IHTTPSession, sess: SessionInfo, clientIp: String): Response {
+            if (!isActionAuthorized(sess)) {
+                return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject().put("error", "2FA_REQUIRED").put("message", "Confirme o 2FA para criar pastas.")
+                )
+            }
+            val params = parseFormBody(session)
+            val parentRel = SettingsManager.sanitizeSubfolderName(params["parent"] ?: "")
+            val newName = SettingsManager.sanitizeSubfolderName(params["name"] ?: "")
+            if (newName.isEmpty()) {
+                return jsonResponse(
+                    Response.Status.BAD_REQUEST,
+                    JSONObject().put("ok", false).put("error", "Nome de pasta inválido.")
+                )
+            }
+
+            val combinedRel = if (parentRel.isEmpty()) newName else "$parentRel/$newName"
+            val dir = SettingsManager.resolveSafeSandboxFile(combinedRel)
+                ?: return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject().put("ok", false).put("error", "Caminho fora da Sandbox.")
+                )
+
+            if (!dir.exists()) dir.mkdirs()
+
+            SettingsManager.appendAuditLog(
+                context = appContext,
+                ip = clientIp,
+                category = "ARQUIVOS_WEB",
+                action = "CRIAR_PASTA",
+                details = "Subpasta criada: DCIM/Camera/IFgestor/$combinedRel",
+                success = true
+            )
+
+            IFGestorHomeWidget.requestWidgetUpdate(appContext)
+            FloatingOverlayManager.refresh(appContext)
+
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject().put("ok", true).put("folder", combinedRel)
+            )
+        }
+
+        /**
+         * Upload binario em streaming paginado com escrita atomica (.part)
+         * e telemetria simultanea na Central de Tarefas (Mobile e Web).
+         */
+        private fun handleApiRawUpload(session: IHTTPSession, sess: SessionInfo, clientIp: String): Response {
+            if (!isActionAuthorized(sess)) {
+                return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject().put("error", "2FA_REQUIRED").put("message", "Autorize o 2FA para enviar arquivos.")
+                )
+            }
+
+            val folderRel = SettingsManager.sanitizeSubfolderName(session.parms["folder"] ?: "")
+            val rawName = session.parms["name"] ?: "upload_${System.currentTimeMillis()}.jpg"
+            val batchTaskId = session.parms["taskId"] ?: "web_up_${System.currentTimeMillis()}"
+            val itemIndex = session.parms["index"]?.toIntOrNull() ?: 1
+            val itemTotal = session.parms["total"]?.toIntOrNull() ?: 1
+
+            val targetDir = SettingsManager.resolveSafeSandboxFile(folderRel)
+                ?: return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject().put("ok", false).put("error", "Diretório fora da Sandbox.")
+                )
+            if (!targetDir.exists()) targetDir.mkdirs()
+
+            val finalFile = SettingsManager.resolveUniqueFile(targetDir, rawName)
+            val partFile = File(targetDir, "${finalFile.name}.part")
+            val contentLength = session.headers["content-length"]?.toLongOrNull() ?: 0L
+
+            SettingsManager.tryLockFile(finalFile)
+            return try {
+                var written = 0L
+                BufferedOutputStream(FileOutputStream(partFile)).use { out ->
+                    val buffer = ByteArray(32 * 1024)
+                    var remaining = contentLength
+                    var lastTick = 0L
+                    while (remaining > 0L) {
+                        val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                        val read = session.inputStream.read(buffer, 0, toRead)
+                        if (read <= 0) break
+                        out.write(buffer, 0, read)
+                        written += read
+                        remaining -= read
+
+                        val now = System.currentTimeMillis()
+                        if (now - lastTick >= 120L) {
+                            lastTick = now
+                            SettingsManager.upsertTask(
+                                id = batchTaskId,
+                                title = "⬆️ Recebendo do PC ($itemIndex/$itemTotal)",
+                                subtitle = finalFile.name,
+                                type = "UPLOAD",
+                                currentItems = itemIndex,
+                                totalItems = itemTotal,
+                                bytesProcessed = written,
+                                totalBytes = contentLength.coerceAtLeast(1L),
+                                status = "RUNNING"
+                            )
+                        }
+                    }
+                    out.flush()
+                }
+
+                if (contentLength > 0L && partFile.length() < contentLength) {
+                    partFile.delete()
+                    throw IllegalStateException("Upload interrompido antes de concluir os bytes.")
+                }
+
+                if (!partFile.renameTo(finalFile)) {
+                    partFile.copyTo(finalFile, overwrite = true)
+                    partFile.delete()
+                }
+
+                MediaScannerConnection.scanFile(
+                    appContext,
+                    arrayOf(finalFile.absolutePath),
+                    null,
+                    null
+                )
+
+                val finishedBatch = (itemIndex >= itemTotal)
+                SettingsManager.upsertTask(
+                    id = batchTaskId,
+                    title = if (finishedBatch) "✅ Upload Concluído ($itemTotal arq.)" else "⬆️ Recebendo do PC ($itemIndex/$itemTotal)",
+                    subtitle = finalFile.name,
+                    type = "UPLOAD",
+                    currentItems = itemIndex,
+                    totalItems = itemTotal,
+                    bytesProcessed = contentLength,
+                    totalBytes = contentLength.coerceAtLeast(1L),
+                    status = if (finishedBatch) "COMPLETED" else "RUNNING"
+                )
+
+                SettingsManager.appendAuditLog(
+                    context = appContext,
+                    ip = clientIp,
+                    category = "UPLOAD_WEB",
+                    action = "ARQUIVO_RECEBIDO",
+                    details = "${finalFile.name} (${finalFile.length()} bytes) em ${folderRel.ifEmpty { "IFgestor" }}",
+                    success = true
+                )
+
+                IFGestorHomeWidget.requestWidgetUpdate(appContext)
+                FloatingOverlayManager.refresh(appContext)
+
+                jsonResponse(
+                    Response.Status.OK,
+                    JSONObject()
+                        .put("ok", true)
+                        .put("fileName", finalFile.name)
+                )
+            } catch (e: Exception) {
+                partFile.delete()
+                SettingsManager.upsertTask(
+                    id = batchTaskId,
+                    title = "❌ Falha no Upload",
+                    subtitle = e.message ?: finalFile.name,
+                    type = "UPLOAD",
+                    currentItems = itemIndex,
+                    totalItems = itemTotal,
+                    status = "FAILED"
+                )
+                jsonResponse(
+                    Response.Status.INTERNAL_ERROR,
+                    JSONObject().put("ok", false).put("error", e.message)
+                )
+            } finally {
+                SettingsManager.unlockFile(finalFile)
+            }
+        }
+
+        private fun handleApiBatchAction(session: IHTTPSession, sess: SessionInfo, clientIp: String): Response {
+            if (!isActionAuthorized(sess)) {
+                return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject().put("error", "2FA_REQUIRED").put("message", "Autorize o 2FA para mover ou excluir.")
+                )
+            }
+
+            val params = parseFormBody(session)
+            val actionType = (params["action"] ?: "").uppercase(Locale.US) // DELETE ou MOVE
+            val targetSub = SettingsManager.sanitizeSubfolderName(params["targetFolder"] ?: "")
+            val pathsRaw = params["paths"] ?: "[]"
+            val arr = JSONArray(pathsRaw)
+            val total = arr.length()
+
+            if (total == 0) {
+                return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("ok", false).put("error", "Nenhum item selecionado."))
+            }
+
+            val taskId = "batch_${actionType.lowercase(Locale.US)}_${System.currentTimeMillis()}"
+            var successCount = 0
+            var skippedLocked = 0
+
+            val destDir = if (actionType == "MOVE") {
+                SettingsManager.resolveSafeSandboxFile(targetSub)
+                    ?: return jsonResponse(Response.Status.FORBIDDEN, JSONObject().put("ok", false).put("error", "Pasta de destino inválida."))
+            } else {
+                null
+            }
+            destDir?.mkdirs()
+
+            for (i in 0 until total) {
+                val rel = arr.optString(i, "")
+                val file = SettingsManager.resolveSafeSandboxFile(rel) ?: continue
+                if (!file.exists() || file == SettingsManager.getSandboxRootDir()) continue
+
+                if (SettingsManager.isFileLocked(file)) {
+                    skippedLocked++
+                    continue
+                }
+
+                SettingsManager.tryLockFile(file)
+                try {
+                    SettingsManager.upsertTask(
+                        id = taskId,
+                        title = if (actionType == "DELETE") "🗑️ Excluindo (${i + 1}/$total)" else "📁 Movendo (${i + 1}/$total)",
+                        subtitle = file.name,
+                        type = if (actionType == "DELETE") "DELETE" else "MOVE",
+                        currentItems = i + 1,
+                        totalItems = total,
+                        status = "RUNNING"
+                    )
+
+                    if (actionType == "DELETE") {
+                        val deleted = if (file.isDirectory) file.deleteRecursively() else file.delete()
+                        if (deleted) {
+                            successCount++
+                            MediaScannerConnection.scanFile(appContext, arrayOf(file.absolutePath), null, null)
+                        }
+                    } else if (actionType == "MOVE" && destDir != null) {
+                        val uniqueDest = SettingsManager.resolveUniqueFile(destDir, file.name)
+                        val moved = if (file.renameTo(uniqueDest)) {
+                            true
+                        } else {
+                            try {
+                                file.copyTo(uniqueDest, overwrite = false)
+                                file.delete()
+                                true
+                            } catch (_: Exception) {
+                                false
+                            }
+                        }
+                        if (moved) {
+                            successCount++
+                            MediaScannerConnection.scanFile(
+                                appContext,
+                                arrayOf(file.absolutePath, uniqueDest.absolutePath),
+                                null,
+                                null
+                            )
+                        }
+                    }
+                } finally {
+                    SettingsManager.unlockFile(file)
+                }
+            }
+
+            SettingsManager.upsertTask(
+                id = taskId,
+                title = if (actionType == "DELETE") "✅ Exclusão Concluída ($successCount/$total)" else "✅ Movimentação Concluída ($successCount/$total)",
+                subtitle = if (skippedLocked > 0) "$skippedLocked ignorado(s) por estarem em transferência" else "Operação finalizada",
+                type = if (actionType == "DELETE") "DELETE" else "MOVE",
+                currentItems = successCount,
+                totalItems = total,
+                status = "COMPLETED"
+            )
+
+            SettingsManager.appendAuditLog(
+                context = appContext,
+                ip = clientIp,
+                category = "ARQUIVOS_WEB",
+                action = if (actionType == "DELETE") "EXCLUSAO_LOTE" else "MOVIMENTACAO_LOTE",
+                details = "Processados $successCount/$total itens (Em transito ignorados: $skippedLocked)",
+                success = true
+            )
+
+            IFGestorHomeWidget.requestWidgetUpdate(appContext)
+            FloatingOverlayManager.refresh(appContext)
+
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject()
+                    .put("ok", true)
+                    .put("processed", successCount)
+                    .put("skippedLocked", skippedLocked)
+                    .put("taskId", taskId)
+            )
+        }
+
+        private fun handleApiP2pSendFromWeb(session: IHTTPSession, sess: SessionInfo, clientIp: String): Response {
+            if (!isActionAuthorized(sess)) {
+                return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject().put("error", "2FA_REQUIRED").put("message", "Autorize o 2FA neste aparelho antes de enviar via P2P.")
+                )
+            }
+
+            val params = parseFormBody(session)
+            val targetIp = (params["targetIp"] ?: "").trim()
+            val targetPort = (params["targetPort"] ?: "8080").toIntOrNull() ?: 8080
+            val targetHttps = (params["targetHttps"] ?: "true").toBoolean()
+            val targetFolder = SettingsManager.sanitizeSubfolderName(params["targetFolder"] ?: "")
+            val pathsJson = JSONArray(params["paths"] ?: "[]")
+
+            val filesToSend = mutableListOf<File>()
+            for (i in 0 until pathsJson.length()) {
+                val f = SettingsManager.resolveSafeSandboxFile(pathsJson.optString(i, ""))
+                if (f != null && f.exists() && f.isFile) {
+                    filesToSend.add(f)
+                }
+            }
+
+            if (targetIp.isEmpty() || filesToSend.isEmpty()) {
+                return jsonResponse(
+                    Response.Status.BAD_REQUEST,
+                    JSONObject().put("ok", false).put("error", "Selecione o aparelho de destino e ao menos um arquivo.")
+                )
+            }
+
+            val taskId = NetworkDiscoveryManager.sendFilesPeerToPeerAsync(
+                context = appContext,
+                targetIp = targetIp,
+                targetPort = targetPort,
+                targetHttps = targetHttps,
+                targetSubfolder = targetFolder,
+                files = filesToSend
+            )
+
+            SettingsManager.appendAuditLog(
+                context = appContext,
+                ip = clientIp,
+                category = "P2P",
+                action = "DISPARO_P2P_VIA_WEB",
+                details = "Iniciado envio P2P de ${filesToSend.size} arquivo(s) para $targetIp:$targetPort",
+                success = true
+            )
+
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject()
+                    .put("ok", true)
+                    .put("taskId", taskId)
+                    .put("message", "Solicitação P2P enviada! Confirme o recebimento 2FA no celular de destino.")
+            )
+        }
+
+        private fun handleApiWhatsAppShareOnPhone(session: IHTTPSession, sess: SessionInfo, clientIp: String): Response {
+            if (!isActionAuthorized(sess)) {
+                return jsonResponse(
+                    Response.Status.FORBIDDEN,
+                    JSONObject().put("error", "2FA_REQUIRED").put("message", "Autorize o 2FA para compartilhar no WhatsApp.")
+                )
+            }
+
+            val params = parseFormBody(session)
+            val pathsJson = JSONArray(params["paths"] ?: "[]")
+            val files = mutableListOf<File>()
+            for (i in 0 until pathsJson.length()) {
+                val f = SettingsManager.resolveSafeSandboxFile(pathsJson.optString(i, ""))
+                if (f != null && f.exists() && f.isFile) {
+                    files.add(f)
+                }
+            }
+
+            if (files.isEmpty()) {
+                return jsonResponse(
+                    Response.Status.BAD_REQUEST,
+                    JSONObject().put("ok", false).put("error", "Nenhum arquivo válido selecionado.")
+                )
+            }
+
+            val launched = SettingsManager.shareFilesToWhatsApp(appContext, files)
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject()
+                    .put("ok", launched)
+                    .put("message", if (launched) "WhatsApp aberto na tela do celular com ${files.size} arquivo(s)!" else "Não foi possível abrir o WhatsApp no aparelho.")
+            )
+        }
+
+        private fun handleApiThumb(session: IHTTPSession): Response {
+            val rel = session.parms["path"] ?: ""
+            val file = SettingsManager.resolveSafeSandboxFile(rel)
+                ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "")
+            if (!file.exists() || !file.isFile) {
+                return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "")
+            }
+
+            return try {
+                val ext = file.extension.lowercase(Locale.getDefault())
+                val bitmap: Bitmap? = if (ext in listOf("mp4", "mov", "mkv", "3gp")) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        ThumbnailUtils.createVideoThumbnail(file, Size(260, 260), null)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        ThumbnailUtils.createVideoThumbnail(file.absolutePath, MediaStore.Video.Thumbnails.MINI_KIND)
+                    }
+                } else {
+                    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeFile(file.absolutePath, opts)
+                    var sample = 1
+                    while (opts.outWidth / sample > 280 || opts.outHeight / sample > 280) {
+                        sample *= 2
+                    }
+                    val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
+                    BitmapFactory.decodeFile(file.absolutePath, decodeOpts)
+                }
+
+                if (bitmap == null) {
+                    return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "")
+                }
+
+                val bos = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 76, bos)
+                bitmap.recycle()
+                val bytes = bos.toByteArray()
+                newFixedLengthResponse(
+                    Response.Status.OK,
+                    "image/jpeg",
+                    ByteArrayInputStream(bytes),
+                    bytes.size.toLong()
+                )
+            } catch (_: Exception) {
+                newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "")
+            }
+        }
+
+        private fun handleApiRawFile(
+            session: IHTTPSession,
+            clientIp: String,
+            downloadAttachment: Boolean
+        ): Response {
+            val rel = session.parms["path"] ?: ""
+            val file = SettingsManager.resolveSafeSandboxFile(rel)
+                ?: return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "Acesso negado fora da Sandbox")
+            if (!file.exists() || !file.isFile) {
+                return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Arquivo não encontrado")
+            }
+
+            val mime = SettingsManager.getMimeType(file)
+            val fis = BufferedInputStream(FileInputStream(file))
+            val res = newFixedLengthResponse(Response.Status.OK, mime, fis, file.length())
+            res.addHeader("Cache-Control", "no-store")
+            if (downloadAttachment) {
+                res.addHeader("Content-Disposition", "attachment; filename=\"${file.name}\"")
+                SettingsManager.appendAuditLog(
+                    context = appContext,
+                    ip = clientIp,
+                    category = "DOWNLOAD_WEB",
+                    action = "DOWNLOAD_ARQUIVO",
+                    details = "Baixado ${file.name} (${file.length()} bytes)",
+                    success = true
+                )
+            }
             return res
         }
-        return newFixedLengthResponse(Response.Status.OK, "application/json", """{"approved":false}""")
-    }
 
-    private fun handleLogin2faSubmission(params: Map<String, String>, clientIp: String): Response {
-        val tempToken = params["temp"] ?: ""
-        val inputCode = (params["code"] ?: "").trim()
-        val pending = pendingLogin2faMap[tempToken]
+        /**
+         * Streaming direto de arquivo .ZIP sem gravar arquivo temporario no disco (Item 11).
+         */
+        private fun handleApiStreamZip(session: IHTTPSession, clientIp: String): Response {
+            val folderRel = SettingsManager.sanitizeSubfolderName(session.parms["folder"] ?: "")
+            val pathsParam = session.parms["paths"] ?: ""
 
-        if (pending == null || System.currentTimeMillis() > pending.expiresAtMs) {
-            pendingLogin2faMap.remove(tempToken)
-            SettingsManager.publishTwoFactorCode(null, null)
-            val res = newFixedLengthResponse(Response.Status.REDIRECT, MIME_HTML, "")
-            res.addHeader("Location", "/?err=expired")
+            val filesToZip = mutableListOf<File>()
+            if (pathsParam.isNotBlank()) {
+                val arr = JSONArray(pathsParam)
+                for (i in 0 until arr.length()) {
+                    val f = SettingsManager.resolveSafeSandboxFile(arr.optString(i, ""))
+                    if (f != null && f.exists() && f.isFile) filesToZip.add(f)
+                }
+            } else {
+                val dir = SettingsManager.resolveSafeSandboxFile(folderRel) ?: SettingsManager.getSandboxRootDir()
+                dir.listFiles { f -> f.isFile && !f.name.startsWith(".") && !f.name.endsWith(".part") }
+                    ?.forEach { filesToZip.add(it) }
+            }
+
+            val pipedIn = PipedInputStream(64 * 1024)
+            val pipedOut = PipedOutputStream(pipedIn)
+            val taskId = "zip_dl_${System.currentTimeMillis()}"
+            val totalFiles = filesToZip.size.coerceAtLeast(1)
+
+            backgroundWorker.execute {
+                try {
+                    ZipOutputStream(BufferedOutputStream(pipedOut)).use { zos ->
+                        val buf = ByteArray(32 * 1024)
+                        for ((idx, file) in filesToZip.withIndex()) {
+                            if (!file.exists() || SettingsManager.isFileLocked(file)) continue
+                            SettingsManager.upsertTask(
+                                id = taskId,
+                                title = "📦 Compactando ZIP (${idx + 1}/$totalFiles)",
+                                subtitle = file.name,
+                                type = "DOWNLOAD",
+                                currentItems = idx + 1,
+                                totalItems = totalFiles,
+                                status = "RUNNING"
+                            )
+                            val entry = ZipEntry(file.name)
+                            zos.putNextEntry(entry)
+                            BufferedInputStream(FileInputStream(file)).use { fis ->
+                                var read: Int
+                                while (fis.read(buf).also { read = it } != -1) {
+                                    zos.write(buf, 0, read)
+                                }
+                            }
+                            zos.closeEntry()
+                        }
+                        zos.finish()
+                    }
+                    SettingsManager.upsertTask(
+                        id = taskId,
+                        title = "✅ Download ZIP Concluído ($totalFiles arq.)",
+                        subtitle = "Streaming finalizado sem ocupar memória interna",
+                        type = "DOWNLOAD",
+                        currentItems = totalFiles,
+                        totalItems = totalFiles,
+                        status = "COMPLETED"
+                    )
+                } catch (_: Exception) {
+                    SettingsManager.upsertTask(
+                        id = taskId,
+                        title = "⚠️ Download ZIP Interrompido",
+                        subtitle = "Conexão encerrada pelo navegador",
+                        type = "DOWNLOAD",
+                        currentItems = 0,
+                        totalItems = totalFiles,
+                        status = "FAILED"
+                    )
+                } finally {
+                    try {
+                        pipedOut.close()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+
+            SettingsManager.appendAuditLog(
+                context = appContext,
+                ip = clientIp,
+                category = "DOWNLOAD_WEB",
+                action = "STREAM_ZIP",
+                details = "Exportacao ZIP em streaming com ${filesToZip.size} arquivo(s)",
+                success = true
+            )
+
+            val zipName = if (folderRel.isEmpty()) "IFGestor_Arquivos.zip" else "IFGestor_${folderRel.replace('/', '_')}.zip"
+            val res = newChunkedResponse(Response.Status.OK, "application/zip", pipedIn)
+            res.addHeader("Content-Disposition", "attachment; filename=\"$zipName\"")
+            res.addHeader("Cache-Control", "no-store")
             return res
         }
 
-        if (pending.code != inputCode && !SettingsManager.isCodeApprovedByPhone(pending.code)) {
-            registerAuthFailure(clientIp)
-            val res = newFixedLengthResponse(Response.Status.REDIRECT, MIME_HTML, "")
-            res.addHeader("Location", "/?step=2fa&temp=$tempToken&err=2fa")
-            return res
+        // =====================================================================
+        // 7. UTILITARIOS DE SESSAO, PARSE FORM BODY E HEADERS DE SEGURANCA
+        // =====================================================================
+
+        private fun parseFormBody(session: IHTTPSession): Map<String, String> {
+            val result = mutableMapOf<String, String>()
+            try {
+                val files = HashMap<String, String>()
+                session.parseBody(files)
+                for ((k, v) in session.parms) {
+                    if (v != null) result[k] = v
+                }
+                val postData = files["postData"]
+                if (!postData.isNullOrBlank()) {
+                    for (pair in postData.split("&")) {
+                        val idx = pair.indexOf('=')
+                        if (idx > 0) {
+                            val key = URLDecoder.decode(pair.substring(0, idx), "UTF-8")
+                            val value = URLDecoder.decode(pair.substring(idx + 1), "UTF-8")
+                            result[key] = value
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            return result
         }
 
-        pendingLogin2faMap.remove(tempToken)
-        SettingsManager.consumeApprovedCode(pending.code)
-        resetAuthFailures(clientIp)
-        return createAuthenticatedSessionResponse(clientIp)
-    }
-
-    private fun createAuthenticatedSessionResponse(clientIp: String): Response {
-        val sessionToken = generateRandomHex(32)
-        val csrfToken = generateRandomHex(24)
-        activeSessions[sessionToken] = AuthSession(
-            token = sessionToken,
-            csrfToken = csrfToken,
-            clientIp = clientIp,
-            lastActivityMs = System.currentTimeMillis()
-        )
-        SettingsManager.updateActiveSessionsCount(activeSessions.size)
-
-        val res = newFixedLengthResponse(Response.Status.REDIRECT, MIME_HTML, "")
-        res.addHeader(
-            "Set-Cookie",
-            "IFG_SESSION=$sessionToken; Path=/; HttpOnly; SameSite=Strict"
-        )
-        res.addHeader("Location", "/")
-        return res
-    }
-
-    private fun handleLogout(session: IHTTPSession): Response {
-        val token = extractSessionCookie(session)
-        if (token != null) {
-            activeSessions.remove(token)
-            SettingsManager.updateActiveSessionsCount(activeSessions.size)
-        }
-        val res = newFixedLengthResponse(Response.Status.REDIRECT, MIME_HTML, "")
-        res.addHeader("Set-Cookie", "IFG_SESSION=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict")
-        res.addHeader("Location", "/")
-        return res
-    }
-
-    private fun getValidSession(session: IHTTPSession, clientIp: String): AuthSession? {
-        val token = extractSessionCookie(session) ?: return null
-        val auth = activeSessions[token] ?: return null
-        val now = System.currentTimeMillis()
-        if (now - auth.lastActivityMs > SESSION_TIMEOUT_MS || auth.clientIp != clientIp) {
-            activeSessions.remove(token)
-            SettingsManager.updateActiveSessionsCount(activeSessions.size)
+        private fun extractToken(session: IHTTPSession): String? {
+            val headerTok = session.headers["x-ifgestor-token"]
+            if (!headerTok.isNullOrBlank()) return headerTok.trim()
+            val queryTok = session.parms["token"]
+            if (!queryTok.isNullOrBlank()) return queryTok.trim()
             return null
         }
-        auth.lastActivityMs = now
-        return auth
-    }
 
-    private fun extractSessionCookie(session: IHTTPSession): String? {
-        val cookieHeader = session.headers["cookie"] ?: return null
-        for (part in cookieHeader.split(";")) {
-            val trimmed = part.trim()
-            if (trimmed.startsWith("IFG_SESSION=")) {
-                return trimmed.removePrefix("IFG_SESSION=").trim()
+        private fun requireValidSession(session: IHTTPSession): SessionInfo? {
+            val tok = extractToken(session) ?: return null
+            val info = activeSessions[tok] ?: return null
+            val now = System.currentTimeMillis()
+            if (info.expiresAt < now) {
+                activeSessions.remove(tok)
+                return null
             }
-        }
-        return null
-    }
-
-    private fun verifyCsrf(
-        session: IHTTPSession,
-        params: Map<String, String>,
-        authSession: AuthSession?
-    ): Boolean {
-        if (!SettingsManager.isWebAuthEnabled(context)) return true
-        val expected = authSession?.csrfToken ?: return false
-        val provided = session.headers["x-csrf-token"] ?: params["csrf"] ?: ""
-        return expected == provided
-    }
-
-    private fun generateRandomHex(byteCount: Int): String {
-        val bytes = ByteArray(byteCount)
-        secureRandom.nextBytes(bytes)
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-
-    private fun sanitizeFile(requestedPath: String?): File {
-        val rootFile = File(rootStoragePath).canonicalFile
-        if (requestedPath.isNullOrBlank()) {
-            val activeTarget = File(SettingsManager.getTargetFolderPath(context)).canonicalFile
-            return if (activeTarget.path.startsWith(rootFile.path) && activeTarget.exists()) {
-                activeTarget
-            } else {
-                rootFile
-            }
-        }
-        val candidate = File(requestedPath).canonicalFile
-        return if (candidate.path.startsWith(rootFile.path)) candidate else rootFile
-    }
-
-    private fun moveFileOrDirectorySafely(source: File, destDir: File): Boolean {
-        if (!source.exists() || source.absolutePath == rootStoragePath) return false
-        if (!destDir.exists()) destDir.mkdirs()
-        val targetFile = File(destDir, source.name)
-        if (source.canonicalPath == targetFile.canonicalPath) return false
-        if (source.isDirectory && targetFile.canonicalPath.startsWith(source.canonicalPath + File.separator)) {
-            return false
-        }
-        return if (source.renameTo(targetFile)) {
-            true
-        } else {
-            try {
-                if (source.isDirectory) {
-                    source.copyRecursively(targetFile, overwrite = true)
-                    source.deleteRecursively()
-                } else {
-                    source.copyTo(targetFile, overwrite = true)
-                    source.delete()
-                }
-                true
-            } catch (_: Exception) {
-                false
-            }
-        }
-    }
-
-    private fun handleFileAction(
-        params: Map<String, String>,
-        bodyText: String,
-        authSession: AuthSession?
-    ): Response {
-        val cmd = params["cmd"] ?: ""
-        val currentDir = sanitizeFile(params["dir"])
-        val targetPath = params["target"]
-        val destPath = params["dest"]
-
-        when (cmd) {
-            "mkdir" -> {
-                val folderName = (params["name"] ?: "").trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                if (folderName.isNotEmpty()) {
-                    File(currentDir, folderName).mkdirs()
-                }
-            }
-            "rename" -> {
-                val newName = (params["name"] ?: "").trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                if (!targetPath.isNullOrBlank() && newName.isNotEmpty()) {
-                    val item = sanitizeFile(targetPath)
-                    val dest = File(item.parentFile, newName)
-                    if (item.absolutePath != rootStoragePath && item.renameTo(dest)) {
-                        if (SettingsManager.getTargetFolderPath(context) == item.absolutePath) {
-                            SettingsManager.setTargetFolderPath(context, dest.absolutePath)
-                        }
-                        MediaScannerConnection.scanFile(
-                            context,
-                            arrayOf(item.absolutePath, dest.absolutePath),
-                            null,
-                            null
-                        )
-                    }
-                }
-            }
-            "move" -> {
-                if (!targetPath.isNullOrBlank() && !destPath.isNullOrBlank()) {
-                    val src = sanitizeFile(targetPath)
-                    val dstDir = sanitizeFile(destPath)
-                    val oldPath = src.absolutePath
-                    if (moveFileOrDirectorySafely(src, dstDir)) {
-                        val newPath = File(dstDir, src.name).absolutePath
-                        MediaScannerConnection.scanFile(context, arrayOf(oldPath, newPath), null, null)
-                    }
-                }
-            }
-            "batch_move" -> {
-                if (!destPath.isNullOrBlank()) {
-                    val dstDir = sanitizeFile(destPath)
-                    val rawList = if (bodyText.isNotBlank()) bodyText else (params["targets"] ?: "")
-                    val names = rawList.split("|").map { it.trim() }.filter { it.isNotEmpty() }
-                    val scannedPaths = mutableListOf<String>()
-                    for (name in names) {
-                        val src = sanitizeFile(File(currentDir, name).absolutePath)
-                        val oldPath = src.absolutePath
-                        if (moveFileOrDirectorySafely(src, dstDir)) {
-                            scannedPaths.add(oldPath)
-                            scannedPaths.add(File(dstDir, src.name).absolutePath)
-                        }
-                    }
-                    if (scannedPaths.isNotEmpty()) {
-                        MediaScannerConnection.scanFile(context, scannedPaths.toTypedArray(), null, null)
-                    }
-                }
-            }
-            "delete" -> {
-                if (!targetPath.isNullOrBlank()) {
-                    val item = sanitizeFile(targetPath)
-                    if (item.absolutePath != rootStoragePath) {
-                        val oldPath = item.absolutePath
-                        item.deleteRecursively()
-                        MediaScannerConnection.scanFile(context, arrayOf(oldPath), null, null)
-                    }
-                }
-            }
-            "batch_delete" -> {
-                val rawList = if (bodyText.isNotBlank()) bodyText else (params["targets"] ?: "")
-                val names = rawList.split("|").map { it.trim() }.filter { it.isNotEmpty() }
-                val deletedPaths = mutableListOf<String>()
-                for (name in names) {
-                    val candidate = File(currentDir, name)
-                    val safeItem = sanitizeFile(candidate.absolutePath)
-                    if (safeItem.exists() && safeItem.absolutePath != rootStoragePath) {
-                        deletedPaths.add(safeItem.absolutePath)
-                        safeItem.deleteRecursively()
-                    }
-                }
-                if (deletedPaths.isNotEmpty()) {
-                    MediaScannerConnection.scanFile(context, deletedPaths.toTypedArray(), null, null)
-                }
-            }
+            info.expiresAt = now + SESSION_TTL_MS
+            return info
         }
 
-        if (authSession != null && authSession.elevatedUntilMs > System.currentTimeMillis()) {
-            authSession.elevatedUntilMs = System.currentTimeMillis() + ELEVATED_WINDOW_MS
+        private fun isActionAuthorized(sess: SessionInfo): Boolean {
+            return sess.actionAuthorizedUntil >= System.currentTimeMillis()
         }
 
-        return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "OK")
-    }
-
-    private fun handleFileUpload(
-        session: IHTTPSession,
-        params: Map<String, String>,
-        authSession: AuthSession?
-    ): Response {
-        val targetDir = sanitizeFile(params["dir"])
-        if (!targetDir.exists()) targetDir.mkdirs()
-
-        val rawName = (params["name"] ?: "arquivo_${System.currentTimeMillis()}").trim()
-        val safeName = rawName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-        val destFile = File(targetDir, safeName)
-
-        val contentLength = session.headers["content-length"]?.toLongOrNull() ?: 0L
-        if (contentLength <= 0L) {
-            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Arquivo vazio")
-        }
-
-        val opToken = session.headers["x-op-token"] ?: params["opToken"] ?: ""
-        val grant = if (opToken.isNotBlank()) activeBatchGrants[opToken] else null
-
-        FileOutputStream(destFile).use { output ->
-            val buffer = ByteArray(16 * 1024)
-            var remaining = contentLength
-            val input = session.inputStream
-            while (remaining > 0) {
-                val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-                val read = input.read(buffer, 0, toRead)
-                if (read == -1) break
-                output.write(buffer, 0, read)
-                remaining -= read
-
-                // Mantem o token do lote e a janela deslizante vivos durante transferencias grandes
-                val now = System.currentTimeMillis()
-                grant?.lastChunkActivityMs = now
-                if (authSession != null && authSession.elevatedUntilMs > 0L) {
-                    authSession.elevatedUntilMs = now + ELEVATED_WINDOW_MS
-                }
-            }
-            output.flush()
-        }
-
-        MediaScannerConnection.scanFile(context, arrayOf(destFile.absolutePath), null, null)
-        return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "OK")
-    }
-
-    private fun handleFileStream(session: IHTTPSession, params: Map<String, String>): Response {
-        val file = sanitizeFile(params["path"])
-        if (!file.exists() || file.isDirectory) {
-            return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Arquivo nao encontrado")
-        }
-
-        val mime = resolveMimeType(file.name)
-        val fileLen = file.length()
-        val rangeHeader = session.headers["range"]
-
-        if (rangeHeader != null && rangeHeader.startsWith("bytes=") && params["download"] != "1") {
-            try {
-                val rangeValue = rangeHeader.removePrefix("bytes=")
-                val parts = rangeValue.split("-")
-                val start = parts[0].toLongOrNull() ?: 0L
-                val end = if (parts.size > 1 && parts[1].isNotBlank()) {
-                    parts[1].toLongOrNull() ?: (fileLen - 1)
-                } else {
-                    fileLen - 1
-                }
-                val clampedEnd = end.coerceAtMost(fileLen - 1)
-                val contentLength = (clampedEnd - start + 1).coerceAtLeast(0L)
-
-                val fis = FileInputStream(file)
-                fis.skip(start)
-                val res = newFixedLengthResponse(Response.Status.PARTIAL_CONTENT, mime, fis, contentLength)
-                res.addHeader("Accept-Ranges", "bytes")
-                res.addHeader("Content-Range", "bytes $start-$clampedEnd/$fileLen")
-                return res
-            } catch (_: Exception) {}
-        }
-
-        val fis = FileInputStream(file)
-        val response = newFixedLengthResponse(Response.Status.OK, mime, fis, fileLen)
-        response.addHeader("Accept-Ranges", "bytes")
-
-        if (params["download"] == "1") {
-            response.addHeader(
-                "Content-Disposition",
-                "attachment; filename=\"${file.name.replace("\"", "")}\""
+        private fun unauthorizedJson(): Response {
+            return jsonResponse(
+                Response.Status.UNAUTHORIZED,
+                JSONObject().put("error", "UNAUTHORIZED").put("message", "Sessão expirada ou não autenticada.")
             )
         }
-        return response
-    }
 
-    private fun handleFolderZipDownload(params: Map<String, String>): Response {
-        val dir = sanitizeFile(params["dir"])
-        if (!dir.exists() || !dir.isDirectory) {
-            return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Pasta invalida")
-        }
-
-        val selectedFilter = params["files"]
-            ?.split("|")
-            ?.map { it.trim() }
-            ?.filter { it.isNotEmpty() }
-            ?.toSet()
-
-        val zipBaseName = if (!selectedFilter.isNullOrEmpty()) {
-            "Selecionados_${dir.name.ifEmpty { "IFGestor" }}"
-        } else {
-            dir.name.ifEmpty { "Memoria" }
-        }
-
-        val tempZip = File(context.cacheDir, "$zipBaseName.zip")
-        if (tempZip.exists()) tempZip.delete()
-
-        ZipOutputStream(BufferedOutputStream(FileOutputStream(tempZip))).use { zos ->
-            val allFiles = dir.listFiles()?.filter { it.isFile && !it.name.startsWith(".") } ?: emptyList()
-            val filesToZip = if (!selectedFilter.isNullOrEmpty()) {
-                allFiles.filter { selectedFilter.contains(it.name) }
-            } else {
-                allFiles
-            }
-
-            val buffer = ByteArray(16 * 1024)
-            for (f in filesToZip) {
-                FileInputStream(f).use { fis ->
-                    BufferedInputStream(fis).use { origin ->
-                        val entry = ZipEntry(f.name)
-                        zos.putNextEntry(entry)
-                        var count: Int
-                        while (origin.read(buffer).also { count = it } != -1) {
-                            zos.write(buffer, 0, count)
-                        }
-                    }
-                }
+        private fun jsonResponse(status: Response.Status, json: JSONObject): Response {
+            return newFixedLengthResponse(status, "application/json; charset=utf-8", json.toString()).apply {
+                addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+                addHeader("X-Content-Type-Options", "nosniff")
+                addHeader("X-Frame-Options", "DENY")
             }
         }
 
-        val fis = FileInputStream(tempZip)
-        val res = newFixedLengthResponse(Response.Status.OK, "application/zip", fis, tempZip.length())
-        res.addHeader(
-            "Content-Disposition",
-            "attachment; filename=\"${zipBaseName.replace("\"", "")}.zip\""
-        )
-        return res
-    }
-
-    private fun getBrandLogoSvg(sizePx: Int = 56, animatedClass: String = ""): String {
-        return """
-            <svg width="$sizePx" height="$sizePx" viewBox="0 0 108 108" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <rect x="4" y="4" width="100" height="100" rx="22" fill="#0B1120" stroke="#1E293B" stroke-width="2"/>
-                <path d="M54 14L86 26V52C86 73 72 88 54 95C36 88 22 73 22 52V26L54 14Z" fill="#38BDF8"/>
-                <path d="M54 18L82 28.5V52C82 70.5 69.5 84 54 90.5C38.5 84 26 70.5 26 52V28.5L54 18Z" fill="#0F2942"/>
-                <path d="M34 35H46L51 40H74C75.65 40 77 41.35 77 43V69C77 71.2 75.2 73 73 73H35C32.8 73 31 71.2 31 69V38C31 36.35 32.35 35 34 35Z" fill="#0284C7"/>
-                <path d="M34 35H46L50 39H31V38C31 36.35 32.35 35 34 35Z" fill="#38BDF8"/>
-                <g class="$animatedClass" style="transform-origin: 54px 56px;">
-                    <circle cx="54" cy="56" r="15" fill="#0B1120"/>
-                    <circle cx="54" cy="56" r="12.5" fill="#10B981"/>
-                    <circle cx="54" cy="56" r="10.5" fill="#0F2942"/>
-                    <path d="M54 47L61.5 50.5L56 54.5Z" fill="#10B981"/>
-                    <path d="M63 56L59.5 63.5L55.5 58Z" fill="#38BDF8"/>
-                    <path d="M54 65L46.5 61.5L52 57.5Z" fill="#10B981"/>
-                    <path d="M45 56L48.5 48.5L52.5 54Z" fill="#38BDF8"/>
-                    <circle cx="54" cy="56" r="2" fill="#F8FAFC"/>
-                </g>
-            </svg>
-        """.trimIndent()
-    }
-
-    private fun renderPinLoginPage(errorType: String?): String {
-        val errBanner = when (errorType) {
-            "pin" -> """<div class="err">❌ PIN incorreto. Verifique no aplicativo IFGestor.</div>"""
-            "expired" -> """<div class="err">⏰ O código de 2ª etapa expirou. Digite o PIN novamente.</div>"""
-            else -> ""
-        }
-        return """
-            <!DOCTYPE html>
-            <html lang="pt-BR">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>IFGestor — Gerenciador de Arquivos Seguro</title>
-                <style>
-                    * { box-sizing: border-box; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
-                    body { margin: 0; background: radial-gradient(circle at top, #0f2942 0%, #070b14 100%); color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; padding: 16px; }
-                    .box { background: rgba(21, 31, 50, 0.94); border: 1px solid #2e3f59; padding: 36px 32px; border-radius: 22px; width: 100%; max-width: 400px; text-align: center; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.7); }
-                    .logo-wrap { margin-bottom: 14px; display: inline-flex; animation: pulseIn 0.8s ease-out; }
-                    @keyframes pulseIn { from { transform: scale(0.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-                    .badge-top { display: inline-block; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 5px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 12px; }
-                    h2 { margin: 0 0 8px; color: #f8fafc; font-size: 22px; }
-                    p { font-size: 13px; color: #94a3b8; margin-bottom: 24px; line-height: 1.5; }
-                    input { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid #475569; background: #0b1120; color: #38bdf8; font-size: 22px; font-weight: 700; text-align: center; letter-spacing: 8px; margin-bottom: 18px; outline: none; }
-                    input:focus { border-color: #38bdf8; }
-                    button { width: 100%; padding: 14px; background: linear-gradient(135deg, #0284c7, #10b981); color: #fff; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; }
-                    .err { background: rgba(127, 29, 29, 0.85); border: 1px solid #ef4444; color: #fecaca; padding: 11px; border-radius: 10px; font-size: 13px; margin-bottom: 18px; }
-                </style>
-            </head>
-            <body>
-                <div class="box">
-                    <div class="logo-wrap">${getBrandLogoSvg(76)}</div><br>
-                    <div class="badge-top">🛡️ ACESSO CORPORATIVO PROTEGIDO</div>
-                    <h2>IFGestor Web</h2>
-                    <p>Digite o PIN configurado na aba <strong>Servidor PC</strong> do seu celular (Padrão: 1234)</p>
-                    $errBanner
-                    <form id="pinForm">
-                        <input type="password" id="pinInput" placeholder="••••" required autofocus>
-                        <button type="submit">Continuar para 2ª Etapa</button>
-                    </form>
-                </div>
-                <script>
-                    document.getElementById('pinForm').onsubmit = async function(e) {
-                        e.preventDefault();
-                        const pin = document.getElementById('pinInput').value;
-                        const resp = await fetch('/auth/pin?pin=' + encodeURIComponent(pin), { method: 'POST' });
-                        if (resp.redirected) {
-                            window.location.href = resp.url;
-                        } else {
-                            window.location.reload();
-                        }
-                    };
-                </script>
-            </body>
-            </html>
-        """.trimIndent()
-    }
-
-    private fun render2faLoginPage(tempToken: String, errorType: String?): String {
-        val errBanner = if (errorType == "2fa") {
-            """<div class="err">❌ Código de verificação inválido.</div>"""
-        } else ""
-
-        return """
-            <!DOCTYPE html>
-            <html lang="pt-BR">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>IFGestor — Verificação em 2 Etapas</title>
-                <style>
-                    * { box-sizing: border-box; font-family: 'Inter', system-ui, sans-serif; }
-                    body { margin: 0; background: radial-gradient(circle at top, #0f2942 0%, #070b14 100%); color: #f8fafc; display: flex; height: 100vh; align-items: center; justify-content: center; padding: 16px; }
-                    .box { background: rgba(21, 31, 50, 0.94); border: 1px solid #2e3f59; padding: 36px 32px; border-radius: 22px; width: 100%; max-width: 420px; text-align: center; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.7); }
-                    .badge-top { display: inline-block; background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.35); padding: 5px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; margin-bottom: 14px; }
-                    h2 { margin: 0 0 8px; color: #f8fafc; font-size: 22px; }
-                    p { font-size: 13px; color: #cbd5e1; margin-bottom: 20px; line-height: 1.5; }
-                    input { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid #475569; background: #0b1120; color: #10b981; font-size: 26px; font-weight: 800; text-align: center; letter-spacing: 10px; margin-bottom: 18px; outline: none; }
-                    button { width: 100%; padding: 14px; background: #10b981; color: #fff; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; }
-                    .err { background: rgba(127, 29, 29, 0.85); border: 1px solid #ef4444; color: #fecaca; padding: 11px; border-radius: 10px; font-size: 13px; margin-bottom: 18px; }
-                </style>
-            </head>
-            <body>
-                <div class="box">
-                    <div style="margin-bottom:12px;">${getBrandLogoSvg(64)}</div>
-                    <div class="badge-top">📲 2ª ETAPA DE SEGURANÇA (2FA)</div>
-                    <h2>Autorize no Celular</h2>
-                    <p>Toque em <strong>"✓ Aprovar Agora"</strong> na notificação do seu celular ou digite abaixo o código de <strong>6 dígitos</strong>:</p>
-                    $errBanner
-                    <form id="twoFaForm">
-                        <input type="text" id="codeInput" maxlength="6" placeholder="000000" required autofocus>
-                        <button type="submit">Liberar Gerenciador de Arquivos</button>
-                    </form>
-                </div>
-                <script>
-                    const tempToken = "${escapeJs(tempToken)}";
-                    document.getElementById('twoFaForm').onsubmit = async function(e) {
-                        e.preventDefault();
-                        const code = document.getElementById('codeInput').value;
-                        const resp = await fetch('/auth/2fa?temp=' + encodeURIComponent(tempToken) + '&code=' + encodeURIComponent(code), { method: 'POST' });
-                        if (resp.redirected) {
-                            window.location.href = resp.url;
-                        } else {
-                            window.location.reload();
-                        }
-                    };
-                    // Verifica automaticamente se o usuario clicou em "Aprovar Agora" na notificacao do celular
-                    setInterval(async () => {
-                        try {
-                            const r = await fetch('/auth/check_login_2fa?temp=' + encodeURIComponent(tempToken));
-                            const data = await r.json();
-                            if (data.approved) {
-                                window.location.href = '/';
-                            }
-                        } catch (_) {}
-                    }, 1200);
-                </script>
-            </body>
-            </html>
-        """.trimIndent()
-    }
-
-    private fun renderLockoutPage(remainingSeconds: Long): String {
-        return """
-            <!DOCTYPE html>
-            <html lang="pt-BR">
-            <head><meta charset="UTF-8"><title>Acesso Temporariamente Bloqueado</title></head>
-            <body style="background:#070b14;color:#f8fafc;font-family:sans-serif;display:flex;height:100vh;align-items:center;justify-content:center;text-align:center;padding:16px;">
-                <div style="background:#151f32;border:1px solid #ef4444;padding:32px;border-radius:18px;max-width:420px;">
-                    <h2 style="color:#ef4444;margin-top:0;">🛡️ Bloqueio Anti-Força Bruta</h2>
-                    <p style="color:#cbd5e1;font-size:14px;">Foram detectadas muitas tentativas incorretas a partir deste computador.</p>
-                    <p style="color:#f8fafc;font-size:15px;">Tente novamente em <strong>$remainingSeconds segundos</strong>.</p>
-                </div>
-            </body>
-            </html>
-        """.trimIndent()
-    }
-
-    private fun buildBreadcrumbsHtml(currentDir: File): String {
-        val rootFile = File(rootStoragePath).canonicalFile
-        val currentCanonical = currentDir.canonicalFile
-        val sb = StringBuilder()
-
-        sb.append("""<a class="crumb" href="/?dir=${urlEncode(rootFile.absolutePath)}">🏠 Memória Interna</a>""")
-
-        if (currentCanonical.path.startsWith(rootFile.path) && currentCanonical.path != rootFile.path) {
-            val rel = currentCanonical.path.removePrefix(rootFile.path).trimStart('/', '\\')
-            val parts = rel.split('/', '\\').filter { it.isNotEmpty() }
-            var accum = rootFile
-            for (part in parts) {
-                accum = File(accum, part)
-                sb.append(""" <span class="crumb-sep">›</span> """)
-                sb.append("""<a class="crumb" href="/?dir=${urlEncode(accum.absolutePath)}">${escapeHtml(part)}</a>""")
+        private fun htmlResponse(html: String): Response {
+            return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html).apply {
+                addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+                addHeader("X-Content-Type-Options", "nosniff")
+                addHeader("X-Frame-Options", "DENY")
             }
         }
-        return sb.toString()
+
+        // =====================================================================
+        // 8. INTERFACE WEB SPA ASSINCRONA COM CENTRAL DE TAREFAS, P2P E WHATSAPP
+        // =====================================================================
+
+        private fun buildSinglePageWebAppHtml(): String {
+            return """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IFGestor • Gerenciador Corporativo Seguro</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --card-hover: #26354d;
+    --border: #334155;
+    --text: #f8fafc;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --primary: #0284c7;
+    --emerald: #10b981;
+    --danger: #ef4444;
+    --whatsapp: #25D366;
+  }
+  body.light-mode {
+    --bg: #f1f5f9;
+    --card: #ffffff;
+    --card-hover: #f8fafc;
+    --border: #cbd5e1;
+    --text: #0f172a;
+    --muted: #475569;
+    --accent: #0284c7;
+    --primary: #0369a1;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+  body { background: var(--bg); color: var(--text); min-height: 100vh; padding-bottom: 90px; transition: background 0.2s; }
+  .topbar {
+    position: sticky; top: 0; z-index: 40;
+    background: var(--card); border-bottom: 1px solid var(--border);
+    padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 12px;
+    align-items: center; justify-content: space-between;
+  }
+  .brand-row { display: flex; align-items: center; gap: 12px; }
+  .brand-badge {
+    background: linear-gradient(135deg, #0284c7, #10b981);
+    color: #fff; font-weight: 800; padding: 8px 12px; border-radius: 10px; font-size: 15px;
+  }
+  .sandbox-pill {
+    font-size: 12px; background: rgba(56,189,248,0.12); color: var(--accent);
+    border: 1px solid var(--accent); padding: 4px 10px; border-radius: 999px; font-weight: 600;
+  }
+  .controls-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  select, input[type="text"], input[type="password"] {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    padding: 8px 12px; border-radius: 8px; font-size: 13px; outline: none;
+  }
+  .btn {
+    border: 1px solid var(--border); background: var(--card-hover); color: var(--text);
+    padding: 8px 13px; border-radius: 8px; font-size: 13px; font-weight: 600;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: 0.15s;
+  }
+  .btn:hover { filter: brightness(1.1); }
+  .btn-primary { background: var(--primary); color: #fff; border-color: var(--accent); }
+  .btn-emerald { background: #059669; color: #fff; border-color: var(--emerald); }
+  .btn-whatsapp { background: #128C7E; color: #fff; border-color: var(--whatsapp); }
+  .btn-danger { background: #b91c1c; color: #fff; border-color: var(--danger); }
+  .container { max-width: 1280px; margin: 18px auto; padding: 0 16px; }
+  .status-strip {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 16px; margin-bottom: 16px; display: flex; flex-wrap: wrap;
+    gap: 16px; align-items: center; justify-content: space-between;
+  }
+  .storage-bar-bg { width: 180px; height: 8px; background: var(--bg); border-radius: 99px; overflow: hidden; border: 1px solid var(--border); }
+  .storage-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--emerald)); width: 0%; }
+  .toolbar {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px; margin-bottom: 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  }
+  .folders-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+  .folder-chip {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 14px; cursor: pointer; display: flex; align-items: center; gap: 8px;
+    font-weight: 600; font-size: 13px;
+  }
+  .folder-chip:hover { border-color: var(--accent); }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(195px, 1fr)); gap: 14px;
+  }
+  .media-card {
+    background: var(--card); border: 2px solid var(--border); border-radius: 12px;
+    overflow: hidden; position: relative; transition: 0.15s; display: flex; flex-direction: column;
+  }
+  .media-card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(56,189,248,0.25); }
+  .thumb-wrap {
+    width: 100%; height: 155px; background: #090d16; position: relative;
+    display: flex; align-items: center; justify-content: center; cursor: pointer; overflow: hidden;
+  }
+  .thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
+  .check-badge {
+    position: absolute; top: 8px; left: 8px; z-index: 5;
+    width: 24px; height: 24px; accent-color: var(--accent); cursor: pointer;
+  }
+  .type-pill {
+    position: absolute; bottom: 8px; right: 8px; background: rgba(15,23,42,0.85);
+    color: #fff; font-size: 11px; padding: 2px 7px; border-radius: 6px; font-weight: 700;
+  }
+  .card-body { padding: 10px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .file-title { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .file-meta { color: var(--muted); font-size: 11px; display: flex; justify-content: space-between; }
+  .card-actions { display: flex; gap: 4px; margin-top: 6px; }
+  .card-actions button { flex: 1; padding: 5px; font-size: 11px; }
+
+  /* Central de Tarefas Multitarefa e Recolhivel (Item 10) */
+  .task-drawer {
+    position: fixed; right: 18px; bottom: 18px; width: 360px; max-width: calc(100vw - 36px);
+    background: var(--card); border: 1px solid var(--accent); border-radius: 14px;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.45); z-index: 90; overflow: hidden;
+  }
+  .task-drawer-header {
+    background: linear-gradient(90deg, #0f2942, #1e293b); color: #fff;
+    padding: 10px 14px; display: flex; justify-content: space-between; align-items: center;
+    cursor: pointer; font-weight: 700; font-size: 13px;
+  }
+  .task-drawer-body { max-height: 260px; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+  .task-drawer-body.collapsed { display: none; }
+  .task-item {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 12px;
+  }
+  .task-bar-bg { width: 100%; height: 7px; background: #1e293b; border-radius: 99px; overflow: hidden; margin-top: 6px; }
+  .task-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--emerald)); transition: width 0.15s; }
+
+  /* Modais (Login, 2FA, P2P, Visualizador) */
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(2,6,23,0.82);
+    display: none; align-items: center; justify-content: center; z-index: 100; padding: 16px;
+  }
+  .modal-backdrop.active { display: flex; }
+  .modal-card {
+    background: var(--card); border: 1px solid var(--accent); border-radius: 16px;
+    width: 100%; max-width: 430px; padding: 22px; display: flex; flex-direction: column; gap: 14px;
+  }
+</style>
+</head>
+<body>
+
+<!-- Barra Superior com Seletor de Dispositivos na Rede (Item 7) -->
+<header class="topbar">
+  <div class="brand-row">
+    <div class="brand-badge">🛡️ IFGestor Web</div>
+    <span class="sandbox-pill" id="sandboxBadge">🔒 DCIM/Camera/IFgestor</span>
+  </div>
+  <div class="controls-row">
+    <label style="font-size:12px;font-weight:700;">📱 Aparelho:</label>
+    <select id="peerDeviceSelector" onchange="onSwitchPeerDevice(this.value)">
+      <option value="">Carregando aparelhos...</option>
+    </select>
+    <button class="btn" onclick="toggleTheme()">🌓 Tema</button>
+    <button class="btn btn-danger" onclick="doLogout()">Sair</button>
+  </div>
+</header>
+
+<main class="container">
+  <!-- Faixa de Telemetria Dupla e Armazenamento -->
+  <section class="status-strip">
+    <div>
+      <div style="font-weight:700;font-size:14px;" id="currentPathLabel">📂 Pasta: DCIM/Camera/IFgestor</div>
+      <div style="font-size:12px;color:var(--muted);margin-top:3px;" id="countersInfo">
+        Sessão Interceptada: 0 • Total na Pasta: 0
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:12px;">
+      <div style="text-align:right;font-size:12px;">
+        <div id="storageText">Armazenamento</div>
+        <div class="storage-bar-bg"><div class="storage-bar-fill" id="storageFill"></div></div>
+      </div>
+      <button class="btn" onclick="refreshCurrentFolder()">🔄 Atualizar</button>
+    </div>
+  </section>
+
+  <!-- Barra de Ferramentas Multitarefa, P2P e WhatsApp -->
+  <section class="toolbar">
+    <input type="file" id="uploadInput" multiple style="display:none" onchange="startParallelUpload(this.files)">
+    <button class="btn btn-primary" onclick="document.getElementById('uploadInput').click()">⬆️ Enviar Arquivos</button>
+    <button class="btn" onclick="promptNewSubfolder()">➕ Nova Subpasta</button>
+    <button class="btn" onclick="toggleSelectAll()">☑️ Selecionar Todos</button>
+    <button class="btn btn-emerald" onclick="openP2pModal()">📲 Enviar P2P (Outro Celular)</button>
+    <button class="btn btn-whatsapp" onclick="shareSelectedToWhatsAppWeb()">💬 WhatsApp Web (PC)</button>
+    <button class="btn btn-whatsapp" onclick="triggerPhoneWhatsApp()">📱 WhatsApp no Celular</button>
+    <button class="btn" onclick="promptBatchMove()">📁 Mover</button>
+    <button class="btn" onclick="downloadSelectedZip()">📦 Baixar ZIP</button>
+    <button class="btn btn-danger" onclick="promptBatchDelete()">🗑️ Excluir</button>
+    <input type="text" id="searchBox" placeholder="🔍 Filtrar por nome..." oninput="renderFilteredFiles()" style="margin-left:auto;">
+  </section>
+
+  <!-- Subpastas da Sandbox -->
+  <div class="folders-row" id="foldersContainer"></div>
+
+  <!-- Grade de Fotos e Videos -->
+  <div class="grid" id="filesGrid"></div>
+</main>
+
+<!-- Central de Tarefas Paralelas e Recolhivel (Item 10) -->
+<aside class="task-drawer" id="taskDrawer">
+  <div class="task-drawer-header" onclick="toggleTaskDrawer()">
+    <span id="taskHeaderTitle">🔄 Central de Tarefas (0 ativas)</span>
+    <span id="taskToggleArrow">▼</span>
+  </div>
+  <div class="task-drawer-body" id="taskListBody">
+    <div style="font-size:12px;color:var(--muted);text-align:center;padding:8px;">Nenhuma operação em andamento.</div>
+  </div>
+</aside>
+
+<!-- Modal de Login Seguro (POST + PBKDF2 + 2FA) -->
+<div class="modal-backdrop active" id="loginModal">
+  <div class="modal-card">
+    <h3 style="font-size:18px;">🔐 Acesso Seguro IFGestor</h3>
+    <p style="font-size:13px;color:var(--muted);">
+      Digite o PIN configurado no celular. Em seguida, aprove a notificação 2FA no aparelho ou insira o código de 6 dígitos.
+    </p>
+    <input type="password" id="pinInput" placeholder="Digite seu PIN (4 a 8 dígitos)" maxlength="8">
+    <div id="login2faBox" style="display:none;flex-direction:column;gap:8px;">
+      <input type="text" id="login2faCodeInput" placeholder="Código 2FA de 6 dígitos (ou aprove no celular)" maxlength="6">
+      <div style="font-size:12px;color:var(--accent);" id="login2faStatus">Aguardando aprovação 2FA no aparelho...</div>
+    </div>
+    <div style="font-size:12px;color:var(--danger);" id="loginErrorText"></div>
+    <button class="btn btn-primary" id="btnSubmitLogin" onclick="submitPinLogin()">Entrar com Segurança</button>
+  </div>
+</div>
+
+<!-- Modal de Autorizacao 2FA para Operacoes Sensíveis -->
+<div class="modal-backdrop" id="action2faModal">
+  <div class="modal-card">
+    <h3>🛡️ Confirmação 2FA Necessária</h3>
+    <p style="font-size:13px;color:var(--muted);" id="action2faDesc">
+      Aprove a operação na notificação do celular ou digite o código de 6 dígitos exibido no aparelho:
+    </p>
+    <input type="text" id="action2faCodeInput" placeholder="Código 2FA de 6 dígitos" maxlength="6">
+    <div style="font-size:12px;color:var(--danger);" id="action2faError"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button class="btn" onclick="closeAction2faModal()">Cancelar</button>
+      <button class="btn btn-primary" onclick="verifyAction2faCodeNow()">Confirmar Código</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal de Transferencia P2P entre Celulares (Item 8) -->
+<div class="modal-backdrop" id="p2pModal">
+  <div class="modal-card">
+    <h3>📲 Transferência P2P entre Celulares</h3>
+    <p style="font-size:12px;color:var(--muted);">
+      Transfere os arquivos selecionados diretamente via Wi-Fi para outro celular rodando o IFGestor, com confirmação 2FA nas duas pontas.
+    </p>
+    <label style="font-size:12px;font-weight:700;">Aparelho de Destino na Rede:</label>
+    <select id="p2pTargetDeviceSelect"></select>
+    <label style="font-size:12px;font-weight:700;">Ou informe IP:Porta manualmente:</label>
+    <input type="text" id="p2pManualHost" placeholder="Ex: 192.168.1.45:8080">
+    <label style="font-size:12px;font-weight:700;">Subpasta de Destino (dentro de DCIM/Camera/IFgestor):</label>
+    <input type="text" id="p2pTargetSubfolder" placeholder="Ex: Recebidos_P2P (vazio = Raiz)">
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
+      <button class="btn" onclick="document.getElementById('p2pModal').classList.remove('active')">Cancelar</button>
+      <button class="btn btn-emerald" onclick="startP2pTransferFromWeb()">📲 Iniciar Envio P2P</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  let authToken = sessionStorage.getItem('ifgestor_token') || '';
+  let currentFolder = '';
+  let cachedFiles = [];
+  let cachedSubfolders = [];
+  let cachedPeers = [];
+  let selectedPaths = new Set();
+  let localClientTasks = {};
+  let serverTasks = [];
+  let taskDrawerCollapsed = false;
+  let loginPollTimer = null;
+  let actionPollTimer = null;
+  let currentLoginReqId = '';
+  let currentActionReqId = '';
+  let pendingActionCallback = null;
+
+  function apiHeaders(extra = {}) {
+    return Object.assign({ 'X-IFGestor-Token': authToken }, extra);
+  }
+
+  function toggleTheme() {
+    document.body.classList.toggle('light-mode');
+  }
+
+  function toggleTaskDrawer() {
+    taskDrawerCollapsed = !taskDrawerCollapsed;
+    const body = document.getElementById('taskListBody');
+    const arrow = document.getElementById('taskToggleArrow');
+    if (taskDrawerCollapsed) {
+      body.classList.add('collapsed');
+      arrow.textContent = '▲';
+    } else {
+      body.classList.remove('collapsed');
+      arrow.textContent = '▼';
+    }
+  }
+
+  // =========================================================================
+  // 1. FLUXO DE LOGIN POST + 2FA SEM EXPOR CREDENCIAIS NA URL
+  // =========================================================================
+
+  async function submitPinLogin() {
+    const pin = document.getElementById('pinInput').value.trim();
+    const errEl = document.getElementById('loginErrorText');
+    errEl.textContent = '';
+
+    if (currentLoginReqId) {
+      const code = document.getElementById('login2faCodeInput').value.trim();
+      if (code.length === 6) {
+        await pollLogin2faStatus(code);
+      }
+      return;
     }
 
-    private fun renderExplorerPage(
-        requestedDir: String?,
-        csrfToken: String,
-        authSession: AuthSession?
-    ): Response {
-        val currentDir = sanitizeFile(requestedDir)
-        if (!currentDir.exists()) currentDir.mkdirs()
+    if (!pin) { errEl.textContent = 'Informe o PIN.'; return; }
 
-        val storageStats = SettingsManager.getStorageStats()
-        val now = System.currentTimeMillis()
-        val initialElevatedRemSec = if (authSession != null && authSession.elevatedUntilMs > now) {
-            ((authSession.elevatedUntilMs - now) / 1000).coerceAtLeast(0)
-        } else 0L
+    const body = new URLSearchParams({ pin });
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+      body: body.toString()
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      errEl.textContent = data.error || 'Falha na autenticação.';
+      return;
+    }
 
-        val children = currentDir.listFiles()
-            ?.filter { !it.name.startsWith(".") }
-            ?.sortedWith(compareByDescending<File> { it.isDirectory }.thenBy { it.name.lowercase() })
-            ?: emptyList()
+    currentLoginReqId = data.requestId;
+    document.getElementById('login2faBox').style.display = 'flex';
+    document.getElementById('btnSubmitLogin').textContent = 'Validar Código 2FA';
 
-        val totalFolders = children.count { it.isDirectory }
-        val totalPhotos = children.count { !it.isDirectory && isImageFile(it.name) }
-        val totalVideos = children.count { !it.isDirectory && isVideoFile(it.name) }
+    if (loginPollTimer) clearInterval(loginPollTimer);
+    loginPollTimer = setInterval(() => pollLogin2faStatus(''), 1200);
+  }
 
-        val dateFormat = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
-        val encodedCurrentDir = urlEncode(currentDir.absolutePath)
-        val parentDir = if (currentDir.absolutePath != rootStoragePath) currentDir.parentFile else null
+  async function pollLogin2faStatus(typedCode) {
+    if (!currentLoginReqId) return;
+    const body = new URLSearchParams({ requestId: currentLoginReqId, code: typedCode || '' });
+    const res = await fetch('/api/auth/poll-2fa', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+      body: body.toString()
+    });
+    const data = await res.json();
 
-        val mediaItemsJsArray = StringBuilder("[")
-        var mediaIndex = 0
-        val filePathToMediaIndex = mutableMapOf<String, Int>()
+    if (data.status === 'APPROVED') {
+      clearInterval(loginPollTimer);
+      authToken = data.token;
+      sessionStorage.setItem('ifgestor_token', authToken);
+      currentLoginReqId = '';
+      document.getElementById('loginModal').classList.remove('active');
+      refreshCurrentFolder();
+    } else if (data.status === 'REJECTED' || data.status === 'EXPIRED') {
+      clearInterval(loginPollTimer);
+      currentLoginReqId = '';
+      document.getElementById('loginErrorText').textContent = 'Acesso recusado ou expirado no celular.';
+      document.getElementById('login2faBox').style.display = 'none';
+      document.getElementById('btnSubmitLogin').textContent = 'Entrar com Segurança';
+    } else if (data.status === 'INVALID_CODE') {
+      document.getElementById('loginErrorText').textContent = 'Código 2FA de 6 dígitos incorreto.';
+    }
+  }
 
-        for (item in children) {
-            if (!item.isDirectory && (isImageFile(item.name) || isVideoFile(item.name))) {
-                if (mediaIndex > 0) mediaItemsJsArray.append(",")
-                val type = if (isImageFile(item.name)) "image" else "video"
-                val fileUrl = "/file?path=" + urlEncode(item.absolutePath)
-                val downloadUrl = "$fileUrl&download=1"
-                mediaItemsJsArray.append(
-                    """{"name":"${escapeJs(item.name)}","path":"${escapeJs(item.absolutePath)}","url":"$fileUrl","download":"$downloadUrl","type":"$type","size":"${formatSize(item.length())}","date":"${dateFormat.format(Date(item.lastModified()))}"}"""
-                )
-                filePathToMediaIndex[item.absolutePath] = mediaIndex
-                mediaIndex++
-            }
+  async function doLogout() {
+    await fetch('/api/auth/logout', { method: 'POST', headers: apiHeaders() });
+    authToken = '';
+    sessionStorage.removeItem('ifgestor_token');
+    location.reload();
+  }
+
+  // =========================================================================
+  // 2. AUTORIZACAO 2FA PARA OPERACOES (COM JANELA DE LOTE PARA MULTITAREFA)
+  // =========================================================================
+
+  async function ensure2faAuthorized(description, onAuthorized) {
+    const body = new URLSearchParams({ description });
+    const res = await fetch('/api/auth/request-action-2fa', {
+      method: 'POST',
+      headers: apiHeaders({ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }),
+      body: body.toString()
+    });
+    if (res.status === 401) {
+      document.getElementById('loginModal').classList.add('active');
+      return;
+    }
+    const data = await res.json();
+    if (data.alreadyAuthorized) {
+      onAuthorized();
+      return;
+    }
+
+    currentActionReqId = data.requestId;
+    pendingActionCallback = onAuthorized;
+    document.getElementById('action2faDesc').textContent = 'Operação: ' + description + '. Aprove na notificação do celular ou digite o código de 6 dígitos:';
+    document.getElementById('action2faCodeInput').value = '';
+    document.getElementById('action2faError').textContent = '';
+    document.getElementById('action2faModal').classList.add('active');
+
+    if (actionPollTimer) clearInterval(actionPollTimer);
+    actionPollTimer = setInterval(() => pollAction2fa(''), 1100);
+  }
+
+  async function verifyAction2faCodeNow() {
+    const code = document.getElementById('action2faCodeInput').value.trim();
+    if (code.length !== 6) {
+      document.getElementById('action2faError').textContent = 'Digite os 6 dígitos do código.';
+      return;
+    }
+    await pollAction2fa(code);
+  }
+
+  async function pollAction2fa(code) {
+    if (!currentActionReqId) return;
+    const body = new URLSearchParams({ requestId: currentActionReqId, code: code || '' });
+    const res = await fetch('/api/auth/poll-2fa', {
+      method: 'POST',
+      headers: apiHeaders({ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }),
+      body: body.toString()
+    });
+    const data = await res.json();
+    if (data.status === 'APPROVED') {
+      clearInterval(actionPollTimer);
+      document.getElementById('action2faModal').classList.remove('active');
+      const cb = pendingActionCallback;
+      pendingActionCallback = null;
+      currentActionReqId = '';
+      if (cb) cb();
+    } else if (data.status === 'REJECTED' || data.status === 'EXPIRED') {
+      clearInterval(actionPollTimer);
+      document.getElementById('action2faError').textContent = 'Operação negada ou expirada no celular.';
+    } else if (data.status === 'INVALID_CODE') {
+      document.getElementById('action2faError').textContent = 'Código 2FA inválido.';
+    }
+  }
+
+  function closeAction2faModal() {
+    if (actionPollTimer) clearInterval(actionPollTimer);
+    currentActionReqId = '';
+    pendingActionCallback = null;
+    document.getElementById('action2faModal').classList.remove('active');
+  }
+
+  // =========================================================================
+  // 3. NAVEGACAO SPA ASSINCRONA (ZERO RELOAD DE PAGINA)
+  // =========================================================================
+
+  async function refreshCurrentFolder(targetSubfolder = currentFolder) {
+    if (!authToken) {
+      document.getElementById('loginModal').classList.add('active');
+      return;
+    }
+    const res = await fetch('/api/list?folder=' + encodeURIComponent(targetSubfolder), {
+      headers: apiHeaders()
+    });
+    if (res.status === 401) {
+      document.getElementById('loginModal').classList.add('active');
+      return;
+    }
+    const data = await res.json();
+    if (!data.ok) return;
+
+    currentFolder = data.currentFolder || '';
+    cachedFiles = data.files || [];
+    cachedSubfolders = data.allSubfolders || [];
+    cachedPeers = data.peers || [];
+    serverTasks = data.tasks || [];
+
+    document.getElementById('sandboxBadge').textContent = '🔒 ' + data.sandboxDisplay;
+    document.getElementById('currentPathLabel').textContent = '📂 ' + data.sandboxDisplay + ' (Prefixo ativo: ' + data.activePrefix + ')';
+    document.getElementById('countersInfo').textContent =
+      '🟢 Sessão Interceptada: ' + data.sessionInterceptCount + '  |  📁 Total nesta Pasta: ' + data.folderMediaCount;
+
+    const pct = Math.min(100, Math.round((data.usedBytes / Math.max(1, data.totalBytes)) * 100));
+    document.getElementById('storageFill').style.width = pct + '%';
+    document.getElementById('storageText').textContent =
+      formatBytes(data.freeBytes) + ' livres (' + pct + '% usado)';
+
+    renderPeersDropdown(data.peers, data.ip, data.port);
+    renderFoldersBar(data.folders);
+    renderFilteredFiles();
+    renderCombinedTasks();
+  }
+
+  function renderPeersDropdown(peers, selfIp, selfPort) {
+    const sel = document.getElementById('peerDeviceSelector');
+    sel.innerHTML = '';
+    (peers || []).forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.url;
+      opt.textContent = (p.isSelf ? '🟢 ' : '📱 ') + p.domain + ' (' + p.ip + ':' + p.port + ')';
+      if (p.isSelf) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  }
+
+  function onSwitchPeerDevice(targetUrl) {
+    if (!targetUrl) return;
+    if (confirm('Deseja alternar o painel para o dispositivo ' + targetUrl + '? (O segundo aparelho solicitará seu próprio PIN e 2FA)')) {
+      window.location.href = targetUrl;
+    } else {
+      refreshCurrentFolder();
+    }
+  }
+
+  function renderFoldersBar(folders) {
+    const box = document.getElementById('foldersContainer');
+    box.innerHTML = '';
+
+    if (currentFolder !== '') {
+      const parts = currentFolder.split('/');
+      parts.pop();
+      const parentRel = parts.join('/');
+      const backChip = document.createElement('div');
+      backChip.className = 'folder-chip';
+      backChip.textContent = '⬅️ Voltar (' + (parentRel || 'Raiz IFgestor') + ')';
+      backChip.onclick = () => { selectedPaths.clear(); refreshCurrentFolder(parentRel); };
+      box.appendChild(backChip);
+    }
+
+    (folders || []).forEach(f => {
+      const chip = document.createElement('div');
+      chip.className = 'folder-chip';
+      chip.innerHTML = '📁 <span>' + escapeHtml(f.name) + '</span> <span style="color:var(--accent);font-size:11px;">(' + f.count + ')</span>';
+      chip.onclick = () => { selectedPaths.clear(); refreshCurrentFolder(f.relPath); };
+      box.appendChild(chip);
+    });
+  }
+
+  function renderFilteredFiles() {
+    const query = (document.getElementById('searchBox').value || '').toLowerCase().trim();
+    const grid = document.getElementById('filesGrid');
+    grid.innerHTML = '';
+
+    const list = cachedFiles.filter(f => !query || f.name.toLowerCase().includes(query));
+    if (list.length === 0) {
+      grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:36px;color:var(--muted);">Nenhum arquivo nesta pasta da Sandbox.</div>';
+      return;
+    }
+
+    list.forEach(file => {
+      const isSel = selectedPaths.has(file.relPath);
+      const card = document.createElement('div');
+      card.className = 'media-card' + (isSel ? ' selected' : '');
+
+      const thumbUrl = '/api/thumb?path=' + encodeURIComponent(file.relPath) + '&token=' + encodeURIComponent(authToken);
+      const rawUrl = '/api/raw?path=' + encodeURIComponent(file.relPath) + '&token=' + encodeURIComponent(authToken);
+
+      card.innerHTML = `
+        <div class="thumb-wrap" onclick="window.open('${rawUrl}', '_blank')">
+          <input type="checkbox" class="check-badge" ${isSel ? 'checked' : ''} onclick="event.stopPropagation(); toggleSelectFile('${escapeQuotes(file.relPath)}', this.checked)">
+          <img src="${thumbUrl}" loading="lazy" onerror="this.style.display='none'">
+          <span class="type-pill">${file.isVideo ? '🎬 VÍDEO' : '📷 FOTO'}</span>
+        </div>
+        <div class="card-body">
+          <div class="file-title" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
+          <div class="file-meta">
+            <span>${formatBytes(file.sizeBytes)}</span>
+            <span>${file.modified}</span>
+          </div>
+          <div class="card-actions">
+            <button class="btn" onclick="downloadSingleFile('${escapeQuotes(file.relPath)}')">⬇️</button>
+            <button class="btn btn-whatsapp" title="Copiar/Enviar para WhatsApp Web" onclick="shareSingleToWhatsAppWeb('${escapeQuotes(file.relPath)}', '${escapeQuotes(file.name)}', ${file.isImage})">💬 WA</button>
+          </div>
+        </div>
+      `;
+      grid.appendChild(card);
+    });
+  }
+
+  function toggleSelectFile(relPath, checked) {
+    if (checked) selectedPaths.add(relPath);
+    else selectedPaths.delete(relPath);
+    renderFilteredFiles();
+  }
+
+  function toggleSelectAll() {
+    if (selectedPaths.size === cachedFiles.length) {
+      selectedPaths.clear();
+    } else {
+      cachedFiles.forEach(f => selectedPaths.add(f.relPath));
+    }
+    renderFilteredFiles();
+  }
+
+  // =========================================================================
+  // 4. UPLOADS E OPERACOES PARALELAS COM BARRAS DE PROGRESSO INDIVIDUAIS
+  // =========================================================================
+
+  function startParallelUpload(fileList) {
+    if (!fileList || fileList.length === 0) return;
+    const filesArray = Array.from(fileList);
+    ensure2faAuthorized('Enviar ' + filesArray.length + ' arquivo(s) para ' + (currentFolder || 'IFgestor'), () => {
+      const batchId = 'up_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+      runUploadQueue(batchId, filesArray, currentFolder);
+    });
+  }
+
+  async function runUploadQueue(batchId, files, targetSubfolder) {
+    const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
+    let completedBytes = 0;
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      await new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        const url = '/api/upload?folder=' + encodeURIComponent(targetSubfolder) +
+          '&name=' + encodeURIComponent(file.name) +
+          '&taskId=' + encodeURIComponent(batchId) +
+          '&index=' + (i + 1) + '&total=' + files.length;
+
+        xhr.open('POST', url, true);
+        xhr.setRequestHeader('X-IFGestor-Token', authToken);
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable) {
+            const currentTotal = completedBytes + ev.loaded;
+            const pct = Math.min(99, Math.round((currentTotal / Math.max(1, totalBytes)) * 100));
+            localClientTasks[batchId] = {
+              id: batchId,
+              title: '⬆️ Enviando (' + (i + 1) + '/' + files.length + ')',
+              subtitle: file.name + ' (' + formatBytes(currentTotal) + ' / ' + formatBytes(totalBytes) + ')',
+              progressPercent: pct,
+              status: 'RUNNING'
+            };
+            renderCombinedTasks();
+          }
+        };
+
+        xhr.onload = () => {
+          completedBytes += file.size;
+          resolve();
+        };
+        xhr.onerror = () => resolve();
+        xhr.send(file);
+      });
+    }
+
+    localClientTasks[batchId] = {
+      id: batchId,
+      title: '✅ Upload Concluído (' + files.length + ' arq.)',
+      subtitle: 'Salvo em ' + (targetSubfolder || 'IFgestor (Raiz)'),
+      progressPercent: 100,
+      status: 'COMPLETED'
+    };
+    renderCombinedTasks();
+    refreshCurrentFolder();
+  }
+
+  function promptNewSubfolder() {
+    const name = prompt('Nome da nova subpasta dentro de ' + (currentFolder || 'IFgestor') + ':');
+    if (!name || !name.trim()) return;
+    ensure2faAuthorized('Criar subpasta ' + name.trim(), async () => {
+      const body = new URLSearchParams({ parent: currentFolder, name: name.trim() });
+      await fetch('/api/mkdir', {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }),
+        body: body.toString()
+      });
+      refreshCurrentFolder();
+    });
+  }
+
+  function promptBatchDelete() {
+    const list = Array.from(selectedPaths);
+    if (list.length === 0) { alert('Selecione ao menos um arquivo.'); return; }
+    if (!confirm('Confirma a exclusão permanente de ' + list.length + ' arquivo(s)?')) return;
+
+    ensure2faAuthorized('Excluir ' + list.length + ' arquivo(s)', async () => {
+      const body = new URLSearchParams({
+        action: 'DELETE',
+        paths: JSON.stringify(list)
+      });
+      await fetch('/api/batch-action', {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }),
+        body: body.toString()
+      });
+      selectedPaths.clear();
+      refreshCurrentFolder();
+    });
+  }
+
+  function promptBatchMove() {
+    const list = Array.from(selectedPaths);
+    if (list.length === 0) { alert('Selecione ao menos um arquivo para mover.'); return; }
+    const dest = prompt(
+      'Mover ' + list.length + ' arquivo(s) para qual subpasta de DCIM/Camera/IFgestor?\n(Deixe vazio para a Raiz IFgestor)\nSubpastas atuais: ' + cachedSubfolders.join(', '),
+      currentFolder
+    );
+    if (dest === null) return;
+
+    ensure2faAuthorized('Mover ' + list.length + ' arquivo(s)', async () => {
+      const body = new URLSearchParams({
+        action: 'MOVE',
+        targetFolder: dest.trim(),
+        paths: JSON.stringify(list)
+      });
+      await fetch('/api/batch-action', {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }),
+        body: body.toString()
+      });
+      selectedPaths.clear();
+      refreshCurrentFolder();
+    });
+  }
+
+  function downloadSingleFile(relPath) {
+    ensure2faAuthorized('Baixar arquivo ' + relPath, () => {
+      window.location.href = '/api/download?path=' + encodeURIComponent(relPath) + '&token=' + encodeURIComponent(authToken);
+    });
+  }
+
+  function downloadSelectedZip() {
+    const list = Array.from(selectedPaths);
+    const desc = list.length > 0 ? ('Exportar ZIP com ' + list.length + ' arquivo(s)') : 'Exportar ZIP da pasta atual';
+    ensure2faAuthorized(desc, () => {
+      const url = '/api/download-zip?folder=' + encodeURIComponent(currentFolder) +
+        (list.length > 0 ? '&paths=' + encodeURIComponent(JSON.stringify(list)) : '') +
+        '&token=' + encodeURIComponent(authToken);
+      window.location.href = url;
+    });
+  }
+
+  // =========================================================================
+  // 5. TRANSFERENCIA P2P ENTRE CELULARES PELO NAVEGADOR (ITEM 8)
+  // =========================================================================
+
+  function openP2pModal() {
+    if (selectedPaths.size === 0) {
+      alert('Selecione os arquivos que deseja enviar para outro aparelho.');
+      return;
+    }
+    const sel = document.getElementById('p2pTargetDeviceSelect');
+    sel.innerHTML = '<option value="">-- Escolha um celular detectado na rede --</option>';
+    (cachedPeers || []).filter(p => !p.isSelf).forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.ip + ':' + p.port + ':' + p.https;
+      opt.textContent = '📱 ' + p.domain + ' (' + p.ip + ':' + p.port + ')';
+      sel.appendChild(opt);
+    });
+    document.getElementById('p2pModal').classList.add('active');
+  }
+
+  function startP2pTransferFromWeb() {
+    const dropdownVal = document.getElementById('p2pTargetDeviceSelect').value;
+    const manualVal = document.getElementById('p2pManualHost').value.trim();
+    const targetFolder = document.getElementById('p2pTargetSubfolder').value.trim();
+
+    let ip = '', port = '8080', https = 'true';
+    if (manualVal) {
+      const parts = manualVal.replace(/^https?:\/\//, '').split(':');
+      ip = parts[0];
+      port = parts[1] || '8080';
+    } else if (dropdownVal) {
+      const parts = dropdownVal.split(':');
+      ip = parts[0];
+      port = parts[1] || '8080';
+      https = parts[2] || 'true';
+    }
+
+    if (!ip) {
+      alert('Selecione um aparelho na lista ou digite o IP do segundo celular.');
+      return;
+    }
+
+    const list = Array.from(selectedPaths);
+    document.getElementById('p2pModal').classList.remove('active');
+
+    ensure2faAuthorized('Enviar ' + list.length + ' arquivo(s) P2P para ' + ip, async () => {
+      const body = new URLSearchParams({
+        targetIp: ip,
+        targetPort: port,
+        targetHttps: https,
+        targetFolder: targetFolder,
+        paths: JSON.stringify(list)
+      });
+      const res = await fetch('/api/p2p/send-from-web', {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }),
+        body: body.toString()
+      });
+      const data = await res.json();
+      alert(data.message || 'Transferência P2P iniciada! Acompanhe na Central de Tarefas.');
+      refreshTasksOnly();
+    });
+  }
+
+  // =========================================================================
+  // 6. COMPARTILHAMENTO VIA WHATSAPP WEB (PC) E WHATSAPP MOBILE (ITEM 16)
+  // =========================================================================
+
+  async function shareSingleToWhatsAppWeb(relPath, fileName, isImage) {
+    ensure2faAuthorized('Compartilhar ' + fileName + ' no WhatsApp Web', async () => {
+      const rawUrl = '/api/raw?path=' + encodeURIComponent(relPath) + '&token=' + encodeURIComponent(authToken);
+      try {
+        const response = await fetch(rawUrl);
+        const blob = await response.blob();
+        const fileObj = new File([blob], fileName, { type: blob.type });
+
+        if (navigator.canShare && navigator.canShare({ files: [fileObj] })) {
+          await navigator.share({ files: [fileObj], title: fileName });
+          return;
         }
-        mediaItemsJsArray.append("]")
 
-        val breadcrumbsHtml = buildBreadcrumbsHtml(currentDir)
+        if (isImage && navigator.clipboard && window.ClipboardItem) {
+          const pngBlob = await convertImageBlobToPng(blob);
+          await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+          alert('✅ Imagem copiada para a Área de Transferência!\n\nO WhatsApp Web será aberto agora: basta clicar na conversa e pressionar Ctrl + V para colar a foto.');
+          window.open('https://web.whatsapp.com/', '_blank');
+          return;
+        }
+      } catch (e) {}
 
-        val sb = StringBuilder()
-        sb.append(
-            """
-            <!DOCTYPE html>
-            <html lang="pt-BR" data-theme="dark">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>IFGestor — Gerenciador de Arquivos</title>
-                <style>
-                    :root {
-                        --card-min: 220px;
-                        --thumb-h: 165px;
-                        --bg-main: #0b1120;
-                        --bg-surface: #151f32;
-                        --bg-elevated: #1e293b;
-                        --border-color: #2e3f59;
-                        --text-primary: #f8fafc;
-                        --text-secondary: #94a3b8;
-                        --brand-primary: #0284c7;
-                        --brand-accent: #38bdf8;
-                        --brand-success: #10b981;
-                        --brand-danger: #ef4444;
-                    }
-                    html[data-theme="light"] {
-                        --bg-main: #f1f5f9;
-                        --bg-surface: #ffffff;
-                        --bg-elevated: #e2e8f0;
-                        --border-color: #cbd5e1;
-                        --text-primary: #0f172a;
-                        --text-secondary: #475569;
-                        --brand-primary: #0f2942;
-                        --brand-accent: #0284c7;
-                        --brand-success: #059669;
-                        --brand-danger: #dc2626;
-                    }
-                    * { box-sizing: border-box; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
-                    body { margin: 0; background: var(--bg-main); color: var(--text-primary); padding: 18px 18px 95px; transition: background 0.2s, color 0.2s; }
-                    .container { max-width: 1360px; margin: 0 auto; }
+      window.open('https://web.whatsapp.com/', '_blank');
+      window.location.href = '/api/download?path=' + encodeURIComponent(relPath) + '&token=' + encodeURIComponent(authToken);
+    });
+  }
 
-                    /* Tela de Abertura Animada em Tela Cheia (Splash Screen Web) */
-                    .web-splash { position: fixed; inset: 0; background: radial-gradient(circle at center, #0f2942 0%, #060a12 100%); z-index: 15000; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: opacity 0.45s ease, visibility 0.45s ease; }
-                    .web-splash.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
-                    .splash-ring { padding: 24px; border-radius: 50%; background: rgba(56, 189, 248, 0.06); border: 1px solid rgba(56, 189, 248, 0.2); animation: splashPulse 1.4s ease-out infinite alternate; }
-                    .spin-lens { animation: spinShutter 2.2s cubic-bezier(0.4, 0, 0.2, 1) infinite; }
-                    @keyframes spinShutter { 0% { transform: rotate(0deg) scale(0.92); } 50% { transform: rotate(180deg) scale(1.04); } 100% { transform: rotate(360deg) scale(0.92); } }
-                    @keyframes splashPulse { from { box-shadow: 0 0 15px rgba(56,189,248,0.15); } to { box-shadow: 0 0 40px rgba(16,185,129,0.35); } }
-                    .splash-title { margin: 18px 0 4px; font-size: 28px; font-weight: 800; color: #f8fafc; letter-spacing: 0.5px; }
-                    .splash-sub { margin: 0 0 22px; font-size: 13px; color: #94a3b8; }
-                    .splash-bar { width: 220px; height: 5px; background: #1e293b; border-radius: 8px; overflow: hidden; }
-                    .splash-bar-fill { width: 0%; height: 100%; background: linear-gradient(90deg, #38bdf8, #10b981); animation: loadProgress 1.25s ease-out forwards; }
-                    @keyframes loadProgress { to { width: 100%; } }
+  function shareSelectedToWhatsAppWeb() {
+    const list = Array.from(selectedPaths);
+    if (list.length === 0) {
+      alert('Selecione uma foto ou vídeo para enviar ao WhatsApp Web.');
+      return;
+    }
+    const first = cachedFiles.find(f => f.relPath === list[0]);
+    if (first) {
+      shareSingleToWhatsAppWeb(first.relPath, first.name, first.isImage);
+    }
+  }
 
-                    /* Cabecalho Corporativo */
-                    .header { background: var(--bg-surface); padding: 16px 22px; border-radius: 16px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; border: 1px solid var(--border-color); }
-                    .brand-row { display: flex; align-items: center; gap: 14px; }
-                    .title h1 { margin: 0; font-size: 20px; color: var(--text-primary); }
-                    .title p { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); }
-                    .storage-widget { min-width: 240px; background: var(--bg-elevated); padding: 10px 14px; border-radius: 12px; border: 1px solid var(--border-color); }
-                    .storage-top { display: flex; justify-content: space-between; font-size: 11px; font-weight: 600; margin-bottom: 6px; color: var(--text-secondary); }
-                    .storage-bar-bg { width: 100%; height: 7px; background: var(--bg-main); border-radius: 10px; overflow: hidden; }
-                    .storage-bar-fill { height: 100%; width: ${storageStats.usedPercent}%; background: linear-gradient(90deg, #0284c7, #10b981); border-radius: 10px; }
+  function triggerPhoneWhatsApp() {
+    const list = Array.from(selectedPaths);
+    if (list.length === 0) {
+      alert('Selecione os arquivos que deseja abrir no WhatsApp do aparelho celular.');
+      return;
+    }
+    ensure2faAuthorized('Abrir ' + list.length + ' arquivo(s) no WhatsApp do celular', async () => {
+      const body = new URLSearchParams({ paths: JSON.stringify(list) });
+      const res = await fetch('/api/whatsapp/share', {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }),
+        body: body.toString()
+      });
+      const data = await res.json();
+      alert(data.message || 'Comando enviado ao WhatsApp do celular!');
+    });
+  }
 
-                    /* Barra de Navegacao e Ferramentas */
-                    .toolbar { background: var(--bg-surface); padding: 14px 18px; border-radius: 16px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 12px; border: 1px solid var(--border-color); }
-                    .crumbs-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border-color); }
-                    .crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; font-size: 13px; }
-                    .crumb { color: var(--brand-accent); text-decoration: none; font-weight: 600; padding: 4px 8px; border-radius: 6px; }
-                    .crumb:hover { background: var(--bg-elevated); }
-                    .crumb-sep { color: var(--text-secondary); font-weight: bold; }
+  function convertImageBlobToPng(blob) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        canvas.toBlob(b => b ? resolve(b) : reject(), 'image/png');
+      };
+      img.onerror = reject;
+      img.src = url;
+    });
+  }
 
-                    .actions-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
-                    .btn-cluster { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  // =========================================================================
+  // 7. TELEMETRIA DA CENTRAL DE TAREFAS PARALELAS E RECOLHIVEL (ITEM 10)
+  // =========================================================================
 
-                    /* Barra de Busca e Filtros */
-                    .filter-bar { background: var(--bg-surface); padding: 12px 18px; border-radius: 14px; margin-bottom: 16px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; border: 1px solid var(--border-color); }
-                    .search-box { flex: 1; min-width: 220px; position: relative; }
-                    .search-box input { width: 100%; padding: 9px 14px 9px 36px; border-radius: 10px; border: 1px solid var(--border-color); background: var(--bg-main); color: var(--text-primary); font-size: 13px; outline: none; }
-                    .search-icon { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); font-size: 14px; color: var(--text-secondary); }
-                    .pill-group { display: inline-flex; background: var(--bg-main); padding: 4px; border-radius: 10px; border: 1px solid var(--border-color); gap: 4px; flex-wrap: wrap; }
-                    .pill-btn { background: transparent; color: var(--text-secondary); border: none; padding: 6px 12px; border-radius: 7px; font-size: 12px; cursor: pointer; font-weight: 600; }
-                    .pill-btn.active { background: var(--brand-primary); color: #fff; }
+  async function refreshTasksOnly() {
+    if (!authToken) return;
+    try {
+      const res = await fetch('/api/tasks', { headers: apiHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        serverTasks = data.tasks || [];
+        renderCombinedTasks();
+      }
+    } catch (e) {}
+  }
 
-                    button, .btn { background: var(--brand-primary); color: #fff; border: none; padding: 8px 14px; border-radius: 10px; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: all 0.15s; }
-                    button:hover, .btn:hover { filter: brightness(1.12); }
-                    .btn-sec { background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-color); }
-                    .btn-ok { background: var(--brand-success); color: #fff; }
-                    .btn-danger { background: var(--brand-danger); color: #fff; }
+  function renderCombinedTasks() {
+    const map = new Map();
+    (serverTasks || []).forEach(t => map.set(t.id, t));
+    Object.values(localClientTasks).forEach(t => map.set(t.id, t));
 
-                    /* Grade de Fotos, Videos e Pastas */
-                    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--card-min), 1fr)); gap: 14px; }
-                    .card { background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 14px; padding: 10px; display: flex; flex-direction: column; justify-content: space-between; position: relative; transition: transform 0.12s, border-color 0.12s; }
-                    .card:hover { border-color: var(--brand-accent); transform: translateY(-2px); }
-                    .card.selected { border: 2px solid var(--brand-accent); background: rgba(56, 189, 248, 0.08); }
-                    .select-check { position: absolute; top: 16px; right: 16px; width: 22px; height: 22px; z-index: 5; accent-color: var(--brand-primary); cursor: pointer; }
-                    .thumb-box { width: 100%; height: var(--thumb-h); background: var(--bg-main); border-radius: 10px; display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 8px; cursor: pointer; position: relative; }
-                    .thumb-box img { width: 100%; height: 100%; object-fit: cover; }
-                    .play-badge { position: absolute; bottom: 8px; right: 8px; background: rgba(15, 23, 42, 0.85); color: #fff; padding: 4px 10px; border-radius: 16px; font-size: 11px; font-weight: 700; }
-                    .icon-big { font-size: 46px; }
-                    .item-name { font-size: 13px; font-weight: 600; color: var(--text-primary); word-break: break-word; margin-bottom: 3px; cursor: pointer; display: block; text-decoration: none; }
-                    .item-meta { font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; }
-                    .card-actions { display: flex; gap: 4px; }
-                    .card-actions .btn, .card-actions button { padding: 6px 6px; font-size: 11px; flex: 1; justify-content: center; }
+    const all = Array.from(map.values());
+    const runningCount = all.filter(t => t.status === 'RUNNING').length;
+    document.getElementById('taskHeaderTitle').textContent =
+      '🔄 Central de Tarefas (' + runningCount + ' ativa' + (runningCount === 1 ? '' : 's') + ')';
 
-                    /* Barra Flutuante de Selecao em Lote */
-                    .batch-bar { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #0f2942; color: #fff; padding: 12px 22px; border-radius: 16px; display: none; align-items: center; gap: 12px; z-index: 900; box-shadow: 0 20px 35px rgba(0,0,0,0.6); border: 1px solid #38bdf8; flex-wrap: wrap; }
-                    .batch-bar.visible { display: flex; }
+    const body = document.getElementById('taskListBody');
+    if (all.length === 0) {
+      body.innerHTML = '<div style="font-size:12px;color:var(--muted);text-align:center;padding:8px;">Nenhuma operação recente.</div>';
+      return;
+    }
 
-                    /* Zona Drag & Drop */
-                    .drop-overlay { position: fixed; inset: 0; background: rgba(2, 132, 199, 0.88); color: #fff; z-index: 9500; display: none; flex-direction: column; align-items: center; justify-content: center; font-size: 24px; font-weight: 800; border: 6px dashed #fff; }
-                    .drop-overlay.active { display: flex; }
+    body.innerHTML = '';
+    all.forEach(t => {
+      const item = document.createElement('div');
+      item.className = 'task-item';
+      item.innerHTML = `
+        <div style="display:flex;justify-content:space-between;font-weight:700;">
+          <span>${escapeHtml(t.title)}</span>
+          <span style="color:var(--accent);">${t.progressPercent || 0}%</span>
+        </div>
+        <div style="color:var(--muted);font-size:11px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+          ${escapeHtml(t.subtitle || '')}
+        </div>
+        <div class="task-bar-bg">
+          <div class="task-bar-fill" style="width:${t.progressPercent || 0}%"></div>
+        </div>
+      `;
+      body.appendChild(item);
+    });
+  }
 
-                    /* Modais Customizados */
-                    .modal-backdrop { position: fixed; inset: 0; background: rgba(5, 10, 20, 0.82); z-index: 9200; display: none; align-items: center; justify-content: center; padding: 16px; }
-                    .modal-backdrop.open { display: flex; }
-                    .modal-card { background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 18px; padding: 24px; width: 100%; max-width: 460px; box-shadow: 0 25px 50px rgba(0,0,0,0.6); }
-                    .modal-card h3 { margin: 0 0 8px; font-size: 18px; color: var(--text-primary); }
-                    .modal-card input[type="text"] { width: 100%; padding: 11px 14px; border-radius: 10px; border: 1px solid var(--border-color); background: var(--bg-main); color: var(--text-primary); font-size: 14px; margin: 10px 0 16px; outline: none; }
-                    .modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  function formatBytes(bytes) {
+    if (!bytes || bytes <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let i = 0, val = bytes;
+    while (val >= 1024 && i < units.length - 1) { val /= 1024; i++; }
+    return val.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+  }
 
-                    /* Lista de Pastas no Seletor de Destino (Mover) */
-                    .dir-picker-list { max-height: 230px; overflow-y: auto; background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 10px; padding: 6px; margin: 10px 0; }
-                    .dir-item { padding: 8px 10px; border-radius: 8px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-primary); }
-                    .dir-item:hover { background: var(--bg-elevated); }
+  function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
 
-                    /* Modal de Tela Cheia (Lightbox) */
-                    .lightbox { display: none; position: fixed; inset: 0; background: rgba(5, 10, 20, 0.96); z-index: 9999; flex-direction: column; justify-content: space-between; }
-                    .lightbox.open { display: flex; }
-                    .lb-top { padding: 14px 22px; background: rgba(15, 23, 42, 0.9); display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid #334155; }
-                    .lb-title { font-size: 15px; font-weight: 600; color: #f8fafc; word-break: break-all; }
-                    .lb-counter { color: #38bdf8; font-weight: 700; margin-right: 10px; }
-                    .lb-actions { display: flex; gap: 8px; align-items: center; }
-                    .lb-stage { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; padding: 16px 70px; }
-                    .lb-stage img, .lb-stage video { max-width: 100%; max-height: 82vh; object-fit: contain; border-radius: 6px; transition: transform 0.2s; }
-                    .lb-stage img.zoomed { transform: scale(1.75); cursor: zoom-out; }
-                    .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(30, 41, 59, 0.85); color: #fff; border: 1px solid #475569; width: 52px; height: 52px; border-radius: 50%; font-size: 22px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-                    .lb-prev { left: 16px; }
-                    .lb-next { right: 16px; }
-                    .lb-footer { padding: 10px; text-align: center; font-size: 12px; color: #94a3b8; background: rgba(15, 23, 42, 0.8); }
-                </style>
-            </head>
-            <body>
-            <!-- Tela de Abertura Animada (Splash Screen) -->
-            <div id="webSplash" class="web-splash">
-                <div class="splash-ring">
-                    ${getBrandLogoSvg(112, "spin-lens")}
-                </div>
-                <div class="splash-title">IFGestor</div>
-                <div class="splash-sub">Gerenciador Corporativo de Mídia & Arquivos</div>
-                <div class="splash-bar"><div class="splash-bar-fill"></div></div>
-            </div>
+  function escapeQuotes(s) {
+    return String(s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  }
 
-            <div id="dropOverlay" class="drop-overlay">
-                ⬆️ Solte os arquivos aqui para enviar (Requer autorização 2FA no celular)
-            </div>
-
-            <div class="container">
-                <!-- Cabecalho Corporativo Puro (Apenas Gerenciador de Arquivos) -->
-                <div class="header">
-                    <div class="brand-row">
-                        ${getBrandLogoSvg(48)}
-                        <div class="title">
-                            <h1>IFGestor — Gerenciador de Arquivos</h1>
-                            <p>🛡️ Proteção 2FA Ativa em Todas as Movimentações, Envios e Exclusões</p>
-                        </div>
-                    </div>
-
-                    <div class="storage-widget">
-                        <div class="storage-top">
-                            <span>💾 Armazenamento do Celular</span>
-                            <span>${storageStats.usedPercent}%</span>
-                        </div>
-                        <div class="storage-bar-bg"><div class="storage-bar-fill"></div></div>
-                        <div style="font-size:11px; color:var(--text-secondary); margin-top:5px;">${storageStats.formattedSummary}</div>
-                    </div>
-
-                    <div class="btn-cluster">
-                        <button type="button" class="btn-ok" id="elevatedBadgeBtn" style="display:none;" onclick="lockElevatedWindowNow()" title="Clique para bloquear imediatamente">
-                            🔓 Janela 2FA Ativa (<span id="elevatedTimerText">5:00</span>) • Bloquear Agora
-                        </button>
-                        <button type="button" class="btn-sec" onclick="toggleTheme()">☀️ Claro / 🌙 Escuro</button>
-                        ${if (SettingsManager.isWebAuthEnabled(context)) """<a class="btn btn-danger" href="/auth/logout">🔒 Sair</a>""" else ""}
-                    </div>
-                </div>
-
-                <!-- Barra de Caminho (Breadcrumbs) e Ferramentas de Arquivo -->
-                <div class="toolbar">
-                    <div class="crumbs-row">
-                        <div class="crumbs">$breadcrumbsHtml</div>
-                        <span id="uploadStatus" style="font-size:12px; font-weight:700; color:var(--brand-accent);"></span>
-                    </div>
-
-                    <div class="actions-row">
-                        <div class="btn-cluster">
-                            ${if (parentDir != null) """<a class="btn btn-sec" href="/?dir=${urlEncode(parentDir.absolutePath)}">⬅️ Pasta Acima</a>""" else ""}
-                            <button type="button" onclick="openMkdirModal()">➕ Nova Pasta</button>
-                            <a class="btn btn-sec" href="/zip?dir=$encodedCurrentDir">📦 Baixar Pasta (.ZIP)</a>
-                            <label class="btn btn-ok" style="cursor:pointer;">
-                                ⬆️ Enviar do PC para cá
-                                <input type="file" id="fileInput" multiple style="display:none" onchange="uploadFilesWith2FA(this.files)">
-                            </label>
-                        </div>
-
-                        <div class="btn-cluster">
-                            <button type="button" class="btn-sec" onclick="toggleSelectAll()">☑️ Selecionar Tudo</button>
-                            <a class="btn btn-sec" href="/?dir=$encodedCurrentDir">🔄 Atualizar</a>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Barra de Busca, Filtro por Tipo e Tamanho de Miniaturas -->
-                <div class="filter-bar">
-                    <div class="search-box">
-                        <span class="search-icon">🔍</span>
-                        <input type="text" id="searchInput" placeholder="Buscar fotos, vídeos ou pastas pelo nome..." oninput="applyFilters()">
-                    </div>
-
-                    <div class="pill-group">
-                        <button type="button" class="pill-btn active" id="fltAll" onclick="setCategoryFilter('all')">Todos (${children.size})</button>
-                        <button type="button" class="pill-btn" id="fltImage" onclick="setCategoryFilter('image')">Fotos ($totalPhotos)</button>
-                        <button type="button" class="pill-btn" id="fltVideo" onclick="setCategoryFilter('video')">Vídeos ($totalVideos)</button>
-                        <button type="button" class="pill-btn" id="fltFolder" onclick="setCategoryFilter('folder')">Pastas ($totalFolders)</button>
-                    </div>
-
-                    <div class="pill-group" title="Tamanho das Miniaturas">
-                        <button type="button" class="pill-btn" id="btnSizeS" onclick="setThumbSize('small')">Pequenas</button>
-                        <button type="button" class="pill-btn active" id="btnSizeM" onclick="setThumbSize('medium')">Médias</button>
-                        <button type="button" class="pill-btn" id="btnSizeL" onclick="setThumbSize('large')">Grandes</button>
-                    </div>
-                </div>
-
-                <!-- Grade Principal -->
-                <div class="grid" id="itemsGrid">
+  setInterval(refreshTasksOnly, 1500);
+  if (authToken) {
+    refreshCurrentFolder();
+  }
+</script>
+</body>
+</html>
             """.trimIndent()
-        )
-
-        if (children.isEmpty()) {
-            sb.append("""<p style="color:var(--text-secondary); grid-column: 1/-1; text-align:center; padding: 40px 0;">Esta pasta está vazia.</p>""")
         }
-
-        for (item in children) {
-            val encodedPath = urlEncode(item.absolutePath)
-            val dateStr = dateFormat.format(Date(item.lastModified()))
-            val safeNameLower = escapeHtml(item.name.lowercase())
-
-            if (item.isDirectory) {
-                val countInside = item.listFiles()?.size ?: 0
-                sb.append(
-                    """
-                    <div class="card item-card" data-name="$safeNameLower" data-type="folder" data-filename="${escapeHtml(item.name)}">
-                        <input type="checkbox" class="select-check" onchange="onCardSelectChange(this)">
-                        <div>
-                            <a href="/?dir=$encodedPath" style="text-decoration:none;">
-                                <div class="thumb-box"><span class="icon-big">📁</span></div>
-                                <span class="item-name">${escapeHtml(item.name)}</span>
-                            </a>
-                            <div class="item-meta">Pasta ($countInside itens) • $dateStr</div>
-                        </div>
-                        <div class="card-actions">
-                            <a class="btn" href="/?dir=$encodedPath">Abrir</a>
-                            <button type="button" class="btn-sec" title="Mover Pasta" onclick="openMoveModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}', false)">📁↗</button>
-                            <button type="button" class="btn-sec" title="Renomear" onclick="openRenameModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">✏️</button>
-                            <button type="button" class="btn-danger" title="Excluir" onclick="openDeleteModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">🗑️</button>
-                        </div>
-                    </div>
-                    """.trimIndent()
-                )
-            } else {
-                val isImg = isImageFile(item.name)
-                val isVid = isVideoFile(item.name)
-                val category = when {
-                    isImg -> "image"
-                    isVid -> "video"
-                    else -> "doc"
-                }
-                val sizeStr = formatSize(item.length())
-                val mIdx = filePathToMediaIndex[item.absolutePath]
-
-                val clickAction = if (mIdx != null) {
-                    "openLightbox($mIdx)"
-                } else {
-                    "window.open('/file?path=$encodedPath', '_blank')"
-                }
-
-                val previewHtml = when {
-                    isImg -> """<img src="/file?path=$encodedPath" loading="lazy" alt="${escapeHtml(item.name)}">"""
-                    isVid -> """<span class="icon-big">🎬</span><span class="play-badge">▶ VÍDEO</span>"""
-                    else -> """<span class="icon-big">📄</span>"""
-                }
-
-                sb.append(
-                    """
-                    <div class="card item-card" data-name="$safeNameLower" data-type="$category" data-filename="${escapeHtml(item.name)}">
-                        <input type="checkbox" class="select-check" onchange="onCardSelectChange(this)">
-                        <div>
-                            <div class="thumb-box" onclick="$clickAction">$previewHtml</div>
-                            <div class="item-name" onclick="$clickAction">${escapeHtml(item.name)}</div>
-                            <div class="item-meta">$sizeStr • $dateStr</div>
-                        </div>
-                        <div class="card-actions">
-                            ${if (mIdx != null) """<button type="button" title="Tela Cheia" onclick="openLightbox($mIdx)">🔍</button>""" else ""}
-                            <a class="btn btn-ok" title="Baixar" href="/file?path=$encodedPath&download=1">⬇️</a>
-                            <button type="button" class="btn-sec" title="Mover para outra pasta" onclick="openMoveModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}', false)">📁↗</button>
-                            <button type="button" class="btn-sec" title="Renomear" onclick="openRenameModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">✏️</button>
-                            <button type="button" class="btn-danger" title="Excluir" onclick="openDeleteModal('${escapeJs(item.absolutePath)}', '${escapeJs(item.name)}')">🗑️</button>
-                        </div>
-                    </div>
-                    """.trimIndent()
-                )
-            }
-        }
-
-        sb.append(
-            """
-                </div>
-            </div>
-
-            <!-- Barra Flutuante de Acoes em Lote -->
-            <div id="batchBar" class="batch-bar">
-                <strong id="batchCountText">0 selecionados</strong>
-                <button type="button" class="btn-ok" onclick="downloadSelectedZip()">📦 Baixar (.ZIP)</button>
-                <button type="button" class="btn" onclick="openBatchMoveModal()">📁↗ Mover Selecionados</button>
-                <button type="button" class="btn-danger" onclick="deleteSelectedBatch()">🗑️ Excluir Selecionados</button>
-                <button type="button" class="btn-sec" onclick="clearAllSelection()">✖ Limpar</button>
-            </div>
-
-            <!-- Modal Customizado de Entrada / Confirmacao -->
-            <div id="customModal" class="modal-backdrop">
-                <div class="modal-card">
-                    <h3 id="modalTitle">Título</h3>
-                    <p id="modalDesc" style="font-size:13px; color:var(--text-secondary); margin:0 0 8px;"></p>
-                    <input type="text" id="modalInput" placeholder="">
-                    <div class="modal-footer">
-                        <button type="button" class="btn-sec" onclick="closeCustomModal()">Cancelar</button>
-                        <button type="button" id="modalConfirmBtn">Continuar (2FA)</button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Modal Seletor Livre de Pastas para Mover Arquivos -->
-            <div id="moveModal" class="modal-backdrop">
-                <div class="modal-card">
-                    <h3>📁 Mover para qual pasta?</h3>
-                    <p id="moveModalTargetDesc" style="font-size:12px; color:var(--text-secondary); margin:0 0 6px;"></p>
-                    <div style="font-size:12px; font-weight:700; color:var(--brand-accent); margin-bottom:6px;" id="moveCurrentPathLabel">Memória Interna</div>
-                    <div class="dir-picker-list" id="moveDirsContainer"></div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn-sec" onclick="closeMoveModal()">Cancelar</button>
-                        <button type="button" class="btn-ok" id="confirmMoveHereBtn">✓ Mover para Esta Pasta</button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Modal de Verificacao em 2 Etapas (2FA) por Operacao -->
-            <div id="action2faModal" class="modal-backdrop">
-                <div class="modal-card" style="text-align:center;">
-                    <div style="font-size:11px; font-weight:800; color:#10b981; margin-bottom:6px;">📲 AUTORIZAÇÃO EM DUAS ETAPAS (2FA)</div>
-                    <h3 id="a2faTitle">Confirmar Operação</h3>
-                    <p style="font-size:13px; color:var(--text-secondary); line-height:1.45;">
-                        Toque em <strong>"✓ Aprovar Agora"</strong> na notificação do seu celular ou digite abaixo o código de <strong>6 dígitos</strong>:
-                    </p>
-                    <input type="text" id="a2faCodeInput" maxlength="6" placeholder="000000" style="text-align:center; font-size:24px; font-weight:800; letter-spacing:8px; color:#10b981;">
-                    <label style="display:flex; align-items:center; justify-content:center; gap:8px; font-size:12px; color:var(--text-secondary); cursor:pointer; margin-bottom:10px;">
-                        <input type="checkbox" id="a2faKeep5Min" style="width:16px; height:16px;">
-                        Manter operações liberadas por 5 min (sem interromper lotes)
-                    </label>
-                    <div id="a2faErrorText" style="color:#ef4444; font-size:12px; font-weight:600; display:none; margin-bottom:8px;">❌ Código incorreto.</div>
-                    <div class="modal-footer" style="justify-content:center;">
-                        <button type="button" class="btn-sec" onclick="cancelAction2fa()">Cancelar Operação</button>
-                        <button type="button" class="btn-ok" id="a2faSubmitBtn">Verificar e Executar</button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Modal Visualizador em Tela Cheia (Lightbox) -->
-            <div id="lightboxModal" class="lightbox">
-                <div class="lb-top">
-                    <div>
-                        <span id="lbCounter" class="lb-counter">1 / 1</span>
-                        <span id="lbTitle" class="lb-title">Arquivo</span>
-                    </div>
-                    <div class="lb-actions">
-                        <button type="button" class="btn-sec" onclick="toggleLightboxZoom()">🔍 Zoom</button>
-                        <a id="lbDownloadBtn" class="btn btn-ok" href="#">⬇️ Baixar</a>
-                        <button type="button" class="btn-sec" onclick="moveCurrentLightboxItem()">📁↗ Mover</button>
-                        <button type="button" class="btn-sec" onclick="renameCurrentLightboxItem()">✏️ Renomear</button>
-                        <button type="button" class="btn-danger" onclick="deleteCurrentLightboxItem()">🗑️ Excluir</button>
-                        <button type="button" class="btn-sec" onclick="closeLightbox()">✖ Fechar</button>
-                    </div>
-                </div>
-                <div class="lb-stage" onclick="if(event.target === this) closeLightbox()">
-                    <button type="button" class="lb-nav lb-prev" onclick="stepLightbox(-1)">◀</button>
-                    <div id="lbMediaHolder" style="display:flex; align-items:center; justify-content:center; width:100%; height:100%;"></div>
-                    <button type="button" class="lb-nav lb-next" onclick="stepLightbox(1)">▶</button>
-                </div>
-                <div class="lb-footer">
-                    Use <strong>◀ Anterior</strong> / <strong>Próximo ▶</strong> ou as setas <strong>⬅️ ➡️</strong> do teclado
-                </div>
-            </div>
-
-            <script>
-                const currentDir = "$encodedCurrentDir";
-                const rawCurrentDirPath = "${escapeJs(currentDir.absolutePath)}";
-                const csrfToken = "$csrfToken";
-                const mediaList = $mediaItemsJsArray;
-                let currentLightboxIndex = 0;
-                let activeCategory = 'all';
-                let elevatedRemainingSec = $initialElevatedRemSec;
-                let poll2faTimer = null;
-
-                // Controle da Splash Screen Animada na Abertura da Sessao
-                (function initWebSplash() {
-                    const splash = document.getElementById('webSplash');
-                    if (sessionStorage.getItem('ifg_splash_shown') === '1') {
-                        splash.classList.add('hidden');
-                    } else {
-                        sessionStorage.setItem('ifg_splash_shown', '1');
-                        setTimeout(() => splash.classList.add('hidden'), 1350);
-                    }
-                })();
-
-                // Cronometro Visual da Janela Deslizante de 5 Minutos
-                function updateElevatedBadgeUI() {
-                    const btn = document.getElementById('elevatedBadgeBtn');
-                    const txt = document.getElementById('elevatedTimerText');
-                    if (elevatedRemainingSec > 0) {
-                        btn.style.display = 'inline-flex';
-                        const m = Math.floor(elevatedRemainingSec / 60);
-                        const s = elevatedRemainingSec % 60;
-                        txt.innerText = m + ":" + (s < 10 ? "0" + s : s);
-                    } else {
-                        btn.style.display = 'none';
-                    }
-                }
-                updateElevatedBadgeUI();
-                setInterval(() => {
-                    if (elevatedRemainingSec > 0) {
-                        elevatedRemainingSec--;
-                        updateElevatedBadgeUI();
-                    }
-                }, 1000);
-
-                async function lockElevatedWindowNow() {
-                    await fetch('/action/lock_window', {
-                        method: 'POST',
-                        headers: { 'X-CSRF-Token': csrfToken }
-                    });
-                    elevatedRemainingSec = 0;
-                    updateElevatedBadgeUI();
-                }
-
-                // Tema Dinamico Claro / Escuro
-                function applyTheme(theme) {
-                    document.documentElement.setAttribute('data-theme', theme);
-                    localStorage.setItem('ifg_web_theme', theme);
-                }
-                function toggleTheme() {
-                    const current = document.documentElement.getAttribute('data-theme') || 'dark';
-                    applyTheme(current === 'dark' ? 'light' : 'dark');
-                }
-                applyTheme(localStorage.getItem('ifg_web_theme') || 'dark');
-
-                // Tamanho das Miniaturas (Pequenas, Medias, Grandes)
-                function setThumbSize(size) {
-                    const root = document.documentElement;
-                    document.getElementById('btnSizeS').classList.remove('active');
-                    document.getElementById('btnSizeM').classList.remove('active');
-                    document.getElementById('btnSizeL').classList.remove('active');
-
-                    if (size === 'small') {
-                        root.style.setProperty('--card-min', '155px');
-                        root.style.setProperty('--thumb-h', '110px');
-                        document.getElementById('btnSizeS').classList.add('active');
-                    } else if (size === 'large') {
-                        root.style.setProperty('--card-min', '330px');
-                        root.style.setProperty('--thumb-h', '245px');
-                        document.getElementById('btnSizeL').classList.add('active');
-                    } else {
-                        root.style.setProperty('--card-min', '220px');
-                        root.style.setProperty('--thumb-h', '165px');
-                        document.getElementById('btnSizeM').classList.add('active');
-                    }
-                    localStorage.setItem('ifg_thumb_size', size);
-                }
-                setThumbSize(localStorage.getItem('ifg_thumb_size') || 'medium');
-
-                // Busca e Filtros
-                function setCategoryFilter(cat) {
-                    activeCategory = cat;
-                    ['All', 'Image', 'Video', 'Folder'].forEach(id => {
-                        const el = document.getElementById('flt' + id);
-                        if (el) el.classList.remove('active');
-                    });
-                    const activeBtnId = cat === 'all' ? 'fltAll' : cat === 'image' ? 'fltImage' : cat === 'video' ? 'fltVideo' : 'fltFolder';
-                    document.getElementById(activeBtnId).classList.add('active');
-                    applyFilters();
-                }
-
-                function applyFilters() {
-                    const q = (document.getElementById('searchInput').value || '').toLowerCase().trim();
-                    document.querySelectorAll('.item-card').forEach(card => {
-                        const name = card.getAttribute('data-name') || '';
-                        const type = card.getAttribute('data-type') || '';
-                        const matchQuery = q === '' || name.includes(q);
-                        const matchCat = activeCategory === 'all' || type === activeCategory;
-                        card.style.display = (matchQuery && matchCat) ? 'flex' : 'none';
-                    });
-                }
-
-                // Selecao Multipla em Lote
-                function getSelectedFilenames() {
-                    const selected = [];
-                    document.querySelectorAll('.item-card').forEach(card => {
-                        const cb = card.querySelector('.select-check');
-                        if (cb && cb.checked && card.style.display !== 'none') {
-                            selected.push(card.getAttribute('data-filename'));
-                        }
-                    });
-                    return selected;
-                }
-
-                function onCardSelectChange(cb) {
-                    const card = cb.closest('.item-card');
-                    if (cb.checked) card.classList.add('selected');
-                    else card.classList.remove('selected');
-                    updateBatchBar();
-                }
-
-                function updateBatchBar() {
-                    const sel = getSelectedFilenames();
-                    const bar = document.getElementById('batchBar');
-                    if (sel.length > 0) {
-                        document.getElementById('batchCountText').innerText = sel.length + " selecionado(s)";
-                        bar.classList.add('visible');
-                    } else {
-                        bar.classList.remove('visible');
-                    }
-                }
-
-                function toggleSelectAll() {
-                    const visibleCards = Array.from(document.querySelectorAll('.item-card')).filter(c => c.style.display !== 'none');
-                    const allChecked = visibleCards.length > 0 && visibleCards.every(c => c.querySelector('.select-check').checked);
-                    visibleCards.forEach(c => {
-                        const cb = c.querySelector('.select-check');
-                        cb.checked = !allChecked;
-                        if (cb.checked) c.classList.add('selected');
-                        else c.classList.remove('selected');
-                    });
-                    updateBatchBar();
-                }
-
-                function clearAllSelection() {
-                    document.querySelectorAll('.item-card').forEach(c => {
-                        c.querySelector('.select-check').checked = false;
-                        c.classList.remove('selected');
-                    });
-                    updateBatchBar();
-                }
-
-                function downloadSelectedZip() {
-                    const sel = getSelectedFilenames();
-                    if (sel.length === 0) return;
-                    window.location.href = "/zip?dir=" + currentDir + "&files=" + encodeURIComponent(sel.join("|"));
-                }
-
-                // Motor de Autorizacao em 2 Etapas (2FA) para TODAS as Operacoes
-                function authorizeWith2FA(actionDescription, callbackWithOpToken) {
-                    fetch('/action/request_2fa?desc=' + encodeURIComponent(actionDescription), {
-                        method: 'POST',
-                        headers: { 'X-CSRF-Token': csrfToken }
-                    })
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.status === 'already_authorized') {
-                            if (data.remainingSeconds) {
-                                elevatedRemainingSec = data.remainingSeconds;
-                                updateElevatedBadgeUI();
-                            }
-                            callbackWithOpToken(data.opToken);
-                            return;
-                        }
-                        openAction2faModal(actionDescription, data.reqId, callbackWithOpToken);
-                    });
-                }
-
-                function openAction2faModal(actionDesc, reqId, onAuthorized) {
-                    if (poll2faTimer) clearInterval(poll2faTimer);
-                    document.getElementById('a2faTitle').innerText = actionDesc;
-                    const codeInput = document.getElementById('a2faCodeInput');
-                    codeInput.value = '';
-                    document.getElementById('a2faErrorText').style.display = 'none';
-                    document.getElementById('action2faModal').classList.add('open');
-                    setTimeout(() => codeInput.focus(), 60);
-
-                    const verifyNow = async (mode) => {
-                        const keep5m = document.getElementById('a2faKeep5Min').checked ? '1' : '0';
-                        const code = codeInput.value.trim();
-                        const resp = await fetch('/action/verify_2fa?reqId=' + encodeURIComponent(reqId) + '&code=' + encodeURIComponent(code) + '&keep5m=' + keep5m + '&mode=' + mode, {
-                            method: 'POST',
-                            headers: { 'X-CSRF-Token': csrfToken }
-                        });
-                        const res = await resp.json();
-                        if (res.status === 'approved') {
-                            if (poll2faTimer) clearInterval(poll2faTimer);
-                            document.getElementById('action2faModal').classList.remove('open');
-                            if (res.remainingSeconds) {
-                                elevatedRemainingSec = res.remainingSeconds;
-                                updateElevatedBadgeUI();
-                            }
-                            onAuthorized(res.opToken);
-                        } else if (res.status === 'invalid_code') {
-                            document.getElementById('a2faErrorText').style.display = 'block';
-                        } else if (res.status === 'expired') {
-                            if (poll2faTimer) clearInterval(poll2faTimer);
-                            alert('O código 2FA expirou. Tente novamente.');
-                            document.getElementById('action2faModal').classList.remove('open');
-                        }
-                    };
-
-                    document.getElementById('a2faSubmitBtn').onclick = () => verifyNow('manual');
-                    poll2faTimer = setInterval(() => verifyNow('poll'), 1200);
-                }
-
-                function cancelAction2fa() {
-                    if (poll2faTimer) clearInterval(poll2faTimer);
-                    document.getElementById('action2faModal').classList.remove('open');
-                }
-
-                async function executeProtectedAction(actionDesc, queryParams, bodyPayload = "") {
-                    authorizeWith2FA(actionDesc, async (opToken) => {
-                        const resp = await fetch("/action?" + queryParams + "&opToken=" + encodeURIComponent(opToken), {
-                            method: "POST",
-                            headers: {
-                                "X-CSRF-Token": csrfToken,
-                                "X-Op-Token": opToken,
-                                "Content-Type": "text/plain; charset=utf-8"
-                            },
-                            body: bodyPayload
-                        });
-                        if (resp.ok) {
-                            window.location.reload();
-                        } else {
-                            alert("Não foi possível concluir a operação.");
-                            window.location.reload();
-                        }
-                    });
-                }
-
-                // Modais de Criar Pasta, Renomear e Excluir (Todos passam pelo 2FA)
-                function openInputModal(title, desc, initialValue, onConfirm) {
-                    document.getElementById('modalTitle').innerText = title;
-                    document.getElementById('modalDesc').innerText = desc;
-                    const input = document.getElementById('modalInput');
-                    input.style.display = 'block';
-                    input.value = initialValue || '';
-
-                    const btn = document.getElementById('modalConfirmBtn');
-                    btn.className = 'btn';
-                    btn.innerText = 'Continuar (2FA)';
-                    btn.onclick = () => {
-                        const val = input.value.trim();
-                        closeCustomModal();
-                        onConfirm(val);
-                    };
-
-                    document.getElementById('customModal').classList.add('open');
-                    setTimeout(() => input.focus(), 60);
-                }
-
-                function openConfirmModal(title, desc, onConfirm) {
-                    document.getElementById('modalTitle').innerText = title;
-                    document.getElementById('modalDesc').innerText = desc;
-                    document.getElementById('modalInput').style.display = 'none';
-
-                    const btn = document.getElementById('modalConfirmBtn');
-                    btn.className = 'btn-danger';
-                    btn.innerText = 'Autorizar com 2FA';
-                    btn.onclick = () => {
-                        closeCustomModal();
-                        onConfirm();
-                    };
-
-                    document.getElementById('customModal').classList.add('open');
-                }
-
-                function closeCustomModal() {
-                    document.getElementById('customModal').classList.remove('open');
-                }
-
-                function openMkdirModal() {
-                    openInputModal("Criar Nova Pasta", "Digite o nome da nova pasta:", "", (val) => {
-                        if (val) {
-                            executeProtectedAction(
-                                "Criar Pasta: " + val,
-                                "cmd=mkdir&dir=" + currentDir + "&name=" + encodeURIComponent(val)
-                            );
-                        }
-                    });
-                }
-
-                function openRenameModal(targetPath, oldName) {
-                    openInputModal("Renomear Item", "Novo nome para '" + oldName + "':", oldName, (val) => {
-                        if (val && val !== oldName) {
-                            executeProtectedAction(
-                                "Renomear '" + oldName + "' para '" + val + "'",
-                                "cmd=rename&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath) + "&name=" + encodeURIComponent(val)
-                            );
-                        }
-                    });
-                }
-
-                function openDeleteModal(targetPath, name) {
-                    openConfirmModal("Excluir '" + name + "'?", "Esta exclusão exigirá autorização de 2ª etapa no celular.", () => {
-                        executeProtectedAction(
-                            "Excluir: " + name,
-                            "cmd=delete&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath)
-                        );
-                    });
-                }
-
-                function deleteSelectedBatch() {
-                    const sel = getSelectedFilenames();
-                    if (sel.length === 0) return;
-                    openConfirmModal(
-                        "Excluir " + sel.length + " item(ns)?",
-                        "A exclusão em lote exigirá autorização de 2ª etapa no celular.",
-                        () => {
-                            executeProtectedAction(
-                                "Excluir em Lote (" + sel.length + " itens)",
-                                "cmd=batch_delete&dir=" + currentDir,
-                                sel.join("|")
-                            );
-                        }
-                    );
-                }
-
-                // Seletor Livre de Pastas para Movimentacao (Individual ou Lote)
-                let currentMoveBrowsePath = rawCurrentDirPath;
-                function loadMovePickerDirectory(dirPath) {
-                    fetch('/dirs?dir=' + encodeURIComponent(dirPath))
-                    .then(r => r.json())
-                    .then(data => {
-                        currentMoveBrowsePath = data.currentPath;
-                        document.getElementById('moveCurrentPathLabel').innerText = "📂 " + data.shortPath;
-                        const box = document.getElementById('moveDirsContainer');
-                        box.innerHTML = '';
-
-                        if (data.parentPath && data.parentPath !== "") {
-                            const upDiv = document.createElement('div');
-                            upDiv.className = 'dir-item';
-                            upDiv.innerHTML = "⬅️ <strong>.. (Subir para pasta acima)</strong>";
-                            upDiv.onclick = () => loadMovePickerDirectory(data.parentPath);
-                            box.appendChild(upDiv);
-                        }
-
-                        if (data.folders.length === 0) {
-                            const emptyMsg = document.createElement('div');
-                            emptyMsg.style.padding = '10px';
-                            emptyMsg.style.fontSize = '12px';
-                            emptyMsg.style.color = '#94a3b8';
-                            emptyMsg.innerText = 'Nenhuma subpasta aqui. Você pode mover para cá.';
-                            box.appendChild(emptyMsg);
-                        } else {
-                            data.folders.forEach(f => {
-                                const row = document.createElement('div');
-                                row.className = 'dir-item';
-                                row.innerHTML = "📁 " + f.name;
-                                row.onclick = () => loadMovePickerDirectory(f.path);
-                                box.appendChild(row);
-                            });
-                        }
-                    });
-                }
-
-                function openMoveModal(targetPath, itemName, isBatch) {
-                    document.getElementById('moveModalTargetDesc').innerText = isBatch
-                        ? "Movendo " + itemName
-                        : "Movendo: " + itemName;
-                    loadMovePickerDirectory(rawCurrentDirPath);
-                    document.getElementById('moveModal').classList.add('open');
-
-                    document.getElementById('confirmMoveHereBtn').onclick = () => {
-                        const dest = currentMoveBrowsePath;
-                        closeMoveModal();
-                        if (isBatch) {
-                            const sel = getSelectedFilenames();
-                            executeProtectedAction(
-                                "Mover " + sel.length + " item(ns)",
-                                "cmd=batch_move&dir=" + currentDir + "&dest=" + encodeURIComponent(dest),
-                                sel.join("|")
-                            );
-                        } else {
-                            executeProtectedAction(
-                                "Mover: " + itemName,
-                                "cmd=move&dir=" + currentDir + "&target=" + encodeURIComponent(targetPath) + "&dest=" + encodeURIComponent(dest)
-                            );
-                        }
-                    };
-                }
-
-                function openBatchMoveModal() {
-                    const sel = getSelectedFilenames();
-                    if (sel.length === 0) return;
-                    openMoveModal("", sel.length + " item(ns) selecionados", true);
-                }
-
-                function closeMoveModal() {
-                    document.getElementById('moveModal').classList.remove('open');
-                }
-
-                // Upload de Arquivos Protegido por 2FA com Token de Lote Ininterrupto
-                function uploadFilesWith2FA(files) {
-                    if (!files || files.length === 0) return;
-                    const fileArray = Array.from(files);
-                    authorizeWith2FA("Enviar " + fileArray.length + " arquivo(s) do PC", async (opToken) => {
-                        const status = document.getElementById("uploadStatus");
-                        for (let i = 0; i < fileArray.length; i++) {
-                            const file = fileArray[i];
-                            status.innerText = "⬆️ Enviando (" + (i + 1) + "/" + fileArray.length + "): " + file.name + "...";
-                            await fetch("/upload?dir=" + currentDir + "&name=" + encodeURIComponent(file.name) + "&opToken=" + encodeURIComponent(opToken), {
-                                method: "POST",
-                                headers: {
-                                    "X-CSRF-Token": csrfToken,
-                                    "X-Op-Token": opToken
-                                },
-                                body: file
-                            });
-                        }
-                        status.innerText = "✅ Upload concluído!";
-                        window.location.reload();
-                    });
-                }
-
-                // Lightbox em Tela Cheia
-                function openLightbox(index) {
-                    if (mediaList.length === 0) return;
-                    currentLightboxIndex = index;
-                    document.getElementById('lightboxModal').classList.add('open');
-                    renderLightboxItem();
-                }
-
-                function closeLightbox() {
-                    document.getElementById('lbMediaHolder').innerHTML = '';
-                    document.getElementById('lightboxModal').classList.remove('open');
-                }
-
-                function stepLightbox(delta) {
-                    if (mediaList.length === 0) return;
-                    currentLightboxIndex = (currentLightboxIndex + delta + mediaList.length) % mediaList.length;
-                    renderLightboxItem();
-                }
-
-                function toggleLightboxZoom() {
-                    const img = document.querySelector('#lbMediaHolder img');
-                    if (img) img.classList.toggle('zoomed');
-                }
-
-                function renderLightboxItem() {
-                    const item = mediaList[currentLightboxIndex];
-                    document.getElementById('lbCounter').innerText = (currentLightboxIndex + 1) + " / " + mediaList.length;
-                    document.getElementById('lbTitle').innerText = item.name + " (" + item.size + " • " + item.date + ")";
-                    document.getElementById('lbDownloadBtn').href = item.download;
-
-                    const holder = document.getElementById('lbMediaHolder');
-                    if (item.type === 'video') {
-                        holder.innerHTML = '<video src="' + item.url + '" controls autoplay></video>';
-                    } else {
-                        holder.innerHTML = '<img src="' + item.url + '" alt="' + item.name + '" onclick="this.classList.toggle(\'zoomed\')">';
-                    }
-                }
-
-                function moveCurrentLightboxItem() {
-                    const item = mediaList[currentLightboxIndex];
-                    if (item) {
-                        closeLightbox();
-                        openMoveModal(item.path, item.name, false);
-                    }
-                }
-
-                function renameCurrentLightboxItem() {
-                    const item = mediaList[currentLightboxIndex];
-                    if (item) openRenameModal(item.path, item.name);
-                }
-
-                function deleteCurrentLightboxItem() {
-                    const item = mediaList[currentLightboxIndex];
-                    if (item) openDeleteModal(item.path, item.name);
-                }
-
-                document.addEventListener('keydown', function(e) {
-                    const isOpen = document.getElementById('lightboxModal').classList.contains('open');
-                    if (!isOpen) return;
-                    if (e.key === 'ArrowRight') stepLightbox(1);
-                    else if (e.key === 'ArrowLeft') stepLightbox(-1);
-                    else if (e.key === 'Escape') closeLightbox();
-                });
-
-                // Drag & Drop Protegido por 2FA
-                window.addEventListener('dragover', function(e) {
-                    e.preventDefault();
-                    document.getElementById('dropOverlay').classList.add('active');
-                });
-                document.getElementById('dropOverlay').addEventListener('dragleave', function(e) {
-                    e.preventDefault();
-                    document.getElementById('dropOverlay').classList.remove('active');
-                });
-                window.addEventListener('drop', function(e) {
-                    e.preventDefault();
-                    document.getElementById('dropOverlay').classList.remove('active');
-                    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                        uploadFilesWith2FA(e.dataTransfer.files);
-                    }
-                });
-            </script>
-            </body>
-            </html>
-            """.trimIndent()
-        )
-
-        return newFixedLengthResponse(Response.Status.OK, MIME_HTML, sb.toString())
-    }
-
-    private fun parseQueryParams(query: String?): Map<String, String> {
-        if (query.isNullOrBlank()) return emptyMap()
-        val map = mutableMapOf<String, String>()
-        for (pair in query.split("&")) {
-            val idx = pair.indexOf("=")
-            if (idx > 0) {
-                val k = URLDecoder.decode(pair.substring(0, idx), "UTF-8")
-                val v = URLDecoder.decode(pair.substring(idx + 1), "UTF-8")
-                map[k] = v
-            }
-        }
-        return map
-    }
-
-    private fun urlEncode(value: String): String = URLEncoder.encode(value, "UTF-8")
-
-    private fun escapeHtml(text: String): String {
-        return text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\"", "&quot;")
-    }
-
-    private fun escapeJs(text: String): String {
-        return text.replace("\\", "\\\\").replace("'", "\\'").replace("\"", "\\\"")
-    }
-
-    private fun isImageFile(name: String): Boolean {
-        val low = name.lowercase()
-        return low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".png") || low.endsWith(".webp")
-    }
-
-    private fun isVideoFile(name: String): Boolean {
-        val low = name.lowercase()
-        return low.endsWith(".mp4") || low.endsWith(".mov") || low.endsWith(".mkv") || low.endsWith(".3gp")
-    }
-
-    private fun resolveMimeType(name: String): String {
-        val low = name.lowercase()
-        return when {
-            low.endsWith(".jpg") || low.endsWith(".jpeg") -> "image/jpeg"
-            low.endsWith(".png") -> "image/png"
-            low.endsWith(".webp") -> "image/webp"
-            low.endsWith(".mp4") -> "video/mp4"
-            low.endsWith(".pdf") -> "application/pdf"
-            else -> "application/octet-stream"
-        }
-    }
-
-    private fun formatSize(bytes: Long): String {
-        if (bytes < 1024) return "$bytes B"
-        val kb = bytes / 1024.0
-        if (kb < 1024) return String.format(Locale.US, "%.1f KB", kb)
-        val mb = kb / 1024.0
-        return String.format(Locale.US, "%.2f MB", mb)
     }
 }
