@@ -1,6 +1,8 @@
 package com.ifgestor.app
 
 import android.Manifest
+import android.app.Activity
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -8,2720 +10,1909 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.media.MediaMetadataRetriever
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.media.MediaScannerConnection
 import android.media.ThumbnailUtils
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.os.PowerManager
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.provider.Settings
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
 import android.util.LruCache
+import android.util.Size
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
+import android.widget.ArrayAdapter
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.GridLayout
+import android.widget.HorizontalScrollView
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.ScrollView
+import android.widget.Spinner
+import android.widget.Switch
+import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.ManagedActivityResultLauncher
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import androidx.core.content.FileProvider
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 
-private val DarkCorpColorScheme = darkColorScheme(
-    primary = Color(0xFF38BDF8),
-    onPrimary = Color(0xFF061523),
-    primaryContainer = Color(0xFF0F2942),
-    onPrimaryContainer = Color(0xFFE0F2FE),
-    secondary = Color(0xFF10B981),
-    onSecondary = Color(0xFF052E16),
-    secondaryContainer = Color(0xFF064E3B),
-    onSecondaryContainer = Color(0xFFD1FAE5),
-    tertiary = Color(0xFF6366F1),
-    background = Color(0xFF0B1120),
-    onBackground = Color(0xFFF8FAFC),
-    surface = Color(0xFF151F32),
-    onSurface = Color(0xFFF8FAFC),
-    surfaceVariant = Color(0xFF1E293B),
-    onSurfaceVariant = Color(0xFFCBD5E1),
-    error = Color(0xFFEF4444)
-)
+class MainActivity : Activity() {
 
-private val LightCorpColorScheme = lightColorScheme(
-    primary = Color(0xFF0F2942),
-    onPrimary = Color.White,
-    primaryContainer = Color(0xFF0F2942),
-    onPrimaryContainer = Color.White,
-    secondary = Color(0xFF059669),
-    onSecondary = Color.White,
-    secondaryContainer = Color(0xFFD1FAE5),
-    onSecondaryContainer = Color(0xFF064E3B),
-    tertiary = Color(0xFF0284C7),
-    background = Color(0xFFF1F5F9),
-    onBackground = Color(0xFF0F172A),
-    surface = Color.White,
-    onSurface = Color(0xFF0F172A),
-    surfaceVariant = Color(0xFFE2E8F0),
-    onSurfaceVariant = Color(0xFF334155),
-    error = Color(0xFFDC2626)
-)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val bgExecutor = Executors.newFixedThreadPool(4)
 
-sealed class PendingMobileOperation {
-    data class CreateFolder(val parentDir: File, val folderName: String) : PendingMobileOperation()
-    data class RenameItem(val targetFile: File, val newName: String) : PendingMobileOperation()
-    data class MoveItems(val sources: List<File>, val destinationDir: File) : PendingMobileOperation()
-    data class DeleteItems(val targets: List<File>, val fromFullScreen: Boolean = false) : PendingMobileOperation()
-}
+    // Cache em memoria RAM para miniaturas da Galeria (evita OutOfMemory)
+    private val thumbCache = object : LruCache<String, Bitmap>(40) {}
 
-object LocalThumbnailCache {
-    private val cache = LruCache<String, ImageBitmap>(80)
+    private var currentTab = 0 // 0 = Painel & Camera, 1 = Galeria Sandbox, 2 = Servidor PC & Auditoria
+    private var currentGallerySubfolder = ""
+    private var gallerySearchQuery = ""
+    private val selectedGalleryPaths = LinkedHashSet<String>()
+    private var isTaskDrawerExpanded = false
 
-    fun get(key: String): ImageBitmap? = cache.get(key)
+    // Referencias de UI atualizadas em tempo real
+    private var tvHeaderStatus: TextView? = null
+    private var tvHeaderCounters: TextView? = null
+    private var contentContainer: FrameLayout? = null
+    private var tabBtn0: Button? = null
+    private var tabBtn1: Button? = null
+    private var tabBtn2: Button? = null
 
-    fun put(key: String, bitmap: ImageBitmap) {
-        cache.put(key, bitmap)
+    // Referencias da Central de Tarefas Recolhivel Mobile (Item 10)
+    private var taskDrawerContainer: LinearLayout? = null
+    private var tvTaskDrawerHeader: TextView? = null
+    private var tvTaskDrawerArrow: TextView? = null
+    private var taskDrawerListLayout: LinearLayout? = null
+
+    // Referencias de atualizacao ao vivo nas abas
+    private var tvLiveChallengeBox: LinearLayout? = null
+    private var galleryGridContainer: LinearLayout? = null
+    private var tvGallerySelectionInfo: TextView? = null
+
+    private val livePoller = object : Runnable {
+        override fun run() {
+            refreshHeaderAndTaskDrawer()
+            if (currentTab == 2) {
+                refreshLive2faChallengeBanner()
+            }
+            mainHandler.postDelayed(this, 1200L)
+        }
     }
-}
 
-class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        SettingsManager.syncStateFromPrefs(this)
-        setContent {
-            val themeMode by SettingsManager.themeMode.collectAsState()
-            val systemDark = isSystemInDarkTheme()
-            val useDark = when (themeMode) {
-                1 -> false
-                2 -> true
-                else -> systemDark
-            }
-
-            MaterialTheme(
-                colorScheme = if (useDark) DarkCorpColorScheme else LightCorpColorScheme
-            ) {
-                var showSplash by rememberSaveable { mutableStateOf(true) }
-
-                Box(modifier = Modifier.fillMaxSize()) {
-                    Surface(
-                        modifier = Modifier.fillMaxSize(),
-                        color = MaterialTheme.colorScheme.background
-                    ) {
-                        IFGestorMainApp(themeMode = themeMode)
-                    }
-
-                    AnimatedVisibility(
-                        visible = showSplash,
-                        exit = fadeOut(animationSpec = tween(450))
-                    ) {
-                        IFGestorSplashScreen(onFinished = { showSplash = false })
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun IFGestorSplashScreen(onFinished: () -> Unit) {
-    val logoScale = remember { Animatable(0.72f) }
-    val progress = remember { Animatable(0f) }
-
-    val infiniteTransition = rememberInfiniteTransition(label = "splash_rings")
-    val ringPulse by infiniteTransition.animateFloat(
-        initialValue = 0.94f,
-        targetValue = 1.08f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(900, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "ring_pulse"
-    )
-
-    LaunchedEffect(Unit) {
-        launch {
-            logoScale.animateTo(
-                targetValue = 1f,
-                animationSpec = tween(durationMillis = 700, easing = FastOutSlowInEasing)
-            )
-        }
-        launch {
-            progress.animateTo(
-                targetValue = 1f,
-                animationSpec = tween(durationMillis = 1250, easing = LinearEasing)
-            )
-        }
-        delay(1350)
-        onFinished()
+        SettingsManager.getSandboxRootDir() // Garante criacao da Sandbox DCIM/Camera/IFgestor
+        setContentView(buildMainScaffold())
+        checkAndRequestInitialPermissions()
+        switchTab(0)
     }
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    colors = listOf(
-                        Color(0xFF0F2942),
-                        Color(0xFF0B1120),
-                        Color(0xFF060A12)
-                    )
-                )
-            )
-            .padding(24.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier.size(220.dp)
-            ) {
-                // Aneis Concentricos Pulsantes
-                Box(
-                    modifier = Modifier
-                        .size(210.dp)
-                        .scale(ringPulse)
-                        .clip(CircleShape)
-                        .border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.16f), CircleShape)
-                )
-                Box(
-                    modifier = Modifier
-                        .size(170.dp)
-                        .scale(ringPulse)
-                        .clip(CircleShape)
-                        .border(1.5.dp, Color(0xFF10B981).copy(alpha = 0.25f), CircleShape)
-                )
-                Box(
-                    modifier = Modifier
-                        .size(136.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFF151F32).copy(alpha = 0.7f))
-                        .border(2.dp, Color(0xFF38BDF8).copy(alpha = 0.45f), CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Image(
-                        painter = painterResource(id = R.drawable.ic_ifgestor_logo),
-                        contentDescription = "Logo IFGestor",
-                        modifier = Modifier
-                            .size(104.dp)
-                            .scale(logoScale.value)
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(20.dp))
-
-            Text(
-                text = "IFGestor",
-                color = Color.White,
-                fontSize = 32.sp,
-                fontWeight = FontWeight.ExtraBold,
-                letterSpacing = 0.8.sp
-            )
-
-            Spacer(modifier = Modifier.height(6.dp))
-
-            Text(
-                text = "Gestão Corporativa de Mídia & Arquivos",
-                color = Color(0xFF94A3B8),
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium
-            )
-        }
-
-        // Barra Inferior de Inicializacao
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 36.dp)
-                .width(240.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(6.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFF1E293B))
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(progress.value)
-                        .fillMaxHeight()
-                        .background(
-                            Brush.horizontalGradient(
-                                colors = listOf(Color(0xFF38BDF8), Color(0xFF10B981))
-                            )
-                        )
-                )
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun IFGestorMainApp(themeMode: Int) {
-    val context = LocalContext.current
-    var selectedTab by rememberSaveable { mutableStateOf(0) }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Image(
-                            painter = painterResource(id = R.drawable.ic_ifgestor_logo),
-                            contentDescription = "Logo IFGestor",
-                            modifier = Modifier
-                                .size(38.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                        )
-                        Column {
-                            Text(
-                                "IFGestor",
-                                fontWeight = FontWeight.ExtraBold,
-                                fontSize = 19.sp
-                            )
-                            Text(
-                                when (selectedTab) {
-                                    0 -> "Interceptador & Captura Rápida"
-                                    1 -> "Gestor de Fotos, Vídeos e Pastas"
-                                    else -> "Servidor Web & Segurança 2FA"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
-                            )
-                        }
-                    }
-                },
-                actions = {
-                    FilledTonalButton(
-                        onClick = {
-                            val next = (themeMode + 1) % 3
-                            SettingsManager.setThemeMode(context, next)
-                            val label = when (next) {
-                                1 -> "Tema Claro (Sol Forte)"
-                                2 -> "Tema Escuro"
-                                else -> "Tema Automático"
-                            }
-                            Toast.makeText(context, label, Toast.LENGTH_SHORT).show()
-                        },
-                        shape = RoundedCornerShape(20.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                        modifier = Modifier.padding(end = 8.dp)
-                    ) {
-                        Icon(
-                            imageVector = when (themeMode) {
-                                1 -> Icons.Default.LightMode
-                                2 -> Icons.Default.DarkMode
-                                else -> Icons.Default.BrightnessAuto
-                            },
-                            contentDescription = "Alternar Tema",
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            when (themeMode) {
-                                1 -> "Claro"
-                                2 -> "Escuro"
-                                else -> "Auto"
-                            },
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-            )
-        },
-        bottomBar = {
-            NavigationBar(
-                containerColor = MaterialTheme.colorScheme.surface,
-                tonalElevation = 8.dp
-            ) {
-                NavigationBarItem(
-                    selected = selectedTab == 0,
-                    onClick = { selectedTab = 0 },
-                    icon = { Icon(Icons.Default.Dashboard, contentDescription = null) },
-                    label = { Text("Painel", fontWeight = FontWeight.SemiBold) }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Default.PhotoLibrary, contentDescription = null) },
-                    label = { Text("Galeria & Pastas", fontWeight = FontWeight.SemiBold) }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 2,
-                    onClick = { selectedTab = 2 },
-                    icon = { Icon(Icons.Default.Security, contentDescription = null) },
-                    label = { Text("Servidor PC", fontWeight = FontWeight.SemiBold) }
-                )
-            }
-        }
-    ) { paddingValues ->
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(paddingValues)
-        ) {
-            when (selectedTab) {
-                0 -> InterceptorTabScreen(onOpenFolderPicker = { selectedTab = 1 })
-                1 -> LocalFolderExplorerTabScreen()
-                else -> WebServerTabScreen()
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun InterceptorTabScreen(onOpenFolderPicker: () -> Unit) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-
-    val activePrefix by SettingsManager.activePrefix.collectAsState()
-    val quickPresets by SettingsManager.quickPresets.collectAsState()
-    val activeFolderPath by SettingsManager.activeFolderPath.collectAsState()
-    val isServiceRunning by SettingsManager.isServiceRunning.collectAsState()
-    val isWebServerRunning by SettingsManager.isWebServerRunning.collectAsState()
-    val interceptedCount by SettingsManager.interceptedCount.collectAsState()
-    val lastFile by SettingsManager.lastInterceptedFile.collectAsState()
-
-    var prefixInput by remember(activePrefix) { mutableStateOf(activePrefix) }
-    var overlayEnabled by remember { mutableStateOf(SettingsManager.isOverlayEnabled(context)) }
-    var hasAllFilesPermission by remember { mutableStateOf(checkStoragePermission()) }
-    var hasOverlayPermission by remember { mutableStateOf(checkOverlayPermission(context)) }
-    var deviceIp by remember { mutableStateOf(WebServerManager.getDeviceIpAddress(context)) }
-    var storageStats by remember { mutableStateOf(SettingsManager.getStorageStats()) }
-    var showAddPresetDialog by remember { mutableStateOf(false) }
-    var newPresetText by remember { mutableStateOf("") }
-
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { }
-
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                hasAllFilesPermission = checkStoragePermission()
-                hasOverlayPermission = checkOverlayPermission(context)
-                deviceIp = WebServerManager.getDeviceIpAddress(context)
-                storageStats = SettingsManager.getStorageStats()
-                SettingsManager.syncStateFromPrefs(context)
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    override fun onResume() {
+        super.onResume()
+        mainHandler.removeCallbacks(livePoller)
+        mainHandler.post(livePoller)
+        IFGestorHomeWidget.requestWidgetUpdate(this)
+        FloatingOverlayManager.refresh(this)
+        renderActiveTab()
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        if (!hasAllFilesPermission || !hasOverlayPermission) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.errorContainer
-                ),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        "Permissões Pendentes do Sistema",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onErrorContainer
-                    )
-                    if (!hasAllFilesPermission) {
-                        Button(
-                            onClick = { requestAllFilesPermission(context) },
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(Icons.Default.FolderOpen, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("1. LIBERAR ACESSO TOTAL AOS ARQUIVOS")
-                        }
-                    }
-                    if (!hasOverlayPermission) {
-                        Button(
-                            onClick = { requestOverlayPermission(context) },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(Icons.Default.Layers, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("2. LIBERAR WIDGET FLUTUANTE DA CÂMERA")
-                        }
-                    }
-                }
-            }
+    override fun onPause() {
+        mainHandler.removeCallbacks(livePoller)
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        mainHandler.removeCallbacks(livePoller)
+        super.onDestroy()
+    }
+
+    /**
+     * Atalho fisico de campo: se o disparo com Botao Volume (-) estiver ativo,
+     * aciona a camera com o interceptador ligado imediatamente.
+     */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN && SettingsManager.isVolumeShutterEnabled(this)) {
+            startCameraWithInterceptor()
+            return true
         }
+        return super.onKeyDown(keyCode, event)
+    }
 
-        Card(
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surface
-            ),
-            border = BorderStroke(
-                1.5.dp,
-                if (isServiceRunning) Color(0xFF10B981) else MaterialTheme.colorScheme.surfaceVariant
-            ),
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(12.dp)
-                                .clip(CircleShape)
-                                .background(if (isServiceRunning) Color(0xFF10B981) else Color(0xFF94A3B8))
-                        )
-                        Text(
-                            text = if (isServiceRunning) "INTERCEPTADOR ATIVO" else "SERVIÇO EM ESPERA",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = if (isServiceRunning) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                    Surface(
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(20.dp)
-                    ) {
-                        Text(
-                            text = "$interceptedCount capturados",
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
+    // =========================================================================
+    // 1. ESTRUTURA VISUAL PRINCIPAL (CABECALHO + ABAS + CENTRAL DE TAREFAS)
+    // =========================================================================
 
-                Divider(color = MaterialTheme.colorScheme.surfaceVariant)
-
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            "Armazenamento Interno",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            "${storageStats.usedPercent}% ocupado",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    LinearProgressIndicator(
-                        progress = storageStats.usedPercent / 100f,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(8.dp)
-                            .clip(RoundedCornerShape(8.dp)),
-                        color = Color(0xFF0284C7),
-                        trackColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                    Text(
-                        storageStats.formattedSummary,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Última captura: $lastFile",
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        if (isWebServerRunning) {
-                            Text(
-                                text = "🌐 PC: http://$deviceIp:${SettingsManager.getServerPort(context)}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF0284C7),
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        Card(
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            shape = RoundedCornerShape(16.dp),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Prefixos Rápidos de Captura (1 Toque)",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold
-                    )
-                    TextButton(onClick = {
-                        newPresetText = ""
-                        showAddPresetDialog = true
-                    }) {
-                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Nova Etiqueta")
-                    }
-                }
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    quickPresets.forEach { preset ->
-                        val isSelected = activePrefix == preset
-                        FilterChip(
-                            selected = isSelected,
-                            onClick = {
-                                prefixInput = preset
-                                SettingsManager.setPrefix(context, preset)
-                                notifyServiceConfigChanged(context, isServiceRunning)
-                            },
-                            label = {
-                                Text(
-                                    preset,
-                                    fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium
-                                )
-                            },
-                            leadingIcon = if (isSelected) {
-                                { Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp)) }
-                            } else null,
-                            trailingIcon = if (quickPresets.size > 1) {
-                                {
-                                    Icon(
-                                        Icons.Default.Close,
-                                        contentDescription = "Remover etiqueta",
-                                        modifier = Modifier
-                                            .size(15.dp)
-                                            .clickable {
-                                                SettingsManager.removeQuickPreset(context, preset)
-                                            }
-                                    )
-                                }
-                            } else null
-                        )
-                    }
-                }
-
-                OutlinedTextField(
-                    value = prefixInput,
-                    onValueChange = {
-                        prefixInput = it
-                        SettingsManager.setPrefix(context, it)
-                        notifyServiceConfigChanged(context, isServiceRunning)
-                    },
-                    label = { Text("Prefixo Ativo Personalizado") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        }
-
-        Card(
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            shape = RoundedCornerShape(16.dp),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Text(
-                    "Pasta de Destino & Controles em Tela",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold
-                )
-
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onOpenFolderPicker() }
-                ) {
-                    Row(
-                        modifier = Modifier.padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(
-                                Icons.Default.FolderSpecial,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                            Column {
-                                Text(
-                                    "Salvando arquivos da câmera em:",
-                                    style = MaterialTheme.typography.labelSmall
-                                )
-                                Text(
-                                    SettingsManager.formatShortPath(activeFolderPath),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                        Icon(Icons.Default.Edit, contentDescription = "Trocar pasta")
-                    }
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            "Widget Flutuante sobre a Câmera",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            "Pílula translúcida com contador e troca rápida de pasta/prefixo",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(
-                        checked = overlayEnabled,
-                        onCheckedChange = {
-                            overlayEnabled = it
-                            SettingsManager.setOverlayEnabled(context, it)
-                            if (isServiceRunning) {
-                                startInterceptorServiceOnly(context)
-                            }
-                        }
-                    )
-                }
-            }
-        }
-
-        Button(
-            onClick = {
-                if (!hasAllFilesPermission) {
-                    requestAllFilesPermission(context)
-                    return@Button
-                }
-                if (overlayEnabled && !hasOverlayPermission) {
-                    requestOverlayPermission(context)
-                    return@Button
-                }
-                requestNotificationPermissionIfNeeded(context, notificationPermissionLauncher)
-                startInterceptorAndOpenNativeCamera(context)
-            },
-            colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF10B981),
-                contentColor = Color.White
-            ),
-            shape = RoundedCornerShape(14.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(58.dp)
-        ) {
-            Icon(Icons.Default.PhotoCamera, contentDescription = null)
-            Spacer(modifier = Modifier.width(10.dp))
-            Text(
-                "ATIVAR E ABRIR CÂMERA NATIVA",
-                fontWeight = FontWeight.ExtraBold,
-                fontSize = 15.sp
+    private fun buildMainScaffold(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#0F172A"))
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
 
-        OutlinedButton(
-            onClick = {
-                if (isServiceRunning) {
-                    val stopIntent = Intent(context, MediaInterceptorService::class.java).apply {
-                        action = MediaInterceptorService.ACTION_STOP
-                    }
-                    context.startService(stopIntent)
-                } else {
-                    if (!hasAllFilesPermission) {
-                        requestAllFilesPermission(context)
-                        return@OutlinedButton
-                    }
-                    requestNotificationPermissionIfNeeded(context, notificationPermissionLauncher)
-                    startInterceptorServiceOnly(context)
-                }
-            },
-            shape = RoundedCornerShape(14.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-        ) {
-            Icon(
-                if (isServiceRunning) Icons.Default.StopCircle else Icons.Default.PlayCircle,
-                contentDescription = null
+        // Cabecalho Corporativo Fixo
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = cardDrawable("#1E293B", "#334155", 0, 1)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+        }
+
+        val logo = ImageView(this).apply {
+            setImageResource(R.drawable.ic_ifgestor_logo)
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40)).apply {
+                marginEnd = dp(12)
+            }
+        }
+        header.addView(logo)
+
+        val headerTextCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val title = TextView(this).apply {
+            text = "IFGestor • Blindagem & Multitarefa"
+            setTextColor(Color.parseColor("#F8FAFC"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+
+        val statusLine = TextView(this).apply {
+            text = "⚪ Câmera: OFF • 🌐 Web: OFF"
+            setTextColor(Color.parseColor("#10B981"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        tvHeaderStatus = statusLine
+
+        val countersLine = TextView(this).apply {
+            text = "Pasta: DCIM/Camera/IFgestor • Sessão: 0 | Total: 0"
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        }
+        tvHeaderCounters = countersLine
+
+        headerTextCol.addView(title)
+        headerTextCol.addView(statusLine)
+        headerTextCol.addView(countersLine)
+        header.addView(headerTextCol)
+        root.addView(header)
+
+        // Barra de Navegacao das 3 Abas
+        val tabsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.parseColor("#0F172A"))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            weightSum = 3f
+        }
+
+        tabBtn0 = makeTabButton("📷 Controle", 0)
+        tabBtn1 = makeTabButton("🖼️ Galeria", 1)
+        tabBtn2 = makeTabButton("💻 Servidor & 2FA", 2)
+
+        tabsRow.addView(tabBtn0)
+        tabsRow.addView(SpaceView(dp(6), 1))
+        tabsRow.addView(tabBtn1)
+        tabsRow.addView(SpaceView(dp(6), 1))
+        tabsRow.addView(tabBtn2)
+        root.addView(tabsRow)
+
+        // Container Central das Abas
+        val frame = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
             )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                if (isServiceRunning) "PARAR SERVIÇO E SERVIDOR WEB"
-                else "INICIAR APENAS EM SEGUNDO PLANO",
-                fontWeight = FontWeight.Bold
-            )
+        }
+        contentContainer = frame
+        root.addView(frame)
+
+        // Central de Tarefas Paralelas e Recolhivel no Rodape (Item 10)
+        val drawer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardDrawable("#1E293B", "#38BDF8", 0, 1)
+            visibility = View.GONE
+        }
+        taskDrawerContainer = drawer
+
+        val drawerHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#0F2942"))
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setOnClickListener {
+                isTaskDrawerExpanded = !isTaskDrawerExpanded
+                taskDrawerListLayout?.visibility = if (isTaskDrawerExpanded) View.VISIBLE else View.GONE
+                tvTaskDrawerArrow?.text = if (isTaskDrawerExpanded) "▼ Recolher" else "▲ Expandir"
+            }
+        }
+
+        val drawerTitle = TextView(this).apply {
+            text = "🔄 Central de Tarefas (0 ativas)"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTypeface(typeface, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        tvTaskDrawerHeader = drawerTitle
+
+        val btnClearDone = TextView(this).apply {
+            text = "Limpar"
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            setOnClickListener {
+                SettingsManager.clearCompletedTasks()
+                refreshHeaderAndTaskDrawer()
+            }
+        }
+
+        val drawerArrow = TextView(this).apply {
+            text = "▲ Expandir"
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        tvTaskDrawerArrow = drawerArrow
+
+        drawerHeader.addView(drawerTitle)
+        drawerHeader.addView(btnClearDone)
+        drawerHeader.addView(SpaceView(dp(8), 1))
+        drawerHeader.addView(drawerArrow)
+        drawer.addView(drawerHeader)
+
+        val drawerList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        taskDrawerListLayout = drawerList
+        drawer.addView(drawerList)
+
+        root.addView(drawer)
+        return root
+    }
+
+    private fun makeTabButton(label: String, index: Int): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTypeface(typeface, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f)
+            setOnClickListener { switchTab(index) }
         }
     }
 
-    if (showAddPresetDialog) {
-        AlertDialog(
-            onDismissRequest = { showAddPresetDialog = false },
-            title = { Text("Nova Etiqueta de Prefixo") },
-            text = {
-                OutlinedTextField(
-                    value = newPresetText,
-                    onValueChange = { newPresetText = it },
-                    label = { Text("Ex: Carreta_ / Balsa_ / Lacre_") },
-                    singleLine = true
-                )
-            },
-            confirmButton = {
-                Button(onClick = {
-                    if (newPresetText.isNotBlank()) {
-                        SettingsManager.addQuickPreset(context, newPresetText)
-                        SettingsManager.setPrefix(context, newPresetText)
-                        notifyServiceConfigChanged(context, isServiceRunning)
-                    }
-                    showAddPresetDialog = false
-                }) {
-                    Text("Adicionar e Usar")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showAddPresetDialog = false }) {
-                    Text("Cancelar")
-                }
+    private fun switchTab(index: Int) {
+        currentTab = index
+        val buttons = listOf(tabBtn0, tabBtn1, tabBtn2)
+        buttons.forEachIndexed { idx, btn ->
+            val selected = (idx == index)
+            btn?.background = cardDrawable(
+                if (selected) "#0284C7" else "#1E293B",
+                if (selected) "#38BDF8" else "#334155",
+                10,
+                1
+            )
+            btn?.setTextColor(if (selected) Color.WHITE else Color.parseColor("#94A3B8"))
+        }
+        renderActiveTab()
+    }
+
+    private fun renderActiveTab() {
+        val container = contentContainer ?: return
+        container.removeAllViews()
+        refreshHeaderAndTaskDrawer()
+
+        val view = when (currentTab) {
+            0 -> buildTab0ControlAndCamera()
+            1 -> buildTab1SandboxGallery()
+            else -> buildTab2ServerSecurityAndAudit()
+        }
+        container.addView(view)
+    }
+
+    private fun refreshHeaderAndTaskDrawer() {
+        val camOn = SettingsManager.isCameraInterceptorEnabled(this)
+        val webOn = SettingsManager.isWebServerEnabled(this)
+        val domain = SettingsManager.getActiveMdnsDomain(this)
+        val port = SettingsManager.getServerPort(this)
+        val scheme = if (SettingsManager.isHttpsEnabled(this)) "https" else "http"
+
+        val statusStr = buildString {
+            append(if (camOn) "🟢 Câmera: ATIVA" else "⚪ Câmera: OFF")
+            append("  •  ")
+            if (webOn) {
+                append("🌐 Web: $scheme://$domain:$port")
+            } else {
+                append("🌐 Web: OFF")
             }
+        }
+        tvHeaderStatus?.text = statusStr
+        tvHeaderStatus?.setTextColor(
+            Color.parseColor(if (camOn || webOn) "#10B981" else "#94A3B8")
         )
-    }
-}
 
-@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
-@Composable
-fun LocalFolderExplorerTabScreen() {
-    val context = LocalContext.current
-    val rootPath = remember { SettingsManager.getStorageRootPath() }
-    val activeFolderPath by SettingsManager.activeFolderPath.collectAsState()
+        val displayPath = SettingsManager.getSandboxDisplayPath(this)
+        val sessCount = SettingsManager.getSessionInterceptCount(this)
+        val totalCount = SettingsManager.getFolderMediaCount(this)
+        tvHeaderCounters?.text = "Pasta: $displayPath  •  Sessão: $sessCount | Pasta: $totalCount"
 
-    var currentDir by remember {
-        val initial = File(SettingsManager.getTargetFolderPath(context))
-        if (!initial.exists()) initial.mkdirs()
-        mutableStateOf(if (initial.exists() && initial.isDirectory) initial else File(rootPath))
-    }
+        // Atualiza a Central de Tarefas Recolhivel
+        val tasks = SettingsManager.getTasksSnapshot()
+        val drawer = taskDrawerContainer ?: return
+        val listLayout = taskDrawerListLayout ?: return
 
-    var allItems by remember { mutableStateOf<List<File>>(emptyList()) }
-    var searchQuery by remember { mutableStateOf("") }
-    var categoryFilter by remember { mutableStateOf("all") }
-    var gridColumns by remember { mutableStateOf(3) }
-
-    var selectedPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
-    val isSelectionMode = selectedPaths.isNotEmpty()
-
-    // Etapa 1 de Criacao de Pasta
-    var showNewFolderDialog by remember { mutableStateOf(false) }
-    var newFolderName by remember { mutableStateOf("") }
-
-    // Menu de Acoes de Item e Etapa 1 de Renomeacao
-    var selectedFileForAction by remember { mutableStateOf<File?>(null) }
-    var showRenameDialog by remember { mutableStateOf(false) }
-    var renameInput by remember { mutableStateOf("") }
-
-    // Etapa 1 de Movimentacao Livre entre Pastas
-    var showMoveFolderPicker by remember { mutableStateOf(false) }
-    var itemsPendingMoveSelection by remember { mutableStateOf<List<File>>(emptyList()) }
-
-    // Etapa 2: Confirmacao Explicita Obrigatoria antes da execucao definitiva
-    var pendingOperation by remember { mutableStateOf<PendingMobileOperation?>(null) }
-
-    var fullScreenMediaIndex by remember { mutableStateOf<Int?>(null) }
-
-    fun refreshDirectory(dir: File) {
-        if (!dir.exists()) dir.mkdirs()
-        currentDir = dir
-        selectedPaths = emptySet()
-        val children = dir.listFiles()?.toList() ?: emptyList()
-        allItems = children
-            .filter { !it.name.startsWith(".") }
-            .sortedWith(compareByDescending<File> { it.isDirectory }.thenByDescending { it.lastModified() })
-    }
-
-    LaunchedEffect(currentDir) {
-        refreshDirectory(currentDir)
-    }
-
-    val filteredItems = remember(allItems, searchQuery, categoryFilter) {
-        allItems.filter { file ->
-            val matchQuery = searchQuery.isBlank() || file.name.contains(searchQuery.trim(), ignoreCase = true)
-            val matchCat = when (categoryFilter) {
-                "image" -> !file.isDirectory && isImageFileName(file.name)
-                "video" -> !file.isDirectory && isVideoFileName(file.name)
-                "folder" -> file.isDirectory
-                else -> true
-            }
-            matchQuery && matchCat
+        if (tasks.isEmpty()) {
+            drawer.visibility = View.GONE
+            return
         }
-    }
 
-    val mediaOnlyList = remember(filteredItems) {
-        filteredItems.filter { !it.isDirectory && (isImageFileName(it.name) || isVideoFileName(it.name)) }
-    }
-
-    fun toggleSelect(path: String) {
-        selectedPaths = if (selectedPaths.contains(path)) {
-            selectedPaths - path
+        drawer.visibility = View.VISIBLE
+        val runningCount = tasks.count { it.status == "RUNNING" }
+        val avgProgress = if (runningCount > 0) {
+            tasks.filter { it.status == "RUNNING" }.map { it.progressPercent }.average().toInt()
         } else {
-            selectedPaths + path
-        }
-    }
-
-    Box(modifier = Modifier.fillMaxSize()) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Buscar em ${currentDir.name.ifEmpty { "Memória" }}...", fontSize = 13.sp) },
-                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-                    trailingIcon = if (searchQuery.isNotEmpty()) {
-                        {
-                            IconButton(onClick = { searchQuery = "" }) {
-                                Icon(Icons.Default.Clear, contentDescription = "Limpar")
-                            }
-                        }
-                    } else null,
-                    singleLine = true,
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.weight(1f)
-                )
-
-                FilledTonalIconButton(
-                    onClick = {
-                        gridColumns = when (gridColumns) {
-                            3 -> 2
-                            2 -> 4
-                            4 -> 1
-                            else -> 3
-                        }
-                    }
-                ) {
-                    Icon(
-                        imageVector = if (gridColumns == 1) Icons.Default.ViewList else Icons.Default.GridView,
-                        contentDescription = "Alternar visualização"
-                    )
-                }
-            }
-
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    BreadcrumbBar(
-                        rootPath = rootPath,
-                        currentDir = currentDir,
-                        onNavigate = { refreshDirectory(it) }
-                    )
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        val canGoUp = currentDir.absolutePath != rootPath && currentDir.parentFile != null
-                        OutlinedButton(
-                            onClick = { currentDir.parentFile?.let { refreshDirectory(it) } },
-                            enabled = canGoUp,
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Default.ArrowUpward, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Acima", fontSize = 12.sp)
-                        }
-
-                        OutlinedButton(
-                            onClick = {
-                                newFolderName = ""
-                                showNewFolderDialog = true
-                            },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Nova Pasta", fontSize = 12.sp)
-                        }
-
-                        val isCurrentTarget = activeFolderPath == currentDir.absolutePath
-                        Button(
-                            onClick = {
-                                SettingsManager.setTargetFolderPath(context, currentDir.absolutePath)
-                                notifyServiceConfigChanged(context, SettingsManager.isServiceRunning.value)
-                                Toast.makeText(context, "Definida como destino da câmera!", Toast.LENGTH_SHORT).show()
-                            },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isCurrentTarget) Color(0xFF10B981) else MaterialTheme.colorScheme.primary
-                            ),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                            modifier = Modifier.weight(1.3f)
-                        ) {
-                            Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                if (isCurrentTarget) "Pasta Ativa" else "Usar na Câmera",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-                }
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                FilterChip(
-                    selected = categoryFilter == "all",
-                    onClick = { categoryFilter = "all" },
-                    label = { Text("Todos (${allItems.size})") }
-                )
-                FilterChip(
-                    selected = categoryFilter == "image",
-                    onClick = { categoryFilter = "image" },
-                    label = { Text("Fotos (${allItems.count { !it.isDirectory && isImageFileName(it.name) }})") }
-                )
-                FilterChip(
-                    selected = categoryFilter == "video",
-                    onClick = { categoryFilter = "video" },
-                    label = { Text("Vídeos (${allItems.count { !it.isDirectory && isVideoFileName(it.name) }})") }
-                )
-                FilterChip(
-                    selected = categoryFilter == "folder",
-                    onClick = { categoryFilter = "folder" },
-                    label = { Text("Pastas (${allItems.count { it.isDirectory }})") }
-                )
-
-                if (filteredItems.isNotEmpty()) {
-                    AssistChip(
-                        onClick = {
-                            selectedPaths = if (selectedPaths.size == filteredItems.size) {
-                                emptySet()
-                            } else {
-                                filteredItems.map { it.absolutePath }.toSet()
-                            }
-                        },
-                        label = {
-                            Text(if (selectedPaths.size == filteredItems.size) "Desmarcar" else "Selecionar Tudo")
-                        }
-                    )
-                }
-            }
-
-            if (filteredItems.isEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            Icons.Default.PhotoLibrary,
-                            contentDescription = null,
-                            modifier = Modifier.size(48.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            "Nenhum arquivo ou pasta encontrado neste local.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            } else if (gridColumns == 1) {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    contentPadding = PaddingValues(bottom = if (isSelectionMode) 84.dp else 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(filteredItems, key = { it.absolutePath }) { item ->
-                        val isSelected = selectedPaths.contains(item.absolutePath)
-                        ExplorerListItemCard(
-                            file = item,
-                            isSelected = isSelected,
-                            onClick = {
-                                if (isSelectionMode) {
-                                    toggleSelect(item.absolutePath)
-                                } else if (item.isDirectory) {
-                                    refreshDirectory(item)
-                                } else {
-                                    val mIdx = mediaOnlyList.indexOfFirst { it.absolutePath == item.absolutePath }
-                                    if (mIdx >= 0) fullScreenMediaIndex = mIdx
-                                    else selectedFileForAction = item
-                                }
-                            },
-                            onLongClick = { toggleSelect(item.absolutePath) },
-                            onMoreClick = { selectedFileForAction = item }
-                        )
-                    }
-                }
-            } else {
-                LazyVerticalGrid(
-                    columns = GridCells.Fixed(gridColumns),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    contentPadding = PaddingValues(bottom = if (isSelectionMode) 84.dp else 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(filteredItems, key = { it.absolutePath }) { item ->
-                        val isSelected = selectedPaths.contains(item.absolutePath)
-                        ExplorerGridItemCard(
-                            file = item,
-                            isSelected = isSelected,
-                            onClick = {
-                                if (isSelectionMode) {
-                                    toggleSelect(item.absolutePath)
-                                } else if (item.isDirectory) {
-                                    refreshDirectory(item)
-                                } else {
-                                    val mIdx = mediaOnlyList.indexOfFirst { it.absolutePath == item.absolutePath }
-                                    if (mIdx >= 0) fullScreenMediaIndex = mIdx
-                                    else selectedFileForAction = item
-                                }
-                            },
-                            onLongClick = { toggleSelect(item.absolutePath) },
-                            onToggleCheck = { toggleSelect(item.absolutePath) }
-                        )
-                    }
-                }
-            }
+            100
         }
 
-        // Barra Flutuante Inferior de Acoes em Lote (Com Seletor Livre de Pasta e Confirmacao)
-        if (isSelectionMode) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFF0F2942),
-                    contentColor = Color.White
-                ),
-                shape = RoundedCornerShape(18.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 10.dp),
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .padding(14.dp)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        "${selectedPaths.size} selecionado(s)",
-                        fontWeight = FontWeight.ExtraBold,
-                        fontSize = 14.sp,
-                        color = Color(0xFF38BDF8)
-                    )
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        FilledTonalButton(
-                            onClick = {
-                                itemsPendingMoveSelection = selectedPaths.map { File(it) }.filter { it.exists() }
-                                if (itemsPendingMoveSelection.isNotEmpty()) {
-                                    showMoveFolderPicker = true
-                                }
-                            },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                        ) {
-                            Icon(Icons.Default.DriveFileMove, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Mover", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        }
-
-                        Button(
-                            onClick = {
-                                val targets = selectedPaths.map { File(it) }.filter { it.exists() }
-                                if (targets.isNotEmpty()) {
-                                    pendingOperation = PendingMobileOperation.DeleteItems(targets, fromFullScreen = false)
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                        ) {
-                            Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Excluir", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        }
-
-                        IconButton(onClick = { selectedPaths = emptySet() }) {
-                            Icon(Icons.Default.Close, contentDescription = "Cancelar seleção", tint = Color.White)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Visualizador de Fotos em Tela Cheia dentro do App
-    if (fullScreenMediaIndex != null && mediaOnlyList.isNotEmpty()) {
-        val safeIdx = fullScreenMediaIndex!!.coerceIn(0, mediaOnlyList.size - 1)
-        val currentMediaFile = mediaOnlyList[safeIdx]
-
-        FullScreenMediaDialog(
-            file = currentMediaFile,
-            index = safeIdx,
-            total = mediaOnlyList.size,
-            onPrev = {
-                fullScreenMediaIndex = (safeIdx - 1 + mediaOnlyList.size) % mediaOnlyList.size
-            },
-            onNext = {
-                fullScreenMediaIndex = (safeIdx + 1) % mediaOnlyList.size
-            },
-            onMoveRequest = {
-                itemsPendingMoveSelection = listOf(currentMediaFile)
-                showMoveFolderPicker = true
-            },
-            onRenameRequest = {
-                selectedFileForAction = currentMediaFile
-                renameInput = currentMediaFile.name
-                showRenameDialog = true
-            },
-            onDeleteRequest = {
-                pendingOperation = PendingMobileOperation.DeleteItems(
-                    targets = listOf(currentMediaFile),
-                    fromFullScreen = true
-                )
-            },
-            onDismiss = { fullScreenMediaIndex = null }
-        )
-    }
-
-    // Etapa 1: Digitar nome da Nova Pasta -> Avanca para Etapa 2 de Confirmacao
-    if (showNewFolderDialog) {
-        AlertDialog(
-            onDismissRequest = { showNewFolderDialog = false },
-            title = { Text("Criar Nova Pasta (Etapa 1/2)") },
-            text = {
-                OutlinedTextField(
-                    value = newFolderName,
-                    onValueChange = { newFolderName = it },
-                    label = { Text("Nome da nova pasta") },
-                    singleLine = true
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val cleanName = newFolderName.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                        if (cleanName.isNotEmpty()) {
-                            showNewFolderDialog = false
-                            pendingOperation = PendingMobileOperation.CreateFolder(currentDir, cleanName)
-                        }
-                    }
-                ) {
-                    Text("Avançar para Confirmação")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showNewFolderDialog = false }) {
-                    Text("Cancelar")
-                }
-            }
-        )
-    }
-
-    // Menu de Opcoes para um Item Individual
-    selectedFileForAction?.let { item ->
-        if (!showRenameDialog) {
-            AlertDialog(
-                onDismissRequest = { selectedFileForAction = null },
-                title = { Text(item.name, maxLines = 2, overflow = TextOverflow.Ellipsis) },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (item.isDirectory) {
-                            Button(
-                                onClick = {
-                                    SettingsManager.setTargetFolderPath(context, item.absolutePath)
-                                    notifyServiceConfigChanged(context, SettingsManager.isServiceRunning.value)
-                                    selectedFileForAction = null
-                                    Toast.makeText(context, "Definida como pasta da câmera!", Toast.LENGTH_SHORT).show()
-                                },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("USAR ESTA PASTA NA CÂMERA")
-                            }
-                        }
-
-                        OutlinedButton(
-                            onClick = {
-                                val target = item
-                                selectedFileForAction = null
-                                itemsPendingMoveSelection = listOf(target)
-                                showMoveFolderPicker = true
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(Icons.Default.DriveFileMove, contentDescription = null)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("MOVER PARA OUTRA PASTA")
-                        }
-
-                        OutlinedButton(
-                            onClick = {
-                                renameInput = item.name
-                                showRenameDialog = true
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(Icons.Default.Edit, contentDescription = null)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("RENOMEAR")
-                        }
-
-                        Button(
-                            onClick = {
-                                val target = item
-                                selectedFileForAction = null
-                                pendingOperation = PendingMobileOperation.DeleteItems(
-                                    targets = listOf(target),
-                                    fromFullScreen = false
-                                )
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Icon(Icons.Default.Delete, contentDescription = null)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("EXCLUIR DO CELULAR")
-                        }
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = { selectedFileForAction = null }) {
-                        Text("Fechar")
-                    }
-                }
-            )
-        }
-    }
-
-    // Etapa 1: Digitar Novo Nome -> Avanca para Etapa 2 de Confirmacao
-    if (showRenameDialog && selectedFileForAction != null) {
-        val target = selectedFileForAction!!
-        AlertDialog(
-            onDismissRequest = {
-                showRenameDialog = false
-                selectedFileForAction = null
-            },
-            title = { Text("Renomear Item (Etapa 1/2)") },
-            text = {
-                OutlinedTextField(
-                    value = renameInput,
-                    onValueChange = { renameInput = it },
-                    label = { Text("Novo nome") },
-                    singleLine = true
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val cleanName = renameInput.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                        showRenameDialog = false
-                        selectedFileForAction = null
-                        if (cleanName.isNotEmpty() && cleanName != target.name) {
-                            pendingOperation = PendingMobileOperation.RenameItem(target, cleanName)
-                        }
-                    }
-                ) {
-                    Text("Avançar para Confirmação")
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        showRenameDialog = false
-                        selectedFileForAction = null
-                    }
-                ) {
-                    Text("Cancelar")
-                }
-            }
-        )
-    }
-
-    // Etapa 1: Seletor Livre de Pasta para Mover Arquivos -> Avanca para Etapa 2 de Confirmacao
-    if (showMoveFolderPicker && itemsPendingMoveSelection.isNotEmpty()) {
-        MoveDestinationPickerDialog(
-            rootPath = rootPath,
-            initialDir = currentDir,
-            itemCount = itemsPendingMoveSelection.size,
-            onDismiss = {
-                showMoveFolderPicker = false
-                itemsPendingMoveSelection = emptyList()
-            },
-            onDestinationSelected = { chosenDestDir ->
-                val listToMove = itemsPendingMoveSelection
-                showMoveFolderPicker = false
-                itemsPendingMoveSelection = emptyList()
-                pendingOperation = PendingMobileOperation.MoveItems(
-                    sources = listToMove,
-                    destinationDir = chosenDestDir
-                )
-            }
-        )
-    }
-
-    // Etapa 2 Universal: Dialogo de Confirmacao Definitiva para Todas as Operacoes Mobile
-    pendingOperation?.let { op ->
-        val (dialogTitle, dialogMessage, isDestructive) = when (op) {
-            is PendingMobileOperation.CreateFolder -> Triple(
-                "Confirmar Criação de Pasta (2/2)",
-                "Deseja criar definitivamente a nova pasta \"${op.folderName}\" dentro de:\n${SettingsManager.formatShortPath(op.parentDir.absolutePath)}?",
-                false
-            )
-            is PendingMobileOperation.RenameItem -> Triple(
-                "Confirmar Renomeação (2/2)",
-                "Deseja renomear definitivamente:\nDe: \"${op.targetFile.name}\"\nPara: \"${op.newName}\"?",
-                false
-            )
-            is PendingMobileOperation.MoveItems -> Triple(
-                "Confirmar Movimentação (2/2)",
-                "Deseja mover definitivamente ${op.sources.size} item(ns) selecionado(s) para a pasta:\n${SettingsManager.formatShortPath(op.destinationDir.absolutePath)}?",
-                false
-            )
-            is PendingMobileOperation.DeleteItems -> Triple(
-                "Confirmar Exclusão Permanente",
-                "Tem certeza que deseja excluir permanentemente ${op.targets.size} item(ns) do armazenamento do celular?\n\nEsta ação não pode ser desfeita.",
-                true
-            )
-        }
-
-        AlertDialog(
-            onDismissRequest = { pendingOperation = null },
-            icon = {
-                Icon(
-                    imageVector = if (isDestructive) Icons.Default.Warning else Icons.Default.VerifiedUser,
-                    contentDescription = null,
-                    tint = if (isDestructive) MaterialTheme.colorScheme.error else Color(0xFF10B981)
-                )
-            },
-            title = {
-                Text(dialogTitle, fontWeight = FontWeight.Bold)
-            },
-            text = {
-                Text(dialogMessage, style = MaterialTheme.typography.bodyMedium)
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        when (op) {
-                            is PendingMobileOperation.CreateFolder -> {
-                                val newDir = File(op.parentDir, op.folderName)
-                                if (newDir.mkdirs() || newDir.exists()) {
-                                    refreshDirectory(newDir)
-                                    Toast.makeText(context, "Pasta criada e aberta!", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                            is PendingMobileOperation.RenameItem -> {
-                                val newFile = File(op.targetFile.parentFile, op.newName)
-                                val oldPath = op.targetFile.absolutePath
-                                if (op.targetFile.renameTo(newFile)) {
-                                    if (activeFolderPath == oldPath) {
-                                        SettingsManager.setTargetFolderPath(context, newFile.absolutePath)
-                                    }
-                                    MediaScannerConnection.scanFile(
-                                        context,
-                                        arrayOf(oldPath, newFile.absolutePath),
-                                        null,
-                                        null
-                                    )
-                                    refreshDirectory(currentDir)
-                                    Toast.makeText(context, "Renomeado com sucesso!", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                            is PendingMobileOperation.MoveItems -> {
-                                var movedCount = 0
-                                val pathsToScan = mutableListOf<String>()
-                                op.sources.forEach { src ->
-                                    val oldPath = src.absolutePath
-                                    if (moveFileOrDirSafely(src, op.destinationDir, rootPath)) {
-                                        movedCount++
-                                        pathsToScan.add(oldPath)
-                                        pathsToScan.add(File(op.destinationDir, src.name).absolutePath)
-                                    }
-                                }
-                                if (pathsToScan.isNotEmpty()) {
-                                    MediaScannerConnection.scanFile(context, pathsToScan.toTypedArray(), null, null)
-                                }
-                                fullScreenMediaIndex = null
-                                refreshDirectory(currentDir)
-                                Toast.makeText(
-                                    context,
-                                    "$movedCount item(ns) movido(s) com sucesso!",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            }
-                            is PendingMobileOperation.DeleteItems -> {
-                                val deletedPaths = mutableListOf<String>()
-                                op.targets.forEach { target ->
-                                    if (target.absolutePath != rootPath) {
-                                        deletedPaths.add(target.absolutePath)
-                                        target.deleteRecursively()
-                                    }
-                                }
-                                if (deletedPaths.isNotEmpty()) {
-                                    MediaScannerConnection.scanFile(context, deletedPaths.toTypedArray(), null, null)
-                                }
-                                if (op.fromFullScreen) {
-                                    fullScreenMediaIndex = null
-                                }
-                                refreshDirectory(currentDir)
-                                Toast.makeText(
-                                    context,
-                                    "${deletedPaths.size} item(ns) excluído(s)!",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            }
-                        }
-                        pendingOperation = null
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isDestructive) MaterialTheme.colorScheme.error else Color(0xFF10B981),
-                        contentColor = Color.White
-                    )
-                ) {
-                    Text(
-                        if (isDestructive) "Confirmar Exclusão" else "Confirmar e Executar",
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            },
-            dismissButton = {
-                OutlinedButton(onClick = { pendingOperation = null }) {
-                    Text("Cancelar")
-                }
-            }
-        )
-    }
-}
-
-@Composable
-fun MoveDestinationPickerDialog(
-    rootPath: String,
-    initialDir: File,
-    itemCount: Int,
-    onDismiss: () -> Unit,
-    onDestinationSelected: (File) -> Unit
-) {
-    var browseDir by remember { mutableStateOf(initialDir) }
-    val subFolders = remember(browseDir.absolutePath) {
-        browseDir.listFiles()
-            ?.filter { it.isDirectory && !it.name.startsWith(".") }
-            ?.sortedBy { it.name.lowercase() }
-            ?: emptyList()
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Column {
-                Text("Mover $itemCount item(ns) (Etapa 1/2)", fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                Text(
-                    "Escolha a pasta de destino:",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "📂 ${SettingsManager.formatShortPath(browseDir.absolutePath)}",
-                        modifier = Modifier.padding(10.dp),
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-
-                if (browseDir.absolutePath != rootPath && browseDir.parentFile != null) {
-                    OutlinedButton(
-                        onClick = { browseDir.parentFile?.let { browseDir = it } },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Default.ArrowUpward, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Subir para Pasta Acima")
-                    }
-                }
-
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(210.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    if (subFolders.isEmpty()) {
-                        item {
-                            Text(
-                                "Nenhuma subpasta aqui. Toque em 'Mover para Cá' abaixo.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(8.dp)
-                            )
-                        }
-                    } else {
-                        items(subFolders, key = { it.absolutePath }) { folder ->
-                            Card(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { browseDir = folder }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    Icon(Icons.Default.Folder, contentDescription = null, tint = Color(0xFF0284C7))
-                                    Text(
-                                        folder.name,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.SemiBold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = { onDestinationSelected(browseDir) },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
-            ) {
-                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("Mover para Cá")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancelar")
-            }
-        }
-    )
-}
-
-@Composable
-fun BreadcrumbBar(
-    rootPath: String,
-    currentDir: File,
-    onNavigate: (File) -> Unit
-) {
-    val segments = remember(currentDir.absolutePath) {
-        val list = mutableListOf<Pair<String, File>>()
-        val rootFile = File(rootPath)
-        list.add("Memória" to rootFile)
-        if (currentDir.absolutePath.startsWith(rootPath) && currentDir.absolutePath != rootPath) {
-            val rel = currentDir.absolutePath.removePrefix(rootPath).trimStart('/')
-            val parts = rel.split("/").filter { it.isNotEmpty() }
-            var acc = rootFile
-            for (p in parts) {
-                acc = File(acc, p)
-                list.add(p to acc)
-            }
-        }
-        list
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        segments.forEachIndexed { index, pair ->
-            val isLast = index == segments.size - 1
-            Surface(
-                color = if (isLast) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
-                shape = RoundedCornerShape(8.dp),
-                modifier = Modifier.clickable { onNavigate(pair.second) }
-            ) {
-                Text(
-                    text = pair.first,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = if (isLast) FontWeight.ExtraBold else FontWeight.Medium,
-                    color = if (isLast) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.primary
-                )
-            }
-            if (!isLast) {
-                Text("›", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-fun ExplorerGridItemCard(
-    file: File,
-    isSelected: Boolean,
-    onClick: () -> Unit,
-    onLongClick: () -> Unit,
-    onToggleCheck: () -> Unit
-) {
-    Card(
-        shape = RoundedCornerShape(12.dp),
-        border = if (isSelected) BorderStroke(2.5.dp, Color(0xFF0284C7)) else null,
-        modifier = Modifier
-            .fillMaxWidth()
-            .combinedClickable(
-                onClick = onClick,
-                onLongClick = onLongClick
-            )
-    ) {
-        Column {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(1f)
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
-                contentAlignment = Alignment.Center
-            ) {
-                if (file.isDirectory) {
-                    val count = remember(file.absolutePath) { file.listFiles()?.size ?: 0 }
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            Icons.Default.Folder,
-                            contentDescription = null,
-                            modifier = Modifier.size(44.dp),
-                            tint = Color(0xFF0284C7)
-                        )
-                        Text(
-                            "$count itens",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                } else {
-                    MediaThumbnailImage(file = file, modifier = Modifier.fillMaxSize())
-                }
-
-                if (isVideoFileName(file.name)) {
-                    Surface(
-                        color = Color.Black.copy(alpha = 0.7f),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .padding(6.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                Icons.Default.PlayArrow,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(12.dp)
-                            )
-                            Text("VÍDEO", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
-                }
-
-                Surface(
-                    color = if (isSelected) Color(0xFF0284C7) else Color.Black.copy(alpha = 0.45f),
-                    shape = CircleShape,
-                    border = BorderStroke(1.5.dp, Color.White),
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(6.dp)
-                        .size(24.dp)
-                        .clickable { onToggleCheck() }
-                ) {
-                    if (isSelected) {
-                        Icon(
-                            Icons.Default.Check,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.padding(3.dp)
-                        )
-                    }
-                }
-            }
-
-            Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
-                Text(
-                    text = file.name,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-fun ExplorerListItemCard(
-    file: File,
-    isSelected: Boolean,
-    onClick: () -> Unit,
-    onLongClick: () -> Unit,
-    onMoreClick: () -> Unit
-) {
-    val dateFormat = remember { SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()) }
-
-    Card(
-        shape = RoundedCornerShape(12.dp),
-        border = if (isSelected) BorderStroke(2.dp, Color(0xFF0284C7)) else null,
-        modifier = Modifier
-            .fillMaxWidth()
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(54.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
-                contentAlignment = Alignment.Center
-            ) {
-                if (file.isDirectory) {
-                    Icon(Icons.Default.Folder, contentDescription = null, tint = Color(0xFF0284C7), modifier = Modifier.size(32.dp))
-                } else {
-                    MediaThumbnailImage(file = file, modifier = Modifier.fillMaxSize())
-                }
-            }
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = file.name,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = if (file.isDirectory) "Pasta • ${dateFormat.format(Date(file.lastModified()))}"
-                    else "${formatFileSize(file.length())} • ${dateFormat.format(Date(file.lastModified()))}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
-            IconButton(onClick = onMoreClick) {
-                Icon(Icons.Default.MoreVert, contentDescription = "Mais opções")
-            }
-        }
-    }
-}
-
-@Composable
-fun MediaThumbnailImage(file: File, modifier: Modifier = Modifier) {
-    val key = "${file.absolutePath}_${file.lastModified()}"
-    var bitmap by remember(key) { mutableStateOf(LocalThumbnailCache.get(key)) }
-
-    LaunchedEffect(key) {
-        if (bitmap == null) {
-            val loaded = withContext(Dispatchers.IO) {
-                decodeThumbnailBitmap(file, 260)
-            }
-            if (loaded != null) {
-                val imgBmp = loaded.asImageBitmap()
-                LocalThumbnailCache.put(key, imgBmp)
-                bitmap = imgBmp
-            }
-        }
-    }
-
-    if (bitmap != null) {
-        Image(
-            bitmap = bitmap!!,
-            contentDescription = file.name,
-            contentScale = ContentScale.Crop,
-            modifier = modifier
-        )
-    } else {
-        Icon(
-            imageVector = if (isVideoFileName(file.name)) Icons.Default.Videocam else Icons.Default.Image,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(32.dp)
-        )
-    }
-}
-
-@Composable
-fun FullScreenMediaDialog(
-    file: File,
-    index: Int,
-    total: Int,
-    onPrev: () -> Unit,
-    onNext: () -> Unit,
-    onMoveRequest: () -> Unit,
-    onRenameRequest: () -> Unit,
-    onDeleteRequest: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    var highResBitmap by remember(file.absolutePath) { mutableStateOf<ImageBitmap?>(null) }
-
-    LaunchedEffect(file.absolutePath) {
-        highResBitmap = withContext(Dispatchers.IO) {
-            decodeThumbnailBitmap(file, 1280)?.asImageBitmap()
-        }
-    }
-
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
-    ) {
-        Surface(
-            modifier = Modifier.fillMaxSize(),
-            color = Color(0xFF050A14)
-        ) {
-            Column(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF0F172A))
-                        .padding(horizontal = 14.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "${index + 1} / $total",
-                            color = Color(0xFF38BDF8),
-                            fontWeight = FontWeight.ExtraBold,
-                            fontSize = 12.sp
-                        )
-                        Text(
-                            text = file.name,
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-
-                    Row {
-                        IconButton(onClick = onMoveRequest) {
-                            Icon(Icons.Default.DriveFileMove, contentDescription = "Mover", tint = Color.White)
-                        }
-                        IconButton(onClick = onRenameRequest) {
-                            Icon(Icons.Default.Edit, contentDescription = "Renomear", tint = Color.White)
-                        }
-                        IconButton(onClick = onDeleteRequest) {
-                            Icon(Icons.Default.Delete, contentDescription = "Excluir", tint = Color(0xFFF87171))
-                        }
-                        IconButton(onClick = onDismiss) {
-                            Icon(Icons.Default.Close, contentDescription = "Fechar", tint = Color.White)
-                        }
-                    }
-                }
-
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (highResBitmap != null) {
-                        Image(
-                            bitmap = highResBitmap!!,
-                            contentDescription = file.name,
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        CircularProgressIndicator(color = Color(0xFF38BDF8))
-                    }
-                }
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF0F172A))
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Button(
-                        onClick = onPrev,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B))
-                    ) {
-                        Icon(Icons.Default.NavigateBefore, contentDescription = null)
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Anterior")
-                    }
-
-                    Text(
-                        formatFileSize(file.length()),
-                        color = Color(0xFF94A3B8),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-
-                    Button(
-                        onClick = onNext,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
-                    ) {
-                        Text("Próximo")
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Icon(Icons.Default.NavigateNext, contentDescription = null)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun WebServerTabScreen() {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-
-    val isServiceRunning by SettingsManager.isServiceRunning.collectAsState()
-    val isWebServerRunning by SettingsManager.isWebServerRunning.collectAsState()
-    val active2faCode by SettingsManager.current2faCode.collectAsState()
-    val active2faIp by SettingsManager.current2faClientIp.collectAsState()
-    val active2faActionDesc by SettingsManager.current2faActionDesc.collectAsState()
-    val activeSessionsCount by SettingsManager.activeSessionsCount.collectAsState()
-
-    var authEnabled by remember { mutableStateOf(SettingsManager.isWebAuthEnabled(context)) }
-    var twoFactorEnabled by remember { mutableStateOf(SettingsManager.isTwoFactorEnabled(context)) }
-    var newPinInput by remember { mutableStateOf("") }
-    var hasCustomPin by remember { mutableStateOf(SettingsManager.hasCustomPin(context)) }
-
-    var ipAddress by remember { mutableStateOf(WebServerManager.getDeviceIpAddress(context)) }
-    val port = remember { SettingsManager.getServerPort(context) }
-    var isIgnoringBattery by remember { mutableStateOf(checkBatteryOptimizationIgnored(context)) }
-
-    val fullUrl = "http://$ipAddress:$port"
-
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                ipAddress = WebServerManager.getDeviceIpAddress(context)
-                isIgnoringBattery = checkBatteryOptimizationIgnored(context)
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        // Visor de Destaque do Codigo 2FA + Botao de Aprovacao com 1 Toque
-        Card(
-            colors = CardDefaults.cardColors(
-                containerColor = if (active2faCode != null)
-                    Color(0xFF064E3B)
-                else
-                    MaterialTheme.colorScheme.surface
-            ),
-            border = BorderStroke(
-                1.5.dp,
-                if (active2faCode != null) Color(0xFF10B981) else MaterialTheme.colorScheme.surfaceVariant
-            ),
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    text = if (active2faCode != null)
-                        "📲 AUTORIZAÇÃO 2FA SOLICITADA PELO PC"
-                    else
-                        "🛡️ VERIFICAÇÃO EM 2 ETAPAS (LOGIN E AÇÕES)",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = if (active2faCode != null) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurface
-                )
-
-                if (active2faActionDesc != null) {
-                    Surface(
-                        color = Color(0xFF0F2942),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Text(
-                            text = "Ação: $active2faActionDesc",
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                            color = Color(0xFF38BDF8),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            textAlign = TextAlign.Center
-                        )
-                    }
-                }
-
-                val displayDigits = (active2faCode ?: "------").toCharArray()
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    displayDigits.forEach { ch ->
-                        Surface(
-                            color = MaterialTheme.colorScheme.background,
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, Color(0xFF0284C7))
-                        ) {
-                            Text(
-                                text = ch.toString(),
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                fontSize = 22.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                color = Color(0xFF38BDF8)
-                            )
-                        }
-                    }
-                }
-
-                if (active2faCode != null) {
-                    Button(
-                        onClick = {
-                            SettingsManager.approvePendingTwoFactor()
-                            Toast.makeText(
-                                context,
-                                "✓ Operação autorizada imediatamente no PC!",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF10B981),
-                            contentColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Default.CheckCircle, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("APROVAR OPERAÇÃO AGORA (1 TOQUE)", fontWeight = FontWeight.ExtraBold)
-                    }
-                }
-
-                Text(
-                    text = if (active2faCode != null)
-                        "Origem: $active2faIp • Aprove no botão acima, na notificação ou digite o código no PC."
-                    else
-                        "Qualquer login, criação de pasta, envio, movimentação, renomeação ou exclusão no PC pedirá sua autorização aqui.",
-                    style = MaterialTheme.typography.bodySmall,
-                    textAlign = TextAlign.Center,
-                    color = if (active2faCode != null) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-
-        Card(
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(
-                1.5.dp,
-                if (isWebServerRunning) Color(0xFF10B981) else MaterialTheme.colorScheme.surfaceVariant
-            ),
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (isWebServerRunning) "SERVIDOR WEB ONLINE" else "SERVIDOR WEB PARADO",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = if (isWebServerRunning) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurface
-                    )
-                    IconButton(onClick = {
-                        ipAddress = WebServerManager.getDeviceIpAddress(context)
-                        Toast.makeText(context, "IP atualizado!", Toast.LENGTH_SHORT).show()
-                    }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Atualizar IP")
-                    }
-                }
-
-                Surface(
-                    color = MaterialTheme.colorScheme.background,
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = fullUrl,
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = Color(0xFF0284C7)
-                        )
-                        FilledTonalButton(
-                            onClick = {
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                clipboard.setPrimaryClip(ClipData.newPlainText("URL IFGestor", fullUrl))
-                                Toast.makeText(context, "Endereço copiado!", Toast.LENGTH_SHORT).show()
-                            }
-                        ) {
-                            Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Copiar")
-                        }
-                    }
-                }
-
-                Button(
-                    onClick = {
-                        if (isServiceRunning && isWebServerRunning) {
-                            val stopIntent = Intent(context, MediaInterceptorService::class.java).apply {
-                                action = MediaInterceptorService.ACTION_STOP
-                            }
-                            context.startService(stopIntent)
-                        } else {
-                            SettingsManager.setWebServerEnabled(context, true)
-                            startInterceptorServiceOnly(context)
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isWebServerRunning) MaterialTheme.colorScheme.error else Color(0xFF10B981),
-                        contentColor = Color.White
-                    ),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(52.dp)
-                ) {
-                    Text(
-                        if (isWebServerRunning) "DESLIGAR SERVIDOR WEB"
-                        else "ATIVAR SERVIDOR WEB EM SEGUNDO PLANO",
-                        fontWeight = FontWeight.ExtraBold
-                    )
-                }
-            }
-        }
-
-        Card(
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(Icons.Default.Lock, contentDescription = null, tint = Color(0xFF0284C7))
-                    Text(
-                        "Segurança Corporativa (PIN + 2FA)",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Solicitar PIN no navegador do PC", fontWeight = FontWeight.SemiBold)
-                        Text(
-                            if (hasCustomPin) "PIN personalizado ativo (SHA-256)" else "PIN padrão inicial: 1234",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(
-                        checked = authEnabled,
-                        onCheckedChange = {
-                            authEnabled = it
-                            SettingsManager.setWebAuthEnabled(context, it)
-                        }
-                    )
-                }
-
-                if (authEnabled) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Verificação 2FA no Login Inicial", fontWeight = FontWeight.SemiBold)
-                            Text(
-                                "As operações de arquivo sempre exigem autorização 2FA",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Switch(
-                            checked = twoFactorEnabled,
-                            onCheckedChange = {
-                                twoFactorEnabled = it
-                                SettingsManager.setTwoFactorEnabled(context, it)
-                            }
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        OutlinedTextField(
-                            value = newPinInput,
-                            onValueChange = { newPinInput = it },
-                            label = { Text("Alterar PIN (mín. 4 dígitos)") },
-                            visualTransformation = PasswordVisualTransformation(),
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f)
-                        )
-                        Button(
-                            onClick = {
-                                if (newPinInput.trim().length < 4) {
-                                    Toast.makeText(context, "Mínimo de 4 dígitos.", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    SettingsManager.setWebPin(context, newPinInput)
-                                    hasCustomPin = true
-                                    newPinInput = ""
-                                    WebServerManager.disconnectAllSessions()
-                                    Toast.makeText(context, "Novo PIN salvo!", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                        ) {
-                            Text("Salvar")
-                        }
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            "Computadores autenticados: $activeSessionsCount",
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        OutlinedButton(
-                            onClick = {
-                                WebServerManager.disconnectAllSessions()
-                                Toast.makeText(context, "Sessões encerradas!", Toast.LENGTH_SHORT).show()
-                            }
-                        ) {
-                            Text("Desconectar Todos")
-                        }
-                    }
-                }
-            }
-        }
-
-        Card(
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    "Operação Contínua com Tela Apagada",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    if (isIgnoringBattery)
-                        "✅ Proteção de energia ativa! O servidor permanece acessível pelo PC mesmo com a tela bloqueada."
-                    else
-                        "⚠️ Desative a restrição de bateria para impedir que o Android desligue o Wi-Fi quando a tela apagar.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                if (!isIgnoringBattery) {
-                    Button(
-                        onClick = { requestIgnoreBatteryOptimization(context) },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("MANTER ATIVO COM A TELA APAGADA")
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun moveFileOrDirSafely(source: File, destDir: File, rootPath: String): Boolean {
-    if (!source.exists() || source.absolutePath == rootPath) return false
-    if (!destDir.exists()) destDir.mkdirs()
-    val targetFile = File(destDir, source.name)
-    if (source.canonicalPath == targetFile.canonicalPath) return false
-    if (source.isDirectory && targetFile.canonicalPath.startsWith(source.canonicalPath + File.separator)) {
-        return false
-    }
-    return if (source.renameTo(targetFile)) {
-        true
-    } else {
-        try {
-            if (source.isDirectory) {
-                source.copyRecursively(targetFile, overwrite = true)
-                source.deleteRecursively()
-            } else {
-                source.copyTo(targetFile, overwrite = true)
-                source.delete()
-            }
-            true
-        } catch (_: Exception) {
-            false
-        }
-    }
-}
-
-private fun decodeThumbnailBitmap(file: File, targetSizePx: Int): Bitmap? {
-    return try {
-        if (isVideoFileName(file.name)) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ThumbnailUtils.createVideoThumbnail(file, android.util.Size(targetSizePx, targetSizePx), null)
-            } else {
-                val retriever = MediaMetadataRetriever()
-                retriever.setDataSource(file.absolutePath)
-                val frame = retriever.frameAtTime
-                retriever.release()
-                frame
-            }
-        } else if (isImageFileName(file.name)) {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(file.absolutePath, bounds)
-            var sampleSize = 1
-            while (bounds.outWidth / sampleSize > targetSizePx * 2 ||
-                bounds.outHeight / sampleSize > targetSizePx * 2
-            ) {
-                sampleSize *= 2
-            }
-            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            BitmapFactory.decodeFile(file.absolutePath, decodeOpts)
+        tvTaskDrawerHeader?.text = if (runningCount > 0) {
+            "🔄 $runningCount ação(ões) ativa(s) • $avgProgress%"
         } else {
-            null
+            "✅ ${tasks.size} operação(ões) recente(s) concluída(s)"
         }
-    } catch (_: Exception) {
-        null
-    }
-}
 
-private fun isImageFileName(name: String): Boolean {
-    val low = name.lowercase()
-    return low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".png") || low.endsWith(".webp")
-}
-
-private fun isVideoFileName(name: String): Boolean {
-    val low = name.lowercase()
-    return low.endsWith(".mp4") || low.endsWith(".mov") || low.endsWith(".mkv") || low.endsWith(".3gp")
-}
-
-private fun formatFileSize(bytes: Long): String {
-    if (bytes < 1024) return "$bytes B"
-    val kb = bytes / 1024.0
-    if (kb < 1024) return String.format(Locale.US, "%.1f KB", kb)
-    val mb = kb / 1024.0
-    return String.format(Locale.US, "%.2f MB", mb)
-}
-
-private fun checkStoragePermission(): Boolean {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        Environment.isExternalStorageManager()
-    } else {
-        true
-    }
-}
-
-private fun checkOverlayPermission(context: Context): Boolean {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-        Settings.canDrawOverlays(context)
-    } else {
-        true
-    }
-}
-
-private fun checkBatteryOptimizationIgnored(context: Context): Boolean {
-    val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-    return pm.isIgnoringBatteryOptimizations(context.packageName)
-}
-
-private fun requestIgnoreBatteryOptimization(context: Context) {
-    try {
-        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-            data = Uri.parse("package:${context.packageName}")
-        }
-        context.startActivity(intent)
-    } catch (e: Exception) {
-        val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-        context.startActivity(intent)
-    }
-}
-
-private fun requestAllFilesPermission(context: Context) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        try {
-            val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                data = Uri.parse("package:${context.packageName}")
+        listLayout.removeAllViews()
+        for (t in tasks.take(6)) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = cardDrawable("#0F172A", "#334155", 8, 1)
+                setPadding(dp(10), dp(6), dp(10), dp(6))
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(6) }
             }
-            context.startActivity(intent)
+
+            val topLine = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            val tTitle = TextView(this).apply {
+                text = t.title
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTypeface(typeface, Typeface.BOLD)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            val tPct = TextView(this).apply {
+                text = "${t.progressPercent}%"
+                setTextColor(Color.parseColor("#38BDF8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTypeface(typeface, Typeface.BOLD)
+            }
+            topLine.addView(tTitle)
+            topLine.addView(tPct)
+
+            val tSub = TextView(this).apply {
+                text = t.subtitle
+                setTextColor(Color.parseColor("#94A3B8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            }
+
+            val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                max = 100
+                progress = t.progressPercent
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(8)
+                ).apply { topMargin = dp(4) }
+            }
+
+            row.addView(topLine)
+            row.addView(tSub)
+            row.addView(bar)
+            listLayout.addView(row)
+        }
+    }
+
+    // =========================================================================
+    // 2. ABA 1: MOTORES INDEPENDENTES, SANDBOX, PREFIXO E WIDGETS (ITENS 12-15)
+    // =========================================================================
+
+    private fun buildTab0ControlAndCamera(): View {
+        val scroll = ScrollView(this)
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(24))
+        }
+        scroll.addView(col)
+
+        // Card 1: Acionamento Individual dos Motores (Item 12)
+        val enginesCard = makeSectionCard("⚡ Motores Independentes (Câmera & Site Web)")
+
+        val camActive = SettingsManager.isCameraInterceptorEnabled(this)
+        val webActive = SettingsManager.isWebServerEnabled(this)
+
+        val btnToggleCameraEngine = makePrimaryButton(
+            if (camActive) "🟢 Interceptador de Fotos: ATIVO (Toque p/ Parar)"
+            else "⚪ Iniciar Interceptação de Fotos",
+            if (camActive) "#059669" else "#1E293B",
+            "#10B981"
+        ) {
+            val next = !SettingsManager.isCameraInterceptorEnabled(this)
+            SettingsManager.setCameraInterceptorEnabled(this, next)
+            val svc = Intent(this, MediaInterceptorService::class.java).apply {
+                action = if (next) {
+                    MediaInterceptorService.ACTION_START_CAMERA_INTERCEPTOR
+                } else {
+                    MediaInterceptorService.ACTION_STOP_CAMERA_INTERCEPTOR
+                }
+            }
+            startServiceCompat(svc)
+            renderActiveTab()
+        }
+        enginesCard.addView(btnToggleCameraEngine)
+
+        enginesCard.addView(SpaceView(1, dp(8)))
+
+        val btnLaunchCameraNow = makePrimaryButton(
+            "📷 Abrir Câmera Nativa + Interceptar Agora",
+            "#0284C7",
+            "#38BDF8"
+        ) {
+            startCameraWithInterceptor()
+        }
+        enginesCard.addView(btnLaunchCameraNow)
+
+        enginesCard.addView(SpaceView(1, dp(8)))
+
+        val btnToggleWebEngine = makePrimaryButton(
+            if (webActive) "🌐 Compartilhamento Web: ATIVO (${WebServerManager.getMdnsUrl(this)})"
+            else "🌐 Iniciar Compartilhamento via Site Web",
+            if (webActive) "#0369A1" else "#1E293B",
+            "#38BDF8"
+        ) {
+            toggleWebServerEngineWithPinCheck()
+        }
+        enginesCard.addView(btnToggleWebEngine)
+
+        col.addView(enginesCard)
+
+        // Card 2: Configuracao da Pasta Sandbox (DCIM/Camera/IFgestor) e Prefixo
+        val folderCard = makeSectionCard("📂 Destino na Sandbox & Contador Duplo")
+
+        val sandboxInfo = TextView(this).apply {
+            text = "Escopo Isolado: ${SettingsManager.getSandboxDisplayPath(this@MainActivity)}"
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 0, 0, dp(8))
+        }
+        folderCard.addView(sandboxInfo)
+
+        // Seletor Dropdown de Subpastas Existentes
+        val lblDropdown = makeFieldLabel("Trocar Subpasta Rápido (Lista Suspensa):")
+        folderCard.addView(lblDropdown)
+
+        val subfolders = SettingsManager.getSandboxSubfolders(this)
+        val currentSub = SettingsManager.getTargetSubfolder(this)
+        val spinnerLabels = subfolders.map { sub ->
+            val cnt = SettingsManager.getFolderMediaCount(this, sub)
+            if (sub.isEmpty()) "📁 IFgestor (Raiz Principal) • $cnt arq."
+            else "📁 $sub • $cnt arq."
+        }
+
+        val folderSpinner = Spinner(this).apply {
+            background = cardDrawable("#0F172A", "#334155", 10, 1)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                spinnerLabels
+            )
+            val currentIdx = subfolders.indexOf(currentSub).coerceAtLeast(0)
+            setSelection(currentIdx, false)
+        }
+        folderCard.addView(folderSpinner)
+
+        folderCard.addView(SpaceView(1, dp(8)))
+
+        val etSubfolder = makeInputEdit(
+            hint = "Subpasta personalizada (vazio = Raiz IFgestor)",
+            initial = currentSub
+        )
+        folderCard.addView(makeFieldLabel("Ou digite nova Subpasta em DCIM/Camera/IFgestor:"))
+        folderCard.addView(etSubfolder)
+
+        folderSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                (view as? TextView)?.setTextColor(Color.WHITE)
+                val chosen = subfolders.getOrElse(pos) { "" }
+                if (chosen != SettingsManager.getTargetSubfolder(this@MainActivity)) {
+                    SettingsManager.setTargetSubfolder(this@MainActivity, chosen)
+                    etSubfolder.setText(chosen)
+                    FloatingOverlayManager.refresh(this@MainActivity)
+                    refreshHeaderAndTaskDrawer()
+                }
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+
+        folderCard.addView(SpaceView(1, dp(8)))
+
+        val etPrefix = makeInputEdit(
+            hint = "Prefixo dos arquivos (ex: Vistoria_)",
+            initial = SettingsManager.getFilePrefix(this)
+        )
+        folderCard.addView(makeFieldLabel("Prefixo Automático das Fotos/Vídeos:"))
+        folderCard.addView(etPrefix)
+
+        folderCard.addView(SpaceView(1, dp(10)))
+
+        val saveRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+        }
+
+        val btnSaveFolderPrefix = makePrimaryButton("💾 Salvar Pasta & Prefixo", "#0284C7", "#38BDF8") {
+            SettingsManager.setTargetSubfolder(this, etSubfolder.text?.toString() ?: "")
+            SettingsManager.setFilePrefix(this, etPrefix.text?.toString() ?: "IFG_")
+            FloatingOverlayManager.refresh(this)
+            IFGestorHomeWidget.requestWidgetUpdate(this)
+            Toast.makeText(
+                this,
+                "Salvo: ${SettingsManager.getSandboxDisplayPath(this)} (${SettingsManager.getFilePrefix(this)})",
+                Toast.LENGTH_SHORT
+            ).show()
+            renderActiveTab()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(4) }
+        }
+
+        val btnResetSession = makePrimaryButton(
+            "🔄 Zerar Sessão (${SettingsManager.getSessionInterceptCount(this)})",
+            "#334155",
+            "#475569"
+        ) {
+            SettingsManager.resetSessionInterceptCount(this)
+            FloatingOverlayManager.refresh(this)
+            renderActiveTab()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(4) }
+        }
+
+        saveRow.addView(btnSaveFolderPrefix)
+        saveRow.addView(btnResetSession)
+        folderCard.addView(saveRow)
+        col.addView(folderCard)
+
+        // Card 3: Widget Flutuante, Botao Volume (-) e Permissoes
+        val optionsCard = makeSectionCard("🎛️ Widgets & Atalhos de Operação")
+
+        val swFloating = Switch(this).apply {
+            text = "Exibir Ícone Flutuante (Dropdown + Contador Duplo) sobre a câmera"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            isChecked = SettingsManager.isFloatingWidgetEnabled(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                if (checked && !Settings.canDrawOverlays(this@MainActivity)) {
+                    requestOverlayPermission()
+                    isChecked = false
+                    return@setOnCheckedChangeListener
+                }
+                SettingsManager.setFloatingWidgetEnabled(this@MainActivity, checked)
+                if (checked && SettingsManager.isCameraInterceptorEnabled(this@MainActivity)) {
+                    FloatingOverlayManager.show(this@MainActivity)
+                } else {
+                    FloatingOverlayManager.hide()
+                }
+            }
+        }
+        optionsCard.addView(swFloating)
+
+        optionsCard.addView(SpaceView(1, dp(8)))
+
+        val swVol = Switch(this).apply {
+            text = "Atalho Botão Físico Volume (-) para abrir câmera no app"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            isChecked = SettingsManager.isVolumeShutterEnabled(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                SettingsManager.setVolumeShutterEnabled(this@MainActivity, checked)
+            }
+        }
+        optionsCard.addView(swVol)
+
+        optionsCard.addView(SpaceView(1, dp(10)))
+
+        val btnPermissions = makePrimaryButton(
+            "🛡️ Verificar / Conceder Permissões (Arquivos, Sobreposição e Notificações)",
+            "#1E293B",
+            "#38BDF8"
+        ) {
+            checkAndRequestInitialPermissions(forcePrompt = true)
+        }
+        optionsCard.addView(btnPermissions)
+
+        col.addView(optionsCard)
+        return scroll
+    }
+
+    // =========================================================================
+    // 3. ABA 2: GALERIA & PASTAS ISOLADA NA SANDBOX + WHATSAPP + P2P (ITENS 3, 8, 16)
+    // =========================================================================
+
+    private fun buildTab1SandboxGallery(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(12))
+        }
+
+        // Barra Superior da Galeria: Caminho na Sandbox + Nova Pasta + Voltar
+        val pathRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = cardDrawable("#1E293B", "#334155", 10, 1)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+        }
+
+        val currentDisplay = if (currentGallerySubfolder.isEmpty()) {
+            "🔒 DCIM/Camera/IFgestor"
+        } else {
+            "🔒 DCIM/Camera/IFgestor/$currentGallerySubfolder"
+        }
+
+        val tvPath = TextView(this).apply {
+            text = currentDisplay
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTypeface(typeface, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        pathRow.addView(tvPath)
+
+        if (currentGallerySubfolder.isNotEmpty()) {
+            val btnUp = makeSmallButton("⬅️ Raiz/Acima", "#334155") {
+                val parts = currentGallerySubfolder.split('/').toMutableList()
+                parts.removeLastOrNull()
+                currentGallerySubfolder = parts.joinToString("/")
+                selectedGalleryPaths.clear()
+                renderActiveTab()
+            }
+            pathRow.addView(btnUp)
+            pathRow.addView(SpaceView(dp(6), 1))
+        }
+
+        val btnNewFolder = makeSmallButton("➕ Pasta", "#0284C7") {
+            promptCreateSubfolderInGallery()
+        }
+        pathRow.addView(btnNewFolder)
+        root.addView(pathRow)
+
+        root.addView(SpaceView(1, dp(8)))
+
+        // Busca e Selecao em Lote
+        val filterRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val etSearch = makeInputEdit("🔍 Filtrar arquivos...", gallerySearchQuery).apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply { marginEnd = dp(6) }
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    gallerySearchQuery = s?.toString() ?: ""
+                    populateGalleryGrid()
+                }
+            })
+        }
+        filterRow.addView(etSearch)
+
+        val btnSelectAll = makeSmallButton("☑️ Todos", "#1E293B") {
+            val dir = SettingsManager.resolveSafeSandboxFile(currentGallerySubfolder)
+                ?: SettingsManager.getSandboxRootDir()
+            val files = dir.listFiles { f -> f.isFile && !f.name.startsWith(".") && !f.name.endsWith(".part") && SettingsManager.isMediaFile(f.name) }
+                ?: emptyArray()
+            if (selectedGalleryPaths.size == files.size) {
+                selectedGalleryPaths.clear()
+            } else {
+                files.forEach { selectedGalleryPaths.add(it.absolutePath) }
+            }
+            populateGalleryGrid()
+        }
+        filterRow.addView(btnSelectAll)
+        root.addView(filterRow)
+
+        root.addView(SpaceView(1, dp(6)))
+
+        // Barra de Acoes Multiplas: WhatsApp, P2P, Mover e Excluir
+        val actionsScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+        }
+        val actionsBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val tvSel = TextView(this).apply {
+            text = "${selectedGalleryPaths.size} sel."
+            setTextColor(Color.parseColor("#94A3B8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(dp(4), 0, dp(8), 0)
+        }
+        tvGallerySelectionInfo = tvSel
+        actionsBar.addView(tvSel)
+
+        actionsBar.addView(makeSmallButton("📲 WhatsApp", "#128C7E") {
+            shareSelectedGalleryFilesToWhatsApp()
+        })
+        actionsBar.addView(SpaceView(dp(6), 1))
+
+        actionsBar.addView(makeSmallButton("📡 Enviar P2P", "#059669") {
+            promptSendSelectedFilesP2pFromMobile()
+        })
+        actionsBar.addView(SpaceView(dp(6), 1))
+
+        actionsBar.addView(makeSmallButton("📁 Mover", "#0284C7") {
+            promptMoveSelectedGalleryFiles()
+        })
+        actionsBar.addView(SpaceView(dp(6), 1))
+
+        actionsBar.addView(makeSmallButton("🗑️ Excluir", "#B91C1C") {
+            promptDeleteSelectedGalleryFiles()
+        })
+
+        actionsScroll.addView(actionsBar)
+        root.addView(actionsScroll)
+
+        root.addView(SpaceView(1, dp(8)))
+
+        // Lista de Subpastas + Grade de Arquivos da Sandbox
+        val scroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+        val gridWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        galleryGridContainer = gridWrap
+        scroll.addView(gridWrap)
+        root.addView(scroll)
+
+        populateGalleryGrid()
+        return root
+    }
+
+    private fun populateGalleryGrid() {
+        val container = galleryGridContainer ?: return
+        container.removeAllViews()
+        tvGallerySelectionInfo?.text = "${selectedGalleryPaths.size} sel."
+
+        val currentDir = SettingsManager.resolveSafeSandboxFile(currentGallerySubfolder)
+            ?: SettingsManager.getSandboxRootDir()
+        if (!currentDir.exists()) currentDir.mkdirs()
+
+        val children = currentDir.listFiles { f ->
+            !f.name.startsWith(".") && !f.name.endsWith(".part") && !f.name.endsWith(".tmp")
+        } ?: emptyArray()
+
+        // 1. Subpastas dentro do diretorio atual
+        val subDirs = children.filter { it.isDirectory }.sortedBy { it.name.lowercase(Locale.getDefault()) }
+        if (subDirs.isNotEmpty()) {
+            val foldersScroll = HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                setPadding(0, 0, 0, dp(8))
+            }
+            val foldersRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            for (folder in subDirs) {
+                val rel = if (currentGallerySubfolder.isEmpty()) folder.name else "$currentGallerySubfolder/${folder.name}"
+                val count = SettingsManager.getFolderMediaCount(this, rel)
+                val chip = TextView(this).apply {
+                    text = "📁 ${folder.name} ($count)"
+                    setTextColor(Color.WHITE)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    setTypeface(typeface, Typeface.BOLD)
+                    background = cardDrawable("#1E293B", "#38BDF8", 10, 1)
+                    setPadding(dp(12), dp(8), dp(12), dp(8))
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { marginEnd = dp(8) }
+                    setOnClickListener {
+                        currentGallerySubfolder = rel
+                        selectedGalleryPaths.clear()
+                        renderActiveTab()
+                    }
+                }
+                foldersRow.addView(chip)
+            }
+            foldersScroll.addView(foldersRow)
+            container.addView(foldersScroll)
+        }
+
+        // 2. Arquivos de midia filtrados
+        val q = gallerySearchQuery.trim().lowercase(Locale.getDefault())
+        val files = children.filter { f ->
+            f.isFile && SettingsManager.isMediaFile(f.name) && (q.isEmpty() || f.name.lowercase(Locale.getDefault()).contains(q))
+        }.sortedByDescending { it.lastModified() }
+
+        if (files.isEmpty()) {
+            val emptyTv = TextView(this).apply {
+                text = "Nenhum arquivo nesta pasta da Sandbox.\nCapture fotos ou envie arquivos pelo Site Web."
+                setTextColor(Color.parseColor("#94A3B8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                gravity = Gravity.CENTER
+                setPadding(dp(20), dp(40), dp(20), dp(40))
+            }
+            container.addView(emptyTv)
+            return
+        }
+
+        val grid = GridLayout(this).apply {
+            columnCount = 2
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val screenWidth = resources.displayMetrics.widthPixels
+        val cardWidth = (screenWidth - dp(36)) / 2
+
+        for (file in files) {
+            val isSelected = selectedGalleryPaths.contains(file.absolutePath)
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = cardDrawable(
+                    "#1E293B",
+                    if (isSelected) "#38BDF8" else "#334155",
+                    12,
+                    if (isSelected) 2 else 1
+                )
+                setPadding(dp(6), dp(6), dp(6), dp(8))
+                layoutParams = GridLayout.LayoutParams().apply {
+                    width = cardWidth
+                    setMargins(dp(3), dp(3), dp(3), dp(6))
+                }
+            }
+
+            val thumbFrame = FrameLayout(this).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(125)
+                )
+                setBackgroundColor(Color.parseColor("#090D16"))
+                setOnClickListener {
+                    showFullScreenMediaDialog(file)
+                }
+            }
+
+            val imgView = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            }
+            thumbFrame.addView(imgView)
+            loadThumbnailAsync(file, imgView)
+
+            val cb = CheckBox(this).apply {
+                isChecked = isSelected
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP or Gravity.START
+                )
+                setOnCheckedChangeListener { _, checked ->
+                    if (checked) selectedGalleryPaths.add(file.absolutePath)
+                    else selectedGalleryPaths.remove(file.absolutePath)
+                    tvGallerySelectionInfo?.text = "${selectedGalleryPaths.size} sel."
+                    card.background = cardDrawable(
+                        "#1E293B",
+                        if (checked) "#38BDF8" else "#334155",
+                        12,
+                        if (checked) 2 else 1
+                    )
+                }
+            }
+            thumbFrame.addView(cb)
+
+            val ext = file.extension.lowercase(Locale.getDefault())
+            val badge = TextView(this).apply {
+                text = if (ext in listOf("mp4", "mov", "mkv", "3gp")) "🎬 VÍDEO" else "📷 FOTO"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
+                setTypeface(typeface, Typeface.BOLD)
+                background = cardDrawable("#CC0F172A", "#334155", 6, 0)
+                setPadding(dp(5), dp(2), dp(5), dp(2))
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.BOTTOM or Gravity.END
+                ).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) }
+            }
+            thumbFrame.addView(badge)
+
+            val tvName = TextView(this).apply {
+                text = file.name
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTypeface(typeface, Typeface.BOLD)
+                maxLines = 1
+                setPadding(dp(2), dp(6), dp(2), dp(2))
+            }
+
+            val kb = (file.length() / 1024L).coerceAtLeast(1L)
+            val tvMeta = TextView(this).apply {
+                text = "${kb} KB • Toque p/ ampliar"
+                setTextColor(Color.parseColor("#94A3B8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                setPadding(dp(2), 0, dp(2), 0)
+            }
+
+            card.addView(thumbFrame)
+            card.addView(tvName)
+            card.addView(tvMeta)
+            grid.addView(card)
+        }
+
+        container.addView(grid)
+    }
+
+    private fun loadThumbnailAsync(file: File, target: ImageView) {
+        val key = "${file.absolutePath}_${file.lastModified()}"
+        target.tag = key
+        val cached = thumbCache.get(key)
+        if (cached != null) {
+            target.setImageBitmap(cached)
+            return
+        }
+
+        bgExecutor.execute {
+            try {
+                val ext = file.extension.lowercase(Locale.getDefault())
+                val bmp: Bitmap? = if (ext in listOf("mp4", "mov", "mkv", "3gp")) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        ThumbnailUtils.createVideoThumbnail(file, Size(240, 240), null)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        ThumbnailUtils.createVideoThumbnail(file.absolutePath, MediaStore.Video.Thumbnails.MINI_KIND)
+                    }
+                } else {
+                    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeFile(file.absolutePath, opts)
+                    var sample = 1
+                    while (opts.outWidth / sample > 240 || opts.outHeight / sample > 240) {
+                        sample *= 2
+                    }
+                    BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+                }
+
+                if (bmp != null) {
+                    thumbCache.put(key, bmp)
+                    mainHandler.post {
+                        if (target.tag == key) {
+                            target.setImageBitmap(bmp)
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun showFullScreenMediaDialog(file: File) {
+        val dialogLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardDrawable("#0F172A", "#38BDF8", 16, 1)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+        }
+
+        val title = TextView(this).apply {
+            text = file.name
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 0, 0, dp(8))
+        }
+        dialogLayout.addView(title)
+
+        val preview = ImageView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(320)
+            )
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(Color.BLACK)
+        }
+        loadThumbnailAsync(file, preview)
+        dialogLayout.addView(preview)
+
+        val dateStr = SimpleDateFormat("dd/MM/yyyy HH:mm:ss", Locale.getDefault()).format(Date(file.lastModified()))
+        val meta = TextView(this).apply {
+            text = "Tamanho: ${file.length() / 1024} KB  •  Data: $dateStr"
+            setTextColor(Color.parseColor("#94A3B8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(0, dp(8), 0, dp(10))
+        }
+        dialogLayout.addView(meta)
+
+        val dlg = AlertDialog.Builder(this)
+            .setView(dialogLayout)
+            .create()
+
+        val btnsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+
+        btnsRow.addView(makeSmallButton("📲 WhatsApp", "#128C7E") {
+            dlg.dismiss()
+            SettingsManager.shareFilesToWhatsApp(this, listOf(file))
+        })
+        btnsRow.addView(SpaceView(dp(6), 1))
+
+        btnsRow.addView(makeSmallButton("🔍 Abrir Externo", "#0284C7") {
+            dlg.dismiss()
+            openFileExternally(file)
+        })
+        btnsRow.addView(SpaceView(dp(6), 1))
+
+        btnsRow.addView(makeSmallButton("Fechar", "#334155") {
+            dlg.dismiss()
+        })
+
+        dialogLayout.addView(btnsRow)
+        dlg.show()
+    }
+
+    private fun openFileExternally(file: File) {
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, SettingsManager.getMimeType(file))
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, "Abrir com..."))
         } catch (e: Exception) {
-            val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-            context.startActivity(intent)
+            Toast.makeText(this, "Não foi possível abrir externamente.", Toast.LENGTH_SHORT).show()
         }
     }
-}
 
-private fun requestOverlayPermission(context: Context) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-        val intent = Intent(
-            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-            Uri.parse("package:${context.packageName}")
-        )
-        context.startActivity(intent)
+    private fun shareSelectedGalleryFilesToWhatsApp() {
+        val files = selectedGalleryPaths.map { File(it) }.filter { it.exists() }
+        if (files.isEmpty()) {
+            Toast.makeText(this, "Selecione ao menos uma foto ou vídeo na galeria.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        SettingsManager.shareFilesToWhatsApp(this, files)
     }
-}
 
-private fun requestNotificationPermissionIfNeeded(
-    context: Context,
-    launcher: ManagedActivityResultLauncher<String, Boolean>
-) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        val granted = ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.POST_NOTIFICATIONS
-        ) == PackageManager.PERMISSION_GRANTED
-        if (!granted) {
-            launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    private fun promptSendSelectedFilesP2pFromMobile() {
+        val files = selectedGalleryPaths.map { File(it) }.filter { it.exists() }
+        if (files.isEmpty()) {
+            Toast.makeText(this, "Selecione os arquivos que deseja enviar para outro celular.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val peers = NetworkDiscoveryManager.getDiscoveredPeers(this).filter { !it.isSelf }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(14), dp(18), dp(10))
+            setBackgroundColor(Color.parseColor("#0F172A"))
+        }
+
+        val peerLabels = if (peers.isEmpty()) {
+            listOf("Nenhum outro celular detectado automaticamente (use IP abaixo)")
+        } else {
+            peers.map { "📱 ${it.domain} (${it.ip}:${it.port})" }
+        }
+
+        val spinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, peerLabels)
+        }
+        box.addView(makeFieldLabel("Aparelhos IFGestor encontrados no Wi-Fi:"))
+        box.addView(spinner)
+        box.addView(SpaceView(1, dp(8)))
+
+        val etManualIp = makeInputEdit("Ex: 192.168.1.45:8080", "")
+        box.addView(makeFieldLabel("Ou informe o IP:Porta manualmente:"))
+        box.addView(etManualIp)
+        box.addView(SpaceView(1, dp(8)))
+
+        val etTargetSub = makeInputEdit("Ex: Recebidos_P2P (vazio = Raiz IFgestor)", currentGallerySubfolder)
+        box.addView(makeFieldLabel("Subpasta de destino no outro celular:"))
+        box.addView(etTargetSub)
+
+        AlertDialog.Builder(this)
+            .setTitle("📡 Enviar ${files.size} Arquivo(s) P2P")
+            .setView(box)
+            .setPositiveButton("Enviar P2P") { _, _ ->
+                val manual = etManualIp.text?.toString()?.trim() ?: ""
+                var targetIp = ""
+                var targetPort = 8080
+                var targetHttps = SettingsManager.isHttpsEnabled(this)
+
+                if (manual.isNotEmpty()) {
+                    val clean = manual.removePrefix("https://").removePrefix("http://")
+                    val parts = clean.split(':')
+                    targetIp = parts[0]
+                    targetPort = parts.getOrNull(1)?.toIntOrNull() ?: 8080
+                } else if (peers.isNotEmpty()) {
+                    val chosen = peers[spinner.selectedItemPosition.coerceIn(0, peers.lastIndex)]
+                    targetIp = chosen.ip
+                    targetPort = chosen.port
+                    targetHttps = chosen.https
+                }
+
+                if (targetIp.isEmpty()) {
+                    Toast.makeText(this, "Informe ou selecione o aparelho de destino.", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+
+                isTaskDrawerExpanded = true
+                NetworkDiscoveryManager.sendFilesPeerToPeerAsync(
+                    context = this,
+                    targetIp = targetIp,
+                    targetPort = targetPort,
+                    targetHttps = targetHttps,
+                    targetSubfolder = etTargetSub.text?.toString() ?: "",
+                    files = files
+                ) { ok, msg ->
+                    mainHandler.post {
+                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                        refreshHeaderAndTaskDrawer()
+                    }
+                }
+                Toast.makeText(
+                    this,
+                    "Solicitação P2P enviada! Confirme a notificação 2FA no celular de destino.",
+                    Toast.LENGTH_LONG
+                ).show()
+                refreshHeaderAndTaskDrawer()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun promptCreateSubfolderInGallery() {
+        val input = makeInputEdit("Nome da nova subpasta", "")
+        AlertDialog.Builder(this)
+            .setTitle("➕ Nova Subpasta na Sandbox")
+            .setView(input)
+            .setPositiveButton("Criar") { _, _ ->
+                val name = SettingsManager.sanitizeSubfolderName(input.text?.toString() ?: "")
+                if (name.isNotEmpty()) {
+                    val combined = if (currentGallerySubfolder.isEmpty()) name else "$currentGallerySubfolder/$name"
+                    val dir = SettingsManager.resolveSafeSandboxFile(combined)
+                    dir?.mkdirs()
+                    IFGestorHomeWidget.requestWidgetUpdate(this)
+                    FloatingOverlayManager.refresh(this)
+                    renderActiveTab()
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun promptMoveSelectedGalleryFiles() {
+        val files = selectedGalleryPaths.map { File(it) }.filter { it.exists() }
+        if (files.isEmpty()) {
+            Toast.makeText(this, "Selecione os arquivos para mover.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val input = makeInputEdit("Subpasta destino (vazio = Raiz IFgestor)", currentGallerySubfolder)
+        AlertDialog.Builder(this)
+            .setTitle("📁 Mover ${files.size} Arquivo(s)")
+            .setView(input)
+            .setPositiveButton("Mover Agora") { _, _ ->
+                val destRel = SettingsManager.sanitizeSubfolderName(input.text?.toString() ?: "")
+                val destDir = SettingsManager.resolveSafeSandboxFile(destRel) ?: SettingsManager.getSandboxRootDir()
+                destDir.mkdirs()
+
+                val taskId = "mob_move_${System.currentTimeMillis()}"
+                selectedGalleryPaths.clear()
+                isTaskDrawerExpanded = true
+
+                bgExecutor.execute {
+                    var movedCount = 0
+                    for ((idx, f) in files.withIndex()) {
+                        if (SettingsManager.isFileLocked(f)) continue
+                        SettingsManager.tryLockFile(f)
+                        try {
+                            SettingsManager.upsertTask(
+                                id = taskId,
+                                title = "📁 Movendo (${idx + 1}/${files.size})",
+                                subtitle = f.name,
+                                type = "MOVE",
+                                currentItems = idx + 1,
+                                totalItems = files.size,
+                                status = "RUNNING"
+                            )
+                            val targetFile = SettingsManager.resolveUniqueFile(destDir, f.name)
+                            val ok = if (f.renameTo(targetFile)) {
+                                true
+                            } else {
+                                try {
+                                    f.copyTo(targetFile, overwrite = false)
+                                    f.delete()
+                                    true
+                                } catch (_: Exception) {
+                                    false
+                                }
+                            }
+                            if (ok) {
+                                movedCount++
+                                MediaScannerConnection.scanFile(
+                                    applicationContext,
+                                    arrayOf(f.absolutePath, targetFile.absolutePath),
+                                    null,
+                                    null
+                                )
+                            }
+                        } finally {
+                            SettingsManager.unlockFile(f)
+                        }
+                    }
+
+                    SettingsManager.upsertTask(
+                        id = taskId,
+                        title = "✅ Movimentação Concluída ($movedCount/${files.size})",
+                        subtitle = "Destino: ${destRel.ifEmpty { "IFgestor (Raiz)" }}",
+                        type = "MOVE",
+                        currentItems = movedCount,
+                        totalItems = files.size,
+                        status = "COMPLETED"
+                    )
+
+                    mainHandler.post {
+                        IFGestorHomeWidget.requestWidgetUpdate(this)
+                        FloatingOverlayManager.refresh(this)
+                        populateGalleryGrid()
+                        refreshHeaderAndTaskDrawer()
+                    }
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun promptDeleteSelectedGalleryFiles() {
+        val files = selectedGalleryPaths.map { File(it) }.filter { it.exists() }
+        if (files.isEmpty()) {
+            Toast.makeText(this, "Selecione os arquivos para excluir.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("🗑️ Excluir ${files.size} Arquivo(s)?")
+            .setMessage("Os arquivos selecionados serão removidos permanentemente da pasta Sandbox.")
+            .setPositiveButton("Excluir") { _, _ ->
+                val taskId = "mob_del_${System.currentTimeMillis()}"
+                selectedGalleryPaths.clear()
+                isTaskDrawerExpanded = true
+
+                bgExecutor.execute {
+                    var delCount = 0
+                    for ((idx, f) in files.withIndex()) {
+                        if (SettingsManager.isFileLocked(f)) continue
+                        SettingsManager.tryLockFile(f)
+                        try {
+                            SettingsManager.upsertTask(
+                                id = taskId,
+                                title = "🗑️ Excluindo (${idx + 1}/${files.size})",
+                                subtitle = f.name,
+                                type = "DELETE",
+                                currentItems = idx + 1,
+                                totalItems = files.size,
+                                status = "RUNNING"
+                            )
+                            if (f.delete()) {
+                                delCount++
+                                MediaScannerConnection.scanFile(applicationContext, arrayOf(f.absolutePath), null, null)
+                            }
+                        } finally {
+                            SettingsManager.unlockFile(f)
+                        }
+                    }
+
+                    SettingsManager.upsertTask(
+                        id = taskId,
+                        title = "✅ Exclusão Concluída ($delCount/${files.size})",
+                        subtitle = "Arquivos removidos com segurança",
+                        type = "DELETE",
+                        currentItems = delCount,
+                        totalItems = files.size,
+                        status = "COMPLETED"
+                    )
+
+                    mainHandler.post {
+                        IFGestorHomeWidget.requestWidgetUpdate(this)
+                        FloatingOverlayManager.refresh(this)
+                        populateGalleryGrid()
+                        refreshHeaderAndTaskDrawer()
+                    }
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    // =========================================================================
+    // 4. ABA 3: SERVIDOR PC, DOMINIO mDNS, PIN PBKDF2, 2FA E AUDIT LOG
+    // =========================================================================
+
+    private fun buildTab2ServerSecurityAndAudit(): View {
+        val scroll = ScrollView(this)
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(24))
+        }
+        scroll.addView(col)
+
+        // Banner Dinamico de Desafio 2FA Pendente (Notificacao ou Codigo de 6 Digitos)
+        val challengeBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        tvLiveChallengeBox = challengeBox
+        col.addView(challengeBox)
+        refreshLive2faChallengeBanner()
+
+        // Card 1: Servidor Web HTTPS & Dominio Local Blindado (ifgestor.local)
+        val netCard = makeSectionCard("🌐 Servidor Web HTTPS & Domínio Local (mDNS)")
+
+        val mdnsUrl = WebServerManager.getMdnsUrl(this)
+        val ipUrl = WebServerManager.getServerUrl(this)
+
+        val tvUrls = TextView(this).apply {
+            text = "🔗 Domínio Amigável: $mdnsUrl\n📍 Endereço IP Direto: $ipUrl"
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 0, 0, dp(8))
+        }
+        netCard.addView(tvUrls)
+
+        val copyRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+        }
+        copyRow.addView(makePrimaryButton("📋 Copiar Domínio .local", "#0284C7", "#38BDF8") {
+            copyToClipboard("URL mDNS", mdnsUrl)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply { marginEnd = dp(4) }
+        })
+
+        copyRow.addView(makePrimaryButton("📋 Copiar IP Numérico", "#334155", "#475569") {
+            copyToClipboard("URL IP", ipUrl)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply { marginStart = dp(4) }
+        })
+        netCard.addView(copyRow)
+
+        netCard.addView(SpaceView(1, dp(10)))
+
+        val etAlias = makeInputEdit("Ex: ifgestor ou vistoria-1", SettingsManager.getDeviceAlias(this))
+        netCard.addView(makeFieldLabel("Nome do Domínio Local (.local):"))
+        netCard.addView(etAlias)
+
+        netCard.addView(SpaceView(1, dp(6)))
+
+        val etPort = makeInputEdit("Porta (padrão 8080)", SettingsManager.getServerPort(this).toString()).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        netCard.addView(makeFieldLabel("Porta do Servidor:"))
+        netCard.addView(etPort)
+
+        netCard.addView(SpaceView(1, dp(6)))
+
+        val swHttps = Switch(this).apply {
+            text = "Criptografia HTTPS / TLS Local (Certificado Autoassinado)"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            isChecked = SettingsManager.isHttpsEnabled(this@MainActivity)
+        }
+        netCard.addView(swHttps)
+
+        val swMdns = Switch(this).apply {
+            text = "Anunciar Domínio .local e Descoberta Multi-Aparelhos (mDNS)"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            isChecked = SettingsManager.isMdnsEnabled(this@MainActivity)
+        }
+        netCard.addView(swMdns)
+
+        netCard.addView(SpaceView(1, dp(10)))
+
+        netCard.addView(makePrimaryButton("💾 Aplicar Configurações de Rede", "#059669", "#10B981") {
+            SettingsManager.setDeviceAlias(this, etAlias.text?.toString() ?: "ifgestor")
+            val portVal = etPort.text?.toString()?.toIntOrNull() ?: 8080
+            SettingsManager.setServerPort(this, portVal)
+            SettingsManager.setHttpsEnabled(this, swHttps.isChecked)
+            SettingsManager.setMdnsEnabled(this, swMdns.isChecked)
+
+            if (SettingsManager.isWebServerEnabled(this)) {
+                WebServerManager.stopServer(this)
+                val svc = Intent(this, MediaInterceptorService::class.java).apply {
+                    action = MediaInterceptorService.ACTION_START_WEB_SERVER
+                }
+                startServiceCompat(svc)
+            }
+            Toast.makeText(this, "Rede atualizada!", Toast.LENGTH_SHORT).show()
+            renderActiveTab()
+        })
+
+        col.addView(netCard)
+
+        // Card 2: Seguranca do PIN (PBKDF2WithHmacSHA256) e Sessoes
+        val pinCard = makeSectionCard("🔐 Credenciais PBKDF2 & Controle de Sessão")
+
+        if (SettingsManager.isPinChangeRequired(this)) {
+            val warnPin = TextView(this).apply {
+                text = "⚠️ ATENÇÃO (OWASP): Seu PIN ainda é o padrão (1234). Cadastre um novo PIN abaixo para liberar o início do Servidor Web."
+                setTextColor(Color.parseColor("#FCA5A5"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTypeface(typeface, Typeface.BOLD)
+                background = cardDrawable("#450A0A", "#EF4444", 8, 1)
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+            }
+            pinCard.addView(warnPin)
+            pinCard.addView(SpaceView(1, dp(8)))
+        }
+
+        val etCurrentPin = makeInputEdit("PIN Atual (padrão inicial: 1234)", "").apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+        }
+        val etNewPin = makeInputEdit("Novo PIN numérico (4 a 8 dígitos, diferente de 1234)", "").apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+        }
+
+        pinCard.addView(makeFieldLabel("PIN Atual:"))
+        pinCard.addView(etCurrentPin)
+        pinCard.addView(SpaceView(1, dp(6)))
+        pinCard.addView(makeFieldLabel("Novo PIN Seguro:"))
+        pinCard.addView(etNewPin)
+        pinCard.addView(SpaceView(1, dp(10)))
+
+        pinCard.addView(makePrimaryButton("🔑 Atualizar PIN (Hash PBKDF2 + Salt)", "#0284C7", "#38BDF8") {
+            val cur = etCurrentPin.text?.toString()?.trim() ?: ""
+            val nw = etNewPin.text?.toString()?.trim() ?: ""
+            if (!SettingsManager.verifyPin(this, cur)) {
+                Toast.makeText(this, "PIN atual incorreto!", Toast.LENGTH_SHORT).show()
+                return@makePrimaryButton
+            }
+            if (nw == "1234" || nw.length < 4 || nw.length > 8 || !nw.all { it.isDigit() }) {
+                Toast.makeText(this, "Escolha um PIN numérico de 4 a 8 dígitos diferente de 1234.", Toast.LENGTH_LONG).show()
+                return@makePrimaryButton
+            }
+            SettingsManager.updatePin(this, nw)
+            WebServerManager.revokeAllSessions(this, "Troca de PIN pelo usuário")
+            Toast.makeText(this, "✅ Novo PIN criptografado com PBKDF2 salvo com sucesso!", Toast.LENGTH_SHORT).show()
+            renderActiveTab()
+        })
+
+        pinCard.addView(SpaceView(1, dp(8)))
+
+        pinCard.addView(makePrimaryButton("🚫 Revogar Todas as Sessões Web Ativas", "#B91C1C", "#EF4444") {
+            WebServerManager.revokeAllSessions(this, "Encerramento manual no aparelho")
+            Toast.makeText(this, "Todas as sessões web foram desconectadas.", Toast.LENGTH_SHORT).show()
+            renderActiveTab()
+        })
+
+        col.addView(pinCard)
+
+        // Card 3: Trilha de Auditoria (Audit Log - Item 4)
+        val auditCard = makeSectionCard("📋 Trilha de Auditoria (Compliance & LGPD)")
+
+        val auditActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+            setPadding(0, 0, 0, dp(8))
+        }
+        auditActions.addView(makePrimaryButton("🔄 Atualizar Logs", "#1E293B", "#38BDF8") {
+            renderActiveTab()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(4) }
+        })
+
+        auditActions.addView(makePrimaryButton("🧹 Limpar Histórico", "#334155", "#475569") {
+            SettingsManager.clearAuditLogs(this)
+            renderActiveTab()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginStart = dp(4) }
+        })
+        auditCard.addView(auditActions)
+
+        val logs = SettingsManager.getAuditLogs(this)
+        if (logs.isEmpty()) {
+            val emptyLog = TextView(this).apply {
+                text = "Nenhum evento registrado ainda."
+                setTextColor(Color.parseColor("#94A3B8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            }
+            auditCard.addView(emptyLog)
+        } else {
+            for (entry in logs.take(40)) {
+                val itemBox = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    background = cardDrawable("#0F172A", if (entry.success) "#334155" else "#EF4444", 8, 1)
+                    setPadding(dp(10), dp(6), dp(10), dp(6))
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { bottomMargin = dp(6) }
+                }
+
+                val icon = if (entry.success) "✅" else "❌"
+                val head = TextView(this).apply {
+                    text = "$icon [${entry.category}] ${entry.action} • ${entry.timestamp}"
+                    setTextColor(if (entry.success) Color.parseColor("#38BDF8") else Color.parseColor("#FCA5A5"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setTypeface(typeface, Typeface.BOLD)
+                }
+
+                val sub = TextView(this).apply {
+                    text = "Origem: ${entry.ip} — ${entry.details}"
+                    setTextColor(Color.parseColor("#E2E8F0"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                }
+
+                itemBox.addView(head)
+                itemBox.addView(sub)
+                auditCard.addView(itemBox)
+            }
+        }
+
+        col.addView(auditCard)
+        return scroll
+    }
+
+    private fun refreshLive2faChallengeBanner() {
+        val box = tvLiveChallengeBox ?: return
+        val ch = WebServerManager.getLatestPendingChallenge()
+        if (ch == null) {
+            box.visibility = View.GONE
+            box.removeAllViews()
+            return
+        }
+
+        box.visibility = View.VISIBLE
+        box.removeAllViews()
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardDrawable("#064E3B", "#10B981", 14, 2)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
+        }
+
+        val title = TextView(this).apply {
+            text = "🔐 SOLICITAÇÃO 2FA AGUARDANDO APROVAÇÃO"
+            setTextColor(Color.parseColor("#A7F3D0"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+
+        val codeTv = TextView(this).apply {
+            text = "Código de 6 dígitos: ${ch.code}"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, dp(4), 0, dp(4))
+        }
+
+        val descTv = TextView(this).apply {
+            text = "${ch.description}\nOrigem: ${ch.ip}"
+            setTextColor(Color.parseColor("#E2E8F0"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, 0, 0, dp(10))
+        }
+
+        val btns = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+        }
+
+        btns.addView(makePrimaryButton("✓ Aprovar Agora", "#059669", "#10B981") {
+            WebServerManager.approveLatestChallengeFromApp(this)
+            refreshLive2faChallengeBanner()
+            renderActiveTab()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(4) }
+        })
+
+        btns.addView(makePrimaryButton("✕ Recusar", "#B91C1C", "#EF4444") {
+            WebServerManager.rejectLatestChallengeFromApp(this)
+            refreshLive2faChallengeBanner()
+            renderActiveTab()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginStart = dp(4) }
+        })
+
+        card.addView(title)
+        card.addView(codeTv)
+        card.addView(descTv)
+        card.addView(btns)
+        box.addView(card)
+    }
+
+    // =========================================================================
+    // 5. ACIONAMENTO DOS MOTORES E PERMISSOES DE SISTEMA
+    // =========================================================================
+
+    private fun startCameraWithInterceptor() {
+        SettingsManager.setCameraInterceptorEnabled(this, true)
+        val svc = Intent(this, MediaInterceptorService::class.java).apply {
+            action = MediaInterceptorService.ACTION_START_CAMERA_INTERCEPTOR
+        }
+        startServiceCompat(svc)
+        IFGestorHomeWidget.requestWidgetUpdate(this)
+        FloatingOverlayManager.show(this)
+        FloatingOverlayManager.refresh(this)
+
+        try {
+            val camIntent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(camIntent)
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(MediaStore.ACTION_IMAGE_CAPTURE))
+            } catch (_: Exception) {
+                Toast.makeText(this, "Interceptador ativado!", Toast.LENGTH_SHORT).show()
+            }
         }
     }
-}
 
-private fun notifyServiceConfigChanged(context: Context, isRunning: Boolean) {
-    if (!isRunning) return
-    val intent = Intent(context, MediaInterceptorService::class.java).apply {
-        action = MediaInterceptorService.ACTION_REFRESH_CONFIG
-    }
-    context.startService(intent)
-}
-
-private fun startInterceptorServiceOnly(context: Context) {
-    val serviceIntent = Intent(context, MediaInterceptorService::class.java).apply {
-        action = MediaInterceptorService.ACTION_START
-    }
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        context.startForegroundService(serviceIntent)
-    } else {
-        context.startService(serviceIntent)
-    }
-}
-
-private fun startInterceptorAndOpenNativeCamera(context: Context) {
-    startInterceptorServiceOnly(context)
-
-    try {
-        val cameraIntent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    private fun toggleWebServerEngineWithPinCheck() {
+        val nextState = !SettingsManager.isWebServerEnabled(this)
+        if (nextState && SettingsManager.isPinChangeRequired(this)) {
+            Toast.makeText(
+                this,
+                "Por segurança, cadastre um novo PIN (diferente de 1234) na aba Servidor & 2FA antes de ligar o site web.",
+                Toast.LENGTH_LONG
+            ).show()
+            switchTab(2)
+            return
         }
-        context.startActivity(cameraIntent)
-    } catch (e: Exception) {
-        Toast.makeText(
-            context,
-            "Não foi possível abrir o atalho da câmera automaticamente.",
-            Toast.LENGTH_SHORT
-        ).show()
+
+        SettingsManager.setWebServerEnabled(this, nextState)
+        val svc = Intent(this, MediaInterceptorService::class.java).apply {
+            action = if (nextState) {
+                MediaInterceptorService.ACTION_START_WEB_SERVER
+            } else {
+                MediaInterceptorService.ACTION_STOP_WEB_SERVER
+            }
+        }
+        startServiceCompat(svc)
+        renderActiveTab()
+    }
+
+    private fun checkAndRequestInitialPermissions(forcePrompt: Boolean = false) {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            if (checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.READ_MEDIA_IMAGES)
+            }
+            if (checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.READ_MEDIA_VIDEO)
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q &&
+                checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+            ) {
+                needed.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
+        }
+
+        if (needed.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            requestPermissions(needed.toTypedArray(), 501)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            if (forcePrompt) {
+                try {
+                    val intent = Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                    startActivity(intent)
+                } catch (_: Exception) {
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                }
+            }
+        } else if (forcePrompt && !Settings.canDrawOverlays(this)) {
+            requestOverlayPermission()
+        } else if (forcePrompt) {
+            Toast.makeText(this, "✅ Todas as permissões principais estão ativas!", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun requestOverlayPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            try {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+                startActivity(intent)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun startServiceCompat(intent: Intent) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (_: Exception) {
+            try {
+                startService(intent)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun copyToClipboard(label: String, value: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText(label, value))
+        Toast.makeText(this, "Copiado: $value", Toast.LENGTH_SHORT).show()
+    }
+
+    // =========================================================================
+    // 6. COMPONENTES VISUAIS REUTILIZAVEIS (ALTO CONTRASTE EM CAMPO)
+    // =========================================================================
+
+    private fun makeSectionCard(titleText: String): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardDrawable("#1E293B", "#334155", 14, 1)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
+
+            val header = TextView(this@MainActivity).apply {
+                text = titleText
+                setTextColor(Color.parseColor("#F8FAFC"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTypeface(typeface, Typeface.BOLD)
+                setPadding(0, 0, 0, dp(10))
+            }
+            addView(header)
+        }
+    }
+
+    private fun makeFieldLabel(textStr: String): TextView {
+        return TextView(this).apply {
+            text = textStr
+            setTextColor(Color.parseColor("#94A3B8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(0, 0, 0, dp(4))
+        }
+    }
+
+    private fun makeInputEdit(hint: String, initial: String): EditText {
+        return EditText(this).apply {
+            setText(initial)
+            this.hint = hint
+            setHintTextColor(Color.parseColor("#64748B"))
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            background = cardDrawable("#0F172A", "#475569", 10, 1)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+    }
+
+    private fun makePrimaryButton(
+        label: String,
+        bgHex: String,
+        strokeHex: String,
+        onClick: () -> Unit
+    ): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTypeface(typeface, Typeface.BOLD)
+            background = cardDrawable(bgHex, strokeHex, 10, 1)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun makeSmallButton(label: String, bgHex: String, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTypeface(typeface, Typeface.BOLD)
+            background = cardDrawable(bgHex, "#334155", 8, 1)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                dp(34)
+            )
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun cardDrawable(
+        fillHex: String,
+        strokeHex: String,
+        radiusDp: Int,
+        strokeWidthDp: Int
+    ): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(radiusDp).toFloat()
+            setColor(Color.parseColor(fillHex))
+            if (strokeWidthDp > 0) {
+                setStroke(dp(strokeWidthDp), Color.parseColor(strokeHex))
+            }
+        }
+    }
+
+    private fun SpaceView(wPx: Int, hPx: Int): View {
+        return View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(wPx, hPx)
+        }
+    }
+
+    private fun dp(value: Int): Int {
+        return TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            value.toFloat(),
+            resources.displayMetrics
+        ).toInt()
     }
 }
