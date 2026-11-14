@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IFGestor Enterprise — Servidor HTTPS & P2P</title>
+<style>
+:root {
+  --bg: #0f172a; --surface: #1e293b; --surface2: #334155;
+  --text: #f8fafc; --muted: #94a3b8; --primary: #3b82f6;
+  --primary-hover: #2563eb; --success: #10b981; --danger: #ef4444;
+  --warning: #f59e0b; --border: #334155;
+}
+body.light {
+  --bg: #f1f5f9; --surface: #ffffff; --surface2: #e2e8f0;
+  --text: #0f172a; --muted: #475569; --primary: #2563eb;
+  --primary-hover: #1d4ed8; --border: #cbd5e1;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+body { background: var(--bg); color: var(--text); min-height: 100vh; transition: background 0.2s, color 0.2s; }
+header {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 12px;
+  align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 40;
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1.15rem; }
+.badge-tls { background: rgba(16,185,129,0.18); color: var(--success); border: 1px solid var(--success); font-size: 0.72rem; padding: 2px 8px; border-radius: 99px; }
+.top-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+select, input, button {
+  background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+  padding: 8px 12px; border-radius: 8px; font-size: 0.9rem; outline: none;
+}
+button { cursor: pointer; font-weight: 600; transition: 0.15s; }
+button.btn-primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+button.btn-primary:hover { background: var(--primary-hover); }
+button.btn-success { background: var(--success); color: #fff; border-color: var(--success); }
+button.btn-danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+button.btn-warning { background: var(--warning); color: #fff; border-color: var(--warning); }
+main { max-width: 1280px; margin: 0 auto; padding: 20px; padding-bottom: 110px; }
+.toolbar {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px; margin-bottom: 16px; display: flex; flex-wrap: wrap; gap: 10px;
+  align-items: center; justify-content: space-between;
+}
+.folder-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+.pill {
+  padding: 7px 14px; border-radius: 99px; background: var(--surface);
+  border: 1px solid var(--border); cursor: pointer; font-size: 0.85rem; font-weight: 600;
+}
+.pill.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+.grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(195px, 1fr)); gap: 14px;
+}
+.card {
+  background: var(--surface); border: 2px solid var(--border); border-radius: 12px;
+  overflow: hidden; position: relative; display: flex; flex-direction: column;
+}
+.card.selected { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(59,130,246,0.35); }
+.thumb-wrap {
+  width: 100%; height: 155px; background: #000; position: relative; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+.thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
+.card-check {
+  position: absolute; top: 8px; left: 8px; width: 22px; height: 22px; z-index: 5; cursor: pointer;
+}
+.lock-badge {
+  position: absolute; top: 8px; right: 8px; background: var(--warning); color: #000;
+  font-size: 0.7rem; font-weight: 700; padding: 2px 6px; border-radius: 6px;
+}
+.card-body { padding: 10px; font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px; }
+.card-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-meta { color: var(--muted); font-size: 0.74rem; display: flex; justify-content: space-between; }
+.card-actions { display: flex; gap: 4px; margin-top: 6px; }
+.card-actions button { flex: 1; padding: 5px; font-size: 0.75rem; }
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.78); z-index: 100;
+  display: none; align-items: center; justify-content: center; padding: 16px;
+}
+.modal-backdrop.show { display: flex; }
+.modal {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  max-width: 480px; width: 100%; padding: 22px; display: flex; flex-direction: column; gap: 14px;
+}
+.modal h3 { font-size: 1.15rem; }
+.modal p { font-size: 0.88rem; color: var(--muted); }
+.lightbox-content {
+  max-width: 92vw; max-height: 82vh; border-radius: 8px; background: #000;
+}
+.task-center {
+  position: fixed; bottom: 16px; right: 16px; width: 360px; max-width: calc(100vw - 32px);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.45); z-index: 80; overflow: hidden;
+}
+.task-header {
+  background: var(--surface2); padding: 10px 14px; display: flex;
+  justify-content: space-between; align-items: center; cursor: pointer; font-weight: 700; font-size: 0.88rem;
+}
+.task-body { max-height: 260px; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+.task-body.collapsed { display: none; }
+.task-item { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 0.78rem; }
+.progress-bar { width: 100%; height: 7px; background: var(--surface2); border-radius: 99px; overflow: hidden; margin-top: 6px; }
+.progress-fill { height: 100%; background: var(--primary); transition: width 0.15s; }
+.toast {
+  position: fixed; bottom: 20px; left: 20px; background: var(--surface2); color: var(--text);
+  border-left: 4px solid var(--primary); padding: 12px 16px; border-radius: 8px;
+  z-index: 120; display: none; font-size: 0.88rem; box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span>IFGestor Web</span>
+    <span class="badge-tls">HTTPS / TLS 2FA</span>
+    <span id="SandboxBadge" style="font-size:0.75rem;color:var(--muted);">DCIM/Camera/IFgestor</span>
+  </div>
+  <div class="top-controls">
+    <label style="font-size:0.8rem;color:var(--muted);">Aparelho na Rede:</label>
+    <select id="peerSelect" onchange="onSwitchPeerDevice(this.value)">
+      <option value="">Carregando dispositivos...</option>
+    </select>
+    <button onclick="openAuditModal()">Auditoria</button>
+    <button onclick="toggleTheme()">Tema</button>
+    <button class="btn-danger" onclick="doLogout()">Sair</button>
+  </div>
+</header>
+
+<main>
+  <div id="incomingP2pBanner" style="display:none;background:rgba(245,158,11,0.18);border:1px solid var(--warning);padding:12px;border-radius:10px;margin-bottom:14px;"></div>
+
+  <div class="folder-pills" id="folderPills"></div>
+
+  <div class="toolbar">
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+      <button onclick="toggleSelectAll()">Selecionar Todos</button>
+      <button class="btn-primary" onclick="document.getElementById('fileUploadInput').click()">+ Enviar Ficheiros</button>
+      <input type="file" id="fileUploadInput" multiple style="display:none" onchange="uploadSelectedFiles(this.files)">
+      <button onclick="promptNewSubfolder()">+ Nova Subpasta</button>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+      <span id="selectionCount" style="font-size:0.84rem;color:var(--muted);">0 selecionado(s)</span>
+      <button class="btn-primary" onclick="downloadSelectedZip()">Baixar .ZIP</button>
+      <button onclick="openMoveModal()">Mover</button>
+      <button class="btn-warning" onclick="openP2pModal()">Enviar P2P (2FA)</button>
+      <button class="btn-success" onclick="openWhatsAppModal()">WhatsApp</button>
+      <button class="btn-danger" onclick="deleteSelectedFiles()">Excluir</button>
+    </div>
+  </div>
+
+  <div class="grid" id="filesGrid"></div>
+</main>
+
+<div class="task-center">
+  <div class="task-header" onclick="toggleTaskCenter()">
+    <span id="taskCenterTitle">Central de Tarefas (0)</span>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <button style="padding:2px 6px;font-size:0.7rem;" onclick="event.stopPropagation();clearCompletedTasks()">Limpar</button>
+      <span id="taskCollapseIcon">▼</span>
+    </div>
+  </div>
+  <div class="task-body" id="taskListContainer">
+    <div style="color:var(--muted);font-size:0.78rem;">Nenhuma tarefa ativa no momento.</div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="authModal">
+  <div class="modal">
+    <h3 id="authTitle">Autenticação Segura IFGestor</h3>
+    <p id="authSubtitle">Digite o seu PIN de segurança (enviado de forma oculta via POST HTTPS).</p>
+
+    <div id="stepPin">
+      <input type="password" id="loginPinInput" placeholder="PIN (ex: 1234 no 1º acesso)" style="width:100%;margin-bottom:10px;" onkeydown="if(event.key==='Enter')submitPin()">
+      <button class="btn-primary" style="width:100%;" onclick="submitPin()">Continuar</button>
+    </div>
+
+    <div id="stepChangePin" style="display:none;flex-direction:column;gap:8px;">
+      <input type="password" id="currentPinInput" placeholder="PIN Atual (1234)" style="width:100%;">
+      <input type="password" id="newPinInput" placeholder="Novo PIN numérico (4 a 8 dígitos, diferente de 1234)" style="width:100%;">
+      <button class="btn-warning" style="width:100%;" onclick="submitChangeDefaultPin()">Salvar Novo PIN e Gerar 2FA</button>
+    </div>
+
+    <div id="step2fa" style="display:none;flex-direction:column;gap:8px;">
+      <input type="text" id="twoFaCodeInput" maxlength="6" placeholder="Código 2FA de 6 dígitos (veja no telemóvel)" style="width:100%;letter-spacing:3px;font-weight:700;text-align:center;" onkeydown="if(event.key==='Enter')submit2fa()">
+      <button class="btn-success" style="width:100%;" onclick="submit2fa()">Validar 2FA e Acessar</button>
+    </div>
+
+    <div id="authError" style="color:var(--danger);font-size:0.82rem;"></div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="p2pModal">
+  <div class="modal">
+    <h3>Transferência P2P entre Telemóveis (Duplo 2FA)</h3>
+    <p id="p2pStatusText">Selecione o telemóvel de destino na mesma rede Wi-Fi.</p>
+    <div id="p2pStep1" style="display:flex;flex-direction:column;gap:8px;">
+      <label style="font-size:0.8rem;">Telemóvel de Destino:</label>
+      <select id="p2pTargetPeerSelect"></select>
+      <label style="font-size:0.8rem;">Subpasta no Destino:</label>
+      <input type="text" id="p2pTargetFolderInput" value="Geral">
+      <button class="btn-primary" onclick="startP2pHandshake()">1. Gerar 2FA no Telemóvel de Origem</button>
+    </div>
+    <div id="p2pStep2" style="display:none;flex-direction:column;gap:8px;">
+      <input type="text" id="p2pSourceCodeInput" placeholder="Código 2FA do Telemóvel de ORIGEM">
+      <button class="btn-warning" onclick="confirmP2pSource()">2. Confirmar Origem e Solicitar Destino</button>
+    </div>
+    <div id="p2pStep3" style="display:none;flex-direction:column;gap:8px;">
+      <input type="text" id="p2pReceiverCodeInput" placeholder="Código 2FA do Telemóvel de DESTINO">
+      <button class="btn-success" onclick="confirmP2pReceiver()">3. Confirmar Destino e Iniciar Envio</button>
+    </div>
+    <button onclick="closeModal('p2pModal')">Fechar</button>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="moveModal">
+  <div class="modal">
+    <h3>Mover Ficheiros Selecionados</h3>
+    <p>Escolha a subpasta de destino dentro do Sandbox DCIM/Camera/IFgestor:</p>
+    <select id="moveTargetSubfolderSelect"></select>
+    <div style="display:flex;gap:8px;">
+      <button class="btn-primary" style="flex:1;" onclick="confirmMoveFiles()">Mover Agora</button>
+      <button onclick="closeModal('moveModal')">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="whatsappModal">
+  <div class="modal">
+    <h3>Compartilhamento Integrado WhatsApp (2FA Ativo)</h3>
+    <p>Escolha como deseja enviar os ficheiros selecionados:</p>
+    <button class="btn-success" onclick="copySelectedImageToClipboardAndOpenWa()">1. Copiar Imagem para Área de Transferência (Ctrl+V no WhatsApp Web)</button>
+    <button class="btn-primary" onclick="shareViaBrowserWebShare()">2. Compartilhar via Web Share API do Navegador</button>
+    <button class="btn-warning" onclick="triggerNativePhoneWhatsApp()">3. Abrir Compartilhamento Direto no Telemóvel (FileProvider)</button>
+    <button onclick="closeModal('whatsappModal')">Fechar</button>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="auditModal">
+  <div class="modal" style="max-width:740px;">
+    <h3>Trilha de Auditoria e Segurança (Audit Log)</h3>
+    <div id="auditListContainer" style="max-height:360px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;font-size:0.78rem;"></div>
+    <button onclick="closeModal('auditModal')">Fechar</button>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="lightboxModal">
+  <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
+    <div id="lightboxMediaWrap"></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;">
+      <button onclick="lightboxPrev()">◀ Anterior</button>
+      <button class="btn-success" onclick="copyCurrentLightboxToWhatsApp()">Copiar p/ WhatsApp Web (Ctrl+V)</button>
+      <button class="btn-primary" onclick="downloadCurrentLightbox()">Baixar</button>
+      <button onclick="lightboxNext()">Próximo ▶</button>
+      <button class="btn-danger" onclick="closeModal('lightboxModal')">Fechar</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toastBox"></div>
+
+<script>
+let sessionToken = localStorage.getItem('ifgestor_token') || '';
+let activeSubfolder = 'Geral';
+let currentFiles = [];
+let selectedSet = new Set();
+let peersList = [];
+let activeP2pTransferId = '';
+let lightboxIndex = 0;
+let localUploadTasks = {};
+
+function showToast(msg) {
+  const box = document.getElementById('toastBox');
+  box.textContent = msg;
+  box.style.display = 'block';
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(function() { box.style.display = 'none'; }, 3800);
+}
+
+function toggleTheme() {
+  document.body.classList.toggle('light');
+}
+
+function closeModal(id) {
+  document.getElementById(id).classList.remove('show');
+}
+
+async function apiFetch(path, options) {
+  options = options || {};
+  const headers = options.headers || {};
+  if (sessionToken) headers['X-Session-Token'] = sessionToken;
+  if (options.body && typeof options.body === 'object' && !(options.body instanceof Blob)) {
+    headers['Content-Type'] = 'application/json; charset=utf-8';
+    options.body = JSON.stringify(options.body);
+  }
+  options.headers = headers;
+  const resp = await fetch(path, options);
+  const data = await resp.json().catch(function() { return { ok: false, error: 'Erro de comunicacao' }; });
+  if (resp.status === 401 && !path.startsWith('/api/login') && !path.startsWith('/api/verify-2fa')) {
+    openAuthModal();
+  }
+  return { status: resp.status, data: data };
+}
+
+async function checkInitialAuth() {
+  const res = await apiFetch('/api/auth/status');
+  if (!res.data.authenticated) {
+    openAuthModal();
+  } else {
+    closeModal('authModal');
+    await refreshFilesAjax();
+    await pollTasksAndPeers();
+  }
+}
+
+function openAuthModal() {
+  document.getElementById('authError').textContent = '';
+  document.getElementById('stepPin').style.display = 'block';
+  document.getElementById('stepChangePin').style.display = 'none';
+  document.getElementById('step2fa').style.display = 'none';
+  document.getElementById('authModal').classList.add('show');
+}
+
+async function submitPin() {
+  const pin = document.getElementById('loginPinInput').value.trim();
+  const res = await apiFetch('/api/login', { method: 'POST', body: { pin: pin } });
+  const data = res.data;
+  if (!data.ok) {
+    document.getElementById('authError').textContent = data.error || 'Falha no login.';
+    return;
+  }
+  sessionToken = data.sessionToken;
+  localStorage.setItem('ifgestor_token', sessionToken);
+  document.getElementById('authError').textContent = '';
+
+  if (data.mustChangePin) {
+    document.getElementById('authTitle').textContent = 'Troca Obrigatoria do PIN Padrao (1234)';
+    document.getElementById('authSubtitle').textContent = data.message;
+    document.getElementById('currentPinInput').value = pin;
+    document.getElementById('stepPin').style.display = 'none';
+    document.getElementById('stepChangePin').style.display = 'flex';
+  } else {
+    document.getElementById('authTitle').textContent = 'Verificacao em Duas Etapas (2FA)';
+    document.getElementById('authSubtitle').textContent = data.message;
+    document.getElementById('stepPin').style.display = 'none';
+    document.getElementById('step2fa').style.display = 'flex';
+  }
+}
+
+async function submitChangeDefaultPin() {
+  const currentPin = document.getElementById('currentPinInput').value.trim();
+  const newPin = document.getElementById('newPinInput').value.trim();
+  const res = await apiFetch('/api/change-pin', { method: 'POST', body: { currentPin: currentPin, newPin: newPin } });
+  const data = res.data;
+  if (!data.ok) {
+    document.getElementById('authError').textContent = data.error || 'Nao foi possivel alterar o PIN.';
+    return;
+  }
+  document.getElementById('authError').textContent = '';
+  document.getElementById('authTitle').textContent = 'Confirme o Codigo 2FA';
+  document.getElementById('authSubtitle').textContent = data.message;
+  document.getElementById('stepChangePin').style.display = 'none';
+  document.getElementById('step2fa').style.display = 'flex';
+}
+
+async function submit2fa() {
+  const code = document.getElementById('twoFaCodeInput').value.trim();
+  const res = await apiFetch('/api/verify-2fa', { method: 'POST', body: { code: code } });
+  const data = res.data;
+  if (!data.ok) {
+    document.getElementById('authError').textContent = data.error || 'Codigo 2FA incorreto.';
+    return;
+  }
+  closeModal('authModal');
+  showToast('Sessao autenticada com 2FA!');
+  await refreshFilesAjax();
+  await pollTasksAndPeers();
+}
+
+async function doLogout() {
+  await apiFetch('/api/logout', { method: 'POST' });
+  sessionToken = '';
+  localStorage.removeItem('ifgestor_token');
+  openAuthModal();
+}
+
+async function refreshFilesAjax(subfolder) {
+  const targetSub = subfolder || activeSubfolder;
+  const res = await apiFetch('/api/files?subfolder=' + encodeURIComponent(targetSub));
+  const data = res.data;
+  if (!data.ok) return;
+  activeSubfolder = data.activeSubfolder;
+  currentFiles = data.files || [];
+
+  const pillsWrap = document.getElementById('folderPills');
+  pillsWrap.innerHTML = '';
+  (data.subfolders || []).forEach(function(sub) {
+    const pill = document.createElement('div');
+    pill.className = 'pill' + (sub === activeSubfolder ? ' active' : '');
+    pill.textContent = '📁 ' + sub;
+    pill.onclick = function() { selectedSet.clear(); refreshFilesAjax(sub); };
+    pillsWrap.appendChild(pill);
+  });
+
+  const moveSelect = document.getElementById('moveTargetSubfolderSelect');
+  moveSelect.innerHTML = '';
+  (data.subfolders || []).forEach(function(sub) {
+    const opt = document.createElement('option');
+    opt.value = sub;
+    opt.textContent = sub;
+    moveSelect.appendChild(opt);
+  });
+
+  renderFilesGrid();
+}
+
+function renderFilesGrid() {
+  const grid = document.getElementById('filesGrid');
+  grid.innerHTML = '';
+  document.getElementById('selectionCount').textContent = selectedSet.size + ' selecionado(s)';
+
+  if (currentFiles.length === 0) {
+    grid.innerHTML = '<div style="grid-column:1/-1;padding:40px;text-align:center;color:var(--muted);">Nenhum ficheiro nesta subpasta do Sandbox.</div>';
+    return;
+  }
+
+  currentFiles.forEach(function(f, idx) {
+    const isSel = selectedSet.has(f.name);
+    const card = document.createElement('div');
+    card.className = 'card' + (isSel ? ' selected' : '');
+
+    const thumbUrl = '/api/thumb?subfolder=' + encodeURIComponent(activeSubfolder) +
+                     '&name=' + encodeURIComponent(f.name) +
+                     '&sessionToken=' + encodeURIComponent(sessionToken);
+
+    const downloadUrl = '/api/file?subfolder=' + encodeURIComponent(activeSubfolder) +
+                        '&name=' + encodeURIComponent(f.name) +
+                        '&download=1&sessionToken=' + encodeURIComponent(sessionToken);
+
+    const safeNameJs = f.name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+    let html = '<div class="thumb-wrap" onclick="openLightbox(' + idx + ')">';
+    html += '<input type="checkbox" class="card-check" ' + (isSel ? 'checked' : '') +
+            ' onclick="event.stopPropagation();toggleFileSelect(\'' + safeNameJs + '\')">';
+    if (f.locked) {
+      html += '<span class="lock-badge">EM TRANSITO</span>';
+    }
+    html += '<img src="' + thumbUrl + '" loading="lazy" alt="' + f.name + '">';
+    html += '</div>';
+    html += '<div class="card-body">';
+    html += '<div class="card-title" title="' + f.name + '">' + f.name + '</div>';
+    html += '<div class="card-meta"><span>' + f.formattedSize + '</span><span>' + f.formattedDate + '</span></div>';
+    html += '<div class="card-actions">';
+    html += '<button onclick="copySingleImageToWhatsApp(\'' + safeNameJs + '\')">WhatsApp</button>';
+    html += '<button onclick="window.location=\'' + downloadUrl + '\'">Baixar</button>';
+    html += '</div></div>';
+
+    card.innerHTML = html;
+    grid.appendChild(card);
+  });
+}
+
+function toggleFileSelect(name) {
+  if (selectedSet.has(name)) selectedSet.delete(name);
+  else selectedSet.add(name);
+  renderFilesGrid();
+}
+
+function toggleSelectAll() {
+  if (selectedSet.size === currentFiles.length) selectedSet.clear();
+  else currentFiles.forEach(function(f) { selectedSet.add(f.name); });
+  renderFilesGrid();
+}
+
+async function promptNewSubfolder() {
+  const folderName = prompt('Nome da nova subpasta dentro de DCIM/Camera/IFgestor:');
+  if (!folderName) return;
+  const res = await apiFetch('/api/subfolder/create', { method: 'POST', body: { folderName: folderName, setAsActive: true } });
+  if (res.data.ok) {
+    showToast('Subpasta criada: ' + res.data.folderName);
+    await refreshFilesAjax(res.data.folderName);
+  }
+}
+
+function uploadSelectedFiles(fileList) {
+  if (!fileList || fileList.length === 0) return;
+  Array.from(fileList).forEach(function(file) {
+    const localId = 'up_' + Math.random().toString(36).substring(2, 8);
+    localUploadTasks[localId] = {
+      id: localId, title: 'Enviando ' + file.name, subtitle: '0%', progressPercent: 0, status: 'RUNNING'
+    };
+
+    const xhr = new XMLHttpRequest();
+    const url = '/api/upload?subfolder=' + encodeURIComponent(activeSubfolder) + '&fileName=' + encodeURIComponent(file.name);
+    xhr.open('POST', url, true);
+    xhr.setRequestHeader('X-Session-Token', sessionToken);
+
+    xhr.upload.onprogress = function(e) {
+      if (e.lengthComputable) {
+        const pct = Math.round((e.loaded * 100) / e.total);
+        localUploadTasks[localId].progressPercent = pct;
+        localUploadTasks[localId].subtitle = pct + '% enviado';
+      }
+    };
+    xhr.onload = function() {
+      delete localUploadTasks[localId];
+      refreshFilesAjax(activeSubfolder);
+    };
+    xhr.onerror = function() {
+      localUploadTasks[localId].status = 'FAILED';
+      localUploadTasks[localId].subtitle = 'Falha no envio';
+    };
+    xhr.send(file);
+  });
+  document.getElementById('fileUploadInput').value = '';
+}
+
+function downloadSelectedZip() {
+  const names = selectedSet.size > 0 ? Array.from(selectedSet).join(',') : 'ALL';
+  const url = '/api/download-zip?subfolder=' + encodeURIComponent(activeSubfolder) +
+              '&files=' + encodeURIComponent(names) +
+              '&sessionToken=' + encodeURIComponent(sessionToken);
+  showToast('Iniciando download .ZIP via streaming...');
+  window.location.href = url;
+}
+
+function openMoveModal() {
+  if (selectedSet.size === 0) { showToast('Selecione ao menos 1 ficheiro.'); return; }
+  document.getElementById('moveModal').classList.add('show');
+}
+
+async function confirmMoveFiles() {
+  const targetSubfolder = document.getElementById('moveTargetSubfolderSelect').value;
+  const res = await apiFetch('/api/move', {
+    method: 'POST',
+    body: { sourceSubfolder: activeSubfolder, targetSubfolder: targetSubfolder, fileNames: Array.from(selectedSet) }
+  });
+  closeModal('moveModal');
+  if (res.data.ok) {
+    selectedSet.clear();
+    showToast(res.data.movedCount + ' ficheiro(s) movido(s)!');
+    await refreshFilesAjax(activeSubfolder);
+  }
+}
+
+async function deleteSelectedFiles() {
+  if (selectedSet.size === 0) { showToast('Selecione ao menos 1 ficheiro.'); return; }
+  if (!confirm('Deseja excluir permanentemente ' + selectedSet.size + ' ficheiro(s)?')) return;
+  const res = await apiFetch('/api/delete', {
+    method: 'POST',
+    body: { subfolder: activeSubfolder, fileNames: Array.from(selectedSet) }
+  });
+  if (res.data.ok) {
+    selectedSet.clear();
+    showToast(res.data.deletedCount + ' ficheiro(s) excluido(s).');
+    await refreshFilesAjax(activeSubfolder);
+  }
+}
+
+function openP2pModal() {
+  if (selectedSet.size === 0) { showToast('Selecione os ficheiros que deseja transferir via P2P.'); return; }
+  const sel = document.getElementById('p2pTargetPeerSelect');
+  sel.innerHTML = '';
+  const remotePeers = peersList.filter(function(p) { return !p.isSelf; });
+  if (remotePeers.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'Nenhum outro telemovel IFGestor encontrado na rede';
+    sel.appendChild(opt);
+  } else {
+    remotePeers.forEach(function(p) {
+      const opt = document.createElement('option');
+      opt.value = JSON.stringify(p);
+      opt.textContent = p.nickname + ' (' + p.hostname + ' / ' + p.ipAddress + ')';
+      sel.appendChild(opt);
+    });
+  }
+  document.getElementById('p2pTargetFolderInput').value = activeSubfolder;
+  document.getElementById('p2pStep1').style.display = 'flex';
+  document.getElementById('p2pStep2').style.display = 'none';
+  document.getElementById('p2pStep3').style.display = 'none';
+  document.getElementById('p2pModal').classList.add('show');
+}
+
+async function startP2pHandshake() {
+  const rawPeer = document.getElementById('p2pTargetPeerSelect').value;
+  if (!rawPeer) { showToast('Nenhum telemovel de destino disponivel.'); return; }
+  const peer = JSON.parse(rawPeer);
+  const targetSubfolder = document.getElementById('p2pTargetFolderInput').value.trim() || 'Geral';
+
+  const res = await apiFetch('/api/p2p/initiate', {
+    method: 'POST',
+    body: {
+      sourceSubfolder: activeSubfolder,
+      targetSubfolder: targetSubfolder,
+      peerIp: peer.ipAddress,
+      peerPort: peer.port,
+      peerNickname: peer.nickname,
+      fileNames: Array.from(selectedSet)
+    }
+  });
+  if (!res.data.ok) { showToast(res.data.error || 'Erro ao iniciar P2P'); return; }
+  activeP2pTransferId = res.data.transferId;
+  document.getElementById('p2pStatusText').textContent = res.data.message;
+  document.getElementById('p2pStep1').style.display = 'none';
+  document.getElementById('p2pStep2').style.display = 'flex';
+}
+
+async function confirmP2pSource() {
+  const code = document.getElementById('p2pSourceCodeInput').value.trim();
+  const res = await apiFetch('/api/p2p/confirm-source', {
+    method: 'POST',
+    body: { transferId: activeP2pTransferId, code: code }
+  });
+  if (!res.data.ok) { showToast(res.data.error || 'Codigo 2FA de origem invalido'); return; }
+  document.getElementById('p2pStatusText').textContent = res.data.message;
+  document.getElementById('p2pStep2').style.display = 'none';
+  document.getElementById('p2pStep3').style.display = 'flex';
+}
+
+async function confirmP2pReceiver() {
+  const code = document.getElementById('p2pReceiverCodeInput').value.trim();
+  const res = await apiFetch('/api/p2p/confirm-receiver', {
+    method: 'POST',
+    body: { transferId: activeP2pTransferId, code: code }
+  });
+  if (!res.data.ok) { showToast(res.data.error || 'Codigo 2FA de destino invalido'); return; }
+  showToast(res.data.message);
+  closeModal('p2pModal');
+  selectedSet.clear();
+  renderFilesGrid();
+}
+
+async function approveIncomingP2pPrompt(transferId, senderName) {
+  const code = prompt('Digite o codigo 2FA exibido na notificacao deste telemovel para aceitar ficheiros de ' + senderName + ':');
+  if (!code) return;
+  const res = await apiFetch('/api/p2p/approve-incoming', {
+    method: 'POST',
+    body: { transferId: transferId, code: code }
+  });
+  if (res.data.ok) showToast('Recebimento P2P autorizado! Aguarde o termino na Central de Tarefas.');
+  else showToast(res.data.error || 'Codigo 2FA invalido.');
+}
+
+function openWhatsAppModal() {
+  if (selectedSet.size === 0) { showToast('Selecione ao menos 1 ficheiro.'); return; }
+  document.getElementById('whatsappModal').classList.add('show');
+}
+
+async function copyImageBlobToClipboard(fileName) {
+  const url = '/api/file?subfolder=' + encodeURIComponent(activeSubfolder) + '&name=' + encodeURIComponent(fileName) + '&sessionToken=' + encodeURIComponent(sessionToken);
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  await new Promise(function(resolve, reject) { img.onload = resolve; img.onerror = reject; img.src = url; });
+  const canvas = document.createElement('canvas');
+  canvas.width = img.naturalWidth;
+  canvas.height = img.naturalHeight;
+  canvas.getContext('2d').drawImage(img, 0, 0);
+  const pngBlob = await new Promise(function(r) { canvas.toBlob(r, 'image/png'); });
+  await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+}
+
+async function copySingleImageToWhatsApp(fileName) {
+  try {
+    await copyImageBlobToClipboard(fileName);
+    showToast('Imagem copiada! Pressione Ctrl+V na conversa do WhatsApp Web.');
+    window.open('https://web.whatsapp.com/', '_blank');
+  } catch (e) {
+    showToast('Use o botao de disparo no telemovel ou baixe o ficheiro.');
+  }
+}
+
+async function copySelectedImageToClipboardAndOpenWa() {
+  const first = Array.from(selectedSet)[0];
+  closeModal('whatsappModal');
+  if (first) await copySingleImageToWhatsApp(first);
+}
+
+async function shareViaBrowserWebShare() {
+  try {
+    const filesToShare = [];
+    const list = Array.from(selectedSet);
+    for (let i = 0; i < list.length; i++) {
+      const name = list[i];
+      const url = '/api/file?subfolder=' + encodeURIComponent(activeSubfolder) + '&name=' + encodeURIComponent(name) + '&sessionToken=' + encodeURIComponent(sessionToken);
+      const resp = await fetch(url);
+      const blob = await resp.blob();
+      filesToShare.push(new File([blob], name, { type: blob.type || 'image/jpeg' }));
+    }
+    if (navigator.canShare && navigator.canShare({ files: filesToShare })) {
+      await navigator.share({ title: 'IFGestor Media', files: filesToShare });
+      closeModal('whatsappModal');
+    } else {
+      showToast('Web Share API nao suportada neste navegador. Use a opcao 1 (Ctrl+V) ou 3.');
+    }
+  } catch (e) {
+    showToast('Compartilhamento cancelado ou indisponivel.');
+  }
+}
+
+async function triggerNativePhoneWhatsApp() {
+  const res = await apiFetch('/api/whatsapp-trigger', {
+    method: 'POST',
+    body: { subfolder: activeSubfolder, fileNames: Array.from(selectedSet) }
+  });
+  closeModal('whatsappModal');
+  if (res.data.ok) showToast('WhatsApp aberto na tela do telemovel com ' + res.data.sharedCount + ' ficheiro(s)!');
+  else showToast(res.data.error || 'Erro ao acionar WhatsApp no telemovel.');
+}
+
+function openLightbox(idx) {
+  lightboxIndex = idx;
+  renderLightboxMedia();
+  document.getElementById('lightboxModal').classList.add('show');
+}
+
+function renderLightboxMedia() {
+  const f = currentFiles[lightboxIndex];
+  if (!f) return;
+  const wrap = document.getElementById('lightboxMediaWrap');
+  const url = '/api/file?subfolder=' + encodeURIComponent(activeSubfolder) + '&name=' + encodeURIComponent(f.name) + '&sessionToken=' + encodeURIComponent(sessionToken);
+  if (f.isVideo) {
+    wrap.innerHTML = '<video class="lightbox-content" src="' + url + '" controls autoplay></video>';
+  } else {
+    wrap.innerHTML = '<img class="lightbox-content" src="' + url + '" alt="' + f.name + '">';
+  }
+}
+
+function lightboxPrev() {
+  if (currentFiles.length === 0) return;
+  lightboxIndex = (lightboxIndex - 1 + currentFiles.length) % currentFiles.length;
+  renderLightboxMedia();
+}
+
+function lightboxNext() {
+  if (currentFiles.length === 0) return;
+  lightboxIndex = (lightboxIndex + 1) % currentFiles.length;
+  renderLightboxMedia();
+}
+
+function copyCurrentLightboxToWhatsApp() {
+  const f = currentFiles[lightboxIndex];
+  if (f) copySingleImageToWhatsApp(f.name);
+}
+
+function downloadCurrentLightbox() {
+  const f = currentFiles[lightboxIndex];
+  if (!f) return;
+  window.location = '/api/file?subfolder=' + encodeURIComponent(activeSubfolder) + '&name=' + encodeURIComponent(f.name) + '&download=1&sessionToken=' + encodeURIComponent(sessionToken);
+}
+
+async function openAuditModal() {
+  const res = await apiFetch('/api/audit');
+  const container = document.getElementById('auditListContainer');
+  container.innerHTML = '';
+  (res.data.logs || []).forEach(function(item) {
+    const row = document.createElement('div');
+    row.style.padding = '8px';
+    row.style.borderRadius = '6px';
+    row.style.background = 'var(--bg)';
+    row.style.borderLeft = '3px solid ' + (item.success ? 'var(--success)' : 'var(--danger)');
+    row.innerHTML = '<strong>[' + item.formattedTime + '] ' + item.action + '</strong> — <em>' + item.actor + '</em><br>' + item.details;
+    container.appendChild(row);
+  });
+  document.getElementById('auditModal').classList.add('show');
+}
+
+function onSwitchPeerDevice(url) {
+  if (url && url !== window.location.origin) {
+    window.location.href = url;
+  }
+}
+
+function toggleTaskCenter() {
+  const body = document.getElementById('taskListContainer');
+  body.classList.toggle('collapsed');
+}
+
+async function clearCompletedTasks() {
+  await apiFetch('/api/tasks/clear', { method: 'POST' });
+  await pollTasksAndPeers();
+}
+
+async function pollTasksAndPeers() {
+  if (!sessionToken) return;
+  try {
+    const res = await apiFetch('/api/tasks');
+    if (res.status !== 200 || !res.data.ok) return;
+    const data = res.data;
+
+    peersList = data.peers || [];
+    const peerSelect = document.getElementById('peerSelect');
+    peerSelect.innerHTML = '';
+    peersList.forEach(function(p) {
+      const opt = document.createElement('option');
+      opt.value = p.httpsUrl;
+      opt.selected = p.isSelf;
+      opt.textContent = p.nickname + ' — ' + p.hostname + ' (' + p.ipAddress + ')';
+      peerSelect.appendChild(opt);
+    });
+
+    const incoming = data.pendingIncomingP2p || [];
+    const banner = document.getElementById('incomingP2pBanner');
+    if (incoming.length > 0 && !incoming[0].receiver2faVerified) {
+      const inc = incoming[0];
+      const safeSender = (inc.senderNickname || '').replace(/'/g, "\\'");
+      banner.style.display = 'block';
+      banner.innerHTML = '<strong>📲 Recebimento P2P Pendente:</strong> <b>' + inc.senderNickname +
+        '</b> (' + inc.senderIp + ') deseja enviar ' + inc.fileCount +
+        ' ficheiro(s) para a pasta <b>' + inc.targetSubfolder + '</b>. ' +
+        '<button class="btn-warning" style="margin-left:10px;" onclick="approveIncomingP2pPrompt(\'' +
+        inc.transferId + '\',\'' + safeSender + '\')">Digitar 2FA de Destino</button>';
+    } else {
+      banner.style.display = 'none';
+    }
+
+    const serverTasks = data.tasks || [];
+    const allTasks = Object.values(localUploadTasks).concat(serverTasks);
+    document.getElementById('taskCenterTitle').textContent = 'Central de Tarefas (' + allTasks.length + ')';
+    const listWrap = document.getElementById('taskListContainer');
+
+    if (allTasks.length === 0) {
+      listWrap.innerHTML = '<div style="color:var(--muted);font-size:0.78rem;">Nenhuma tarefa ativa no momento.</div>';
+    } else {
+      listWrap.innerHTML = '';
+      allTasks.forEach(function(t) {
+        const div = document.createElement('div');
+        div.className = 'task-item';
+        div.innerHTML =
+          '<div style="display:flex;justify-content:space-between;font-weight:600;">' +
+            '<span>' + t.title + '</span><span>' + t.progressPercent + '%</span>' +
+          '</div>' +
+          '<div style="color:var(--muted);margin-top:2px;">' + t.subtitle + '</div>' +
+          '<div class="progress-bar"><div class="progress-fill" style="width:' + t.progressPercent + '%"></div></div>';
+        listWrap.appendChild(div);
+      });
+    }
+  } catch (_e) {}
+}
+
+setInterval(pollTasksAndPeers, 1500);
+checkInitialAuth();
+</script>
+</body>
+</html>
