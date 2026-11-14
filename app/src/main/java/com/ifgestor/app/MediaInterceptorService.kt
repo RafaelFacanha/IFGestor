@@ -5,466 +5,549 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.database.ContentObserver
 import android.media.MediaScannerConnection
 import android.net.Uri
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.PowerManager
 import android.provider.MediaStore
-import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 class MediaInterceptorService : Service() {
 
-    companion object {
-        const val ACTION_START = "com.ifgestor.app.ACTION_START"
-        const val ACTION_STOP = "com.ifgestor.app.ACTION_STOP"
-        const val ACTION_TOGGLE_OVERLAY = "com.ifgestor.app.ACTION_TOGGLE_OVERLAY"
-        const val ACTION_REFRESH_CONFIG = "com.ifgestor.app.ACTION_REFRESH_CONFIG"
-        const val ACTION_APPROVE_2FA = "com.ifgestor.app.ACTION_APPROVE_2FA"
-        private const val CHANNEL_ID = "ifgestor_interceptor_channel"
-        private const val AUTH_CHANNEL_ID = "ifgestor_2fa_channel"
-        private const val NOTIFICATION_ID = 1001
-        private const val TWO_FA_NOTIFICATION_ID = 1002
-    }
+    private lateinit var settings: SettingsManager
+    private lateinit var audit: AuditLogManager
+    private lateinit var taskManager: FileLockAndTaskManager
+    private lateinit var webServer: WebServerManager
+    private lateinit var mdnsManager: MdnsDiscoveryManager
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val processedFiles = ConcurrentHashMap.newKeySet<String>()
-    private var serviceStartEpochSeconds: Long = 0L
     private var mediaObserver: ContentObserver? = null
-    private var overlayManager: FloatingOverlayManager? = null
+    private var observerRegistered = false
 
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+    // ITEM 3: Trava Anti-Loop para impedir reprocessamento do mesmo arquivo pelo ContentObserver
+    private val recentlyProcessedUris = ConcurrentHashMap.newKeySet<String>()
+    private val recentlyProcessedPaths = ConcurrentHashMap.newKeySet<String>()
+    private var serviceStartTimestamp: Long = System.currentTimeMillis()
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannels()
-        SettingsManager.syncStateFromPrefs(this)
-        serviceStartEpochSeconds = (System.currentTimeMillis() / 1000) - 2
-        acquireLocksForScreenOff()
+        settings = SettingsManager(applicationContext)
+        audit = AuditLogManager.getInstance(applicationContext)
+        taskManager = FileLockAndTaskManager.getInstance(applicationContext)
+        webServer = WebServerManager.getInstance(applicationContext)
+        mdnsManager = MdnsDiscoveryManager.getInstance(applicationContext)
 
-        overlayManager = FloatingOverlayManager(this) {
-            updateNotification()
-        }
-
-        SettingsManager.onTwoFactorRequestWithAction = { code, clientIp, actionDesc ->
-            showTwoFactorNotification(code, clientIp, actionDesc)
-        }
-
-        registerMediaObservers()
+        ensureForegroundChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> {
-                stopInterceptorService()
-                return START_NOT_STICKY
+        val action = intent?.action ?: ACTION_SYNC_ENGINES
+
+        when (action) {
+            ACTION_START_INTERCEPTOR -> setInterceptorEngineState(true)
+            ACTION_STOP_INTERCEPTOR -> setInterceptorEngineState(false)
+            ACTION_TOGGLE_INTERCEPTOR -> setInterceptorEngineState(!_interceptorRunningFlow.value)
+
+            ACTION_START_SERVER -> setWebServerEngineState(true)
+            ACTION_STOP_SERVER -> setWebServerEngineState(false)
+            ACTION_TOGGLE_SERVER -> setWebServerEngineState(!_webServerRunningFlow.value)
+
+            ACTION_START_BOTH -> {
+                setInterceptorEngineState(true)
+                setWebServerEngineState(true)
             }
-            ACTION_TOGGLE_OVERLAY -> {
-                overlayManager?.toggleVisibility()
-                return START_STICKY
+
+            ACTION_STOP_ALL -> {
+                setInterceptorEngineState(false)
+                setWebServerEngineState(false)
             }
-            ACTION_REFRESH_CONFIG -> {
-                syncWebServerState()
-                overlayManager?.refreshBubbleLabel()
-                updateNotification()
-                return START_STICKY
+
+            ACTION_REFRESH_UI -> {
+                refreshNotificationsAndWidgets()
             }
-            ACTION_APPROVE_2FA -> {
-                val approvedCode = SettingsManager.approvePendingTwoFactor()
-                val manager = getSystemService(NotificationManager::class.java)
-                manager?.cancel(TWO_FA_NOTIFICATION_ID)
-                if (approvedCode != null) {
-                    Handler(Looper.getMainLooper()).post {
-                        Toast.makeText(
-                            this,
-                            "✓ Operação autorizada no computador!",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                }
-                return START_STICKY
+
+            else -> {
+                // Restaura o estado salvo nas preferências se o serviço for reiniciado pelo sistema
+                val savedInterceptor = settings.isInterceptorActive()
+                val savedServer = settings.isWebServerActive()
+                setInterceptorEngineState(savedInterceptor)
+                setWebServerEngineState(savedServer)
             }
         }
 
-        SettingsManager.setServiceRunning(true)
-        syncWebServerState()
-
-        val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
-
-        if (SettingsManager.isOverlayEnabled(this)) {
-            overlayManager?.show()
-            overlayManager?.refreshBubbleLabel()
-        } else {
-            overlayManager?.hide()
-        }
-
+        evaluateServiceLifecycle()
         return START_STICKY
     }
 
-    private fun showTwoFactorNotification(code: String, clientIp: String, actionDesc: String) {
-        val openAppIntent = Intent(this, MainActivity::class.java)
-        val openAppPending = PendingIntent.getActivity(
-            this,
-            3,
-            openAppIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+    // =========================================================================
+    // ITEM 12: Controle Independente dos Dois Motores (Interceptador vs Servidor Web)
+    // =========================================================================
 
-        val approveIntent = Intent(this, MediaInterceptorService::class.java).apply {
-            action = ACTION_APPROVE_2FA
-        }
-        val approvePending = PendingIntent.getService(
-            this,
-            4,
-            approveIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        val notification = NotificationCompat.Builder(this, AUTH_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_ifgestor_logo)
-            .setContentTitle("Código 2FA: $code • $actionDesc")
-            .setContentText("PC ($clientIp) aguarda confirmação. Digite o código ou aprove abaixo.")
-            .setStyle(
-                NotificationCompat.BigTextStyle().bigText(
-                    "Operação solicitada: $actionDesc\n" +
-                        "Computador: $clientIp\n" +
-                        "Código 2FA: $code (ou toque em 'Aprovar Agora')"
+    private fun setInterceptorEngineState(enable: Boolean) {
+        if (enable) {
+            if (!observerRegistered) {
+                serviceStartTimestamp = (System.currentTimeMillis() / 1000L) - 2L
+                registerMediaContentObserver()
+                observerRegistered = true
+                audit.logEvent(
+                    action = "INTERCEPTADOR_ATIVADO",
+                    actor = "Motor Mobile",
+                    details = "Monitorando câmera -> DCIM/Camera/IFgestor/${settings.getTargetSubfolder()} (Prefixo: ${settings.getFilePrefix()})",
+                    success = true
                 )
-            )
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .setContentIntent(openAppPending)
-            .addAction(
-                android.R.drawable.checkbox_on_background,
-                "✓ Aprovar Agora",
-                approvePending
-            )
-            .build()
-
-        val manager = getSystemService(NotificationManager::class.java)
-        manager?.notify(TWO_FA_NOTIFICATION_ID, notification)
-    }
-
-    private fun syncWebServerState() {
-        if (SettingsManager.isWebServerEnabled(this)) {
-            WebServerManager.startServer(this, SettingsManager.getServerPort(this))
-        } else {
-            WebServerManager.stopServer()
-        }
-    }
-
-    private fun acquireLocksForScreenOff() {
-        try {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "IFGestor::BackgroundWakeLock"
-            ).apply {
-                setReferenceCounted(false)
-                acquire()
             }
+            settings.setInterceptorActive(true)
+            _interceptorRunningFlow.value = true
 
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val lockType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            if (settings.isFloatingWidgetEnabled()) {
+                FloatingOverlayManager.getInstance(applicationContext).showOrUpdateOverlay()
+            }
+        } else {
+            if (observerRegistered) {
+                unregisterMediaContentObserver()
+                observerRegistered = false
+                audit.logEvent(
+                    action = "INTERCEPTADOR_PAUSADO",
+                    actor = "Motor Mobile",
+                    details = "Interceptação automática de fotos e vídeos desativada",
+                    success = true
+                )
+            }
+            settings.setInterceptorActive(false)
+            _interceptorRunningFlow.value = false
+            FloatingOverlayManager.getInstance(applicationContext).hideOverlay()
+        }
+        refreshNotificationsAndWidgets()
+    }
+
+    private fun setWebServerEngineState(enable: Boolean) {
+        if (enable) {
+            if (!webServer.isServerRunning()) {
+                val started = webServer.startServer(settings.getServerPort())
+                _webServerRunningFlow.value = started
+                settings.setWebServerActive(started)
+            } else {
+                _webServerRunningFlow.value = true
+                settings.setWebServerActive(true)
+            }
+        } else {
+            if (webServer.isServerRunning()) {
+                webServer.stopServer()
+            }
+            _webServerRunningFlow.value = false
+            settings.setWebServerActive(false)
+        }
+        refreshNotificationsAndWidgets()
+    }
+
+    private fun evaluateServiceLifecycle() {
+        val anyEngineActive = _interceptorRunningFlow.value || _webServerRunningFlow.value
+        if (anyEngineActive) {
+            startForeground(NOTIFICATION_ID_FOREGROUND, buildForegroundNotification())
+            IFGestorHomeWidgetProvider.updateAllWidgets(applicationContext)
+        } else {
+            FloatingOverlayManager.getInstance(applicationContext).hideOverlay()
+            IFGestorHomeWidgetProvider.updateAllWidgets(applicationContext)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
             } else {
                 @Suppress("DEPRECATION")
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                stopForeground(true)
             }
-            wifiLock = wm.createWifiLock(lockType, "IFGestor::BackgroundWifiLock").apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
+            stopSelf()
         }
     }
 
-    private fun releaseLocks() {
-        try {
-            if (wakeLock?.isHeld == true) wakeLock?.release()
-            if (wifiLock?.isHeld == true) wifiLock?.release()
-        } catch (e: Exception) {
-            e.printStackTrace()
+    fun refreshNotificationsAndWidgets() {
+        if (_interceptorRunningFlow.value || _webServerRunningFlow.value) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(NOTIFICATION_ID_FOREGROUND, buildForegroundNotification())
         }
+        if (_interceptorRunningFlow.value && settings.isFloatingWidgetEnabled()) {
+            FloatingOverlayManager.getInstance(applicationContext).showOrUpdateOverlay()
+        } else {
+            FloatingOverlayManager.getInstance(applicationContext).hideOverlay()
+        }
+        IFGestorHomeWidgetProvider.updateAllWidgets(applicationContext)
     }
 
-    private fun registerMediaObservers() {
-        mediaObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+    // =========================================================================
+    // ITEM 3: Interceptador de Mídia com Trava Anti-Loop e Sandbox Estrito
+    // =========================================================================
+
+    private fun registerMediaContentObserver() {
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 super.onChange(selfChange, uri)
+                if (!_interceptorRunningFlow.value || uri == null) return
+                val uriStr = uri.toString()
+
+                // Ignora URIs genéricas sem ID numérico ou já processadas recentemente
+                val id = try {
+                    ContentUris.parseId(uri)
+                } catch (_: Exception) {
+                    -1L
+                }
+                if (id <= 0L) return
+
+                val key = "$uriStr#$id"
+                if (!recentlyProcessedUris.add(key)) return
+
                 serviceScope.launch {
-                    delay(400)
-                    scanRecentCameraMedia()
+                    try {
+                        // Aguarda a câmera nativa concluir a gravação e liberar o descritor
+                        delay(750L)
+                        inspectAndInterceptMediaUri(uri)
+                    } finally {
+                        delay(10_000L)
+                        recentlyProcessedUris.remove(key)
+                    }
                 }
             }
         }
 
-        mediaObserver?.let { observer ->
-            contentResolver.registerContentObserver(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                true,
-                observer
-            )
-            contentResolver.registerContentObserver(
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                true,
-                observer
-            )
+        mediaObserver = observer
+        contentResolver.registerContentObserver(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            true,
+            observer
+        )
+        contentResolver.registerContentObserver(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            true,
+            observer
+        )
+    }
+
+    private fun unregisterMediaContentObserver() {
+        mediaObserver?.let {
+            try {
+                contentResolver.unregisterContentObserver(it)
+            } catch (_: Exception) {
+            }
         }
+        mediaObserver = null
     }
 
-    private fun scanRecentCameraMedia() {
-        queryAndIntercept(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
-        queryAndIntercept(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-    }
-
-    private fun queryAndIntercept(collectionUri: Uri) {
+    @Suppress("DEPRECATION")
+    private suspend fun inspectAndInterceptMediaUri(uri: Uri) {
         val projection = mutableListOf(
             MediaStore.MediaColumns._ID,
-            MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.DATA,
+            MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.DATE_ADDED
-        ).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                add(MediaStore.MediaColumns.IS_PENDING)
-            }
-        }.toTypedArray()
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            projection.add(MediaStore.MediaColumns.IS_PENDING)
+        }
 
-        val selection = "${MediaStore.MediaColumns.DATE_ADDED} >= ?"
-        val selectionArgs = arrayOf(serviceStartEpochSeconds.toString())
-        val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+        // Tenta até 4 vezes caso o arquivo ainda esteja com IS_PENDING == 1 (ex: vídeos longos ou HDR)
+        for (attempt in 1..4) {
+            var filePath: String? = null
+            var dateAdded = 0L
+            var isPending = 0
 
-        try {
-            contentResolver.query(
-                collectionUri,
-                projection,
-                selection,
-                selectionArgs,
-                sortOrder
-            )?.use { cursor ->
-                val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
-                val dataCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
-                val pendingCol = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    cursor.getColumnIndex(MediaStore.MediaColumns.IS_PENDING)
-                } else -1
-
-                while (cursor.moveToNext()) {
-                    val displayName = cursor.getString(nameCol) ?: continue
-                    val filePath = cursor.getString(dataCol) ?: continue
-
-                    if (pendingCol != -1 && cursor.getInt(pendingCol) == 1) {
-                        continue
+            contentResolver.query(uri, projection.toTypedArray(), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                    val dateIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_ADDED)
+                    if (dataIdx >= 0) filePath = cursor.getString(dataIdx)
+                    if (dateIdx >= 0) dateAdded = cursor.getLong(dateIdx)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val pendingIdx = cursor.getColumnIndex(MediaStore.MediaColumns.IS_PENDING)
+                        if (pendingIdx >= 0) isPending = cursor.getInt(pendingIdx)
                     }
-
-                    if (displayName.startsWith(".pending") || displayName.startsWith(".trashed")) {
-                        continue
-                    }
-
-                    val normalizedPath = filePath.replace("\\", "/")
-                    val isFromCamera = normalizedPath.contains("/DCIM/Camera/", ignoreCase = true) ||
-                        normalizedPath.contains("/DCIM/100ANDRO/", ignoreCase = true)
-
-                    if (!isFromCamera) continue
-
-                    val prefix = SettingsManager.getPrefix(this)
-                    val targetDir = File(SettingsManager.getTargetFolderPath(this))
-                    val sourceFile = File(filePath)
-
-                    if (!sourceFile.exists() || sourceFile.length() == 0L) continue
-
-                    if (sourceFile.parentFile?.absolutePath == targetDir.absolutePath &&
-                        prefix.isNotEmpty() && displayName.startsWith(prefix)
-                    ) {
-                        continue
-                    }
-
-                    if (processedFiles.contains(filePath)) continue
-
-                    processedFiles.add(filePath)
-                    moveAndRenameFile(sourceFile, displayName, prefix, targetDir)
                 }
             }
+
+            if (isPending == 1) {
+                delay(800L)
+                continue
+            }
+
+            val rawPath = filePath ?: return
+            val sourceFile = File(rawPath)
+            if (!sourceFile.exists() || !sourceFile.isFile || sourceFile.length() <= 0L) {
+                delay(500L)
+                continue
+            }
+
+            // Ignora fotos antigas anteriores ao início do motor
+            if (dateAdded > 0L && dateAdded < serviceStartTimestamp) {
+                return
+            }
+
+            // TRAVA ANTI-LOOP 1: Se o arquivo já está dentro do Sandbox DCIM/Camera/IFgestor, ignora imediatamente
+            if (settings.isInsideSandbox(sourceFile)) {
+                return
+            }
+
+            // TRAVA ANTI-LOOP 2: Ignora arquivos fora da pasta da câmera ou já processados pelo caminho canônico
+            val canonicalSource = try {
+                sourceFile.canonicalPath
+            } catch (_: Exception) {
+                sourceFile.absolutePath
+            }
+            if (!canonicalSource.contains("/DCIM/", ignoreCase = true)) {
+                return
+            }
+            if (!recentlyProcessedPaths.add(canonicalSource)) {
+                return
+            }
+
+            val prefix = settings.getFilePrefix()
+            if (sourceFile.name.startsWith(prefix, ignoreCase = true) || sourceFile.name.endsWith(".part")) {
+                return
+            }
+
+            moveAndPrefixCapturedFile(sourceFile, uri, prefix)
+            return
+        }
+    }
+
+    private fun moveAndPrefixCapturedFile(sourceFile: File, originalUri: Uri, prefix: String) {
+        val targetDir = settings.getActiveCaptureDirectory()
+        val ext = sourceFile.extension.ifBlank { "jpg" }
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+        val desiredName = "${prefix}${timestamp}.$ext"
+
+        val finalDestFile = taskManager.resolveUniqueDestinationFile(targetDir, desiredName)
+
+        // Registra o destino na trava anti-loop ANTES de criar o arquivo no disco
+        val destCanonical = try {
+            finalDestFile.canonicalPath
+        } catch (_: Exception) {
+            finalDestFile.absolutePath
+        }
+        recentlyProcessedPaths.add(destCanonical)
+
+        if (!taskManager.tryAcquireLock(finalDestFile, "Interceptação Câmera")) {
+            return
+        }
+
+        try {
+            val partFile = File(targetDir, "${finalDestFile.name}.part")
+            var movedDirectly = sourceFile.renameTo(finalDestFile)
+
+            if (!movedDirectly) {
+                sourceFile.copyTo(partFile, overwrite = true)
+                if (partFile.renameTo(finalDestFile)) {
+                    movedDirectly = true
+                } else {
+                    partFile.copyTo(finalDestFile, overwrite = true)
+                    partFile.delete()
+                    movedDirectly = finalDestFile.exists()
+                }
+                if (movedDirectly) {
+                    if (!sourceFile.delete()) {
+                        try {
+                            contentResolver.delete(originalUri, null, null)
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            }
+
+            if (movedDirectly && finalDestFile.exists()) {
+                val sessionCount = settings.incrementSessionPhotoCount()
+                _lastInterceptedFileFlow.value = finalDestFile.name
+                _sessionCountFlow.value = sessionCount
+
+                // Atualiza o MediaStore para apontar para o novo arquivo dentro de DCIM/Camera/IFgestor
+                MediaScannerConnection.scanFile(
+                    applicationContext,
+                    arrayOf(finalDestFile.absolutePath, sourceFile.absolutePath),
+                    null,
+                    null
+                )
+
+                audit.logEvent(
+                    action = "MIDIA_INTERCEPTADA",
+                    actor = "Câmera Nativa",
+                    details = "${sourceFile.name} -> ${targetDir.name}/${finalDestFile.name} (Sessão: #$sessionCount)",
+                    success = true
+                )
+
+                refreshNotificationsAndWidgets()
+            }
         } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
-    private fun moveAndRenameFile(
-        sourceFile: File,
-        originalName: String,
-        prefix: String,
-        targetDir: File
-    ) {
-        if (!targetDir.exists()) {
-            targetDir.mkdirs()
-        }
-
-        val newFileName = "${prefix}${originalName}"
-        val destFile = File(targetDir, newFileName)
-
-        val moved = if (sourceFile.renameTo(destFile)) {
-            true
-        } else {
-            try {
-                sourceFile.copyTo(destFile, overwrite = true)
-                sourceFile.delete()
-                true
-            } catch (e: Exception) {
-                false
-            }
-        }
-
-        if (moved) {
-            processedFiles.add(destFile.absolutePath)
-            MediaScannerConnection.scanFile(
-                this,
-                arrayOf(sourceFile.absolutePath, destFile.absolutePath),
-                null,
-                null
+            audit.logEvent(
+                action = "ERRO_INTERCEPTACAO",
+                actor = "Câmera Nativa",
+                details = "Falha ao processar ${sourceFile.name}: ${e.message}",
+                success = false
             )
-            SettingsManager.registerInterceptedFile(newFileName)
-            Handler(Looper.getMainLooper()).post {
-                overlayManager?.refreshBubbleLabel()
-                updateNotification()
-            }
-        } else {
-            processedFiles.remove(sourceFile.absolutePath)
+        } finally {
+            taskManager.releaseLock(finalDestFile)
         }
     }
 
-    private fun buildNotification(): Notification {
-        val prefix = SettingsManager.getPrefix(this)
-        val count = SettingsManager.interceptedCount.value
-        val ip = WebServerManager.getDeviceIpAddress(this)
-        val port = SettingsManager.getServerPort(this)
-        val webInfo = if (WebServerManager.isRunning()) "PC: http://$ip:$port" else "Web: Desativado"
+    // =========================================================================
+    // Notificação Persistente com Controles Independentes (Item 12)
+    // =========================================================================
 
-        val openAppIntent = Intent(this, MainActivity::class.java)
-        val openAppPending = PendingIntent.getActivity(
-            this,
-            0,
-            openAppIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+    private fun buildForegroundNotification(): Notification {
+        val interceptorOn = _interceptorRunningFlow.value
+        val serverOn = _webServerRunningFlow.value
+        val subfolder = settings.getTargetSubfolder()
+        val prefix = settings.getFilePrefix()
+        val sessionCount = settings.getSessionPhotoCount()
+        val folderCount = settings.getActiveFolderFileCount()
 
-        val toggleOverlayIntent = Intent(this, MediaInterceptorService::class.java).apply {
-            action = ACTION_TOGGLE_OVERLAY
+        val title = buildString {
+            append("IFGestor • ")
+            append(if (interceptorOn) "Câmera: ON" else "Câmera: OFF")
+            append(" | ")
+            append(if (serverOn) "Web HTTPS: ON" else "Web: OFF")
         }
-        val toggleOverlayPending = PendingIntent.getService(
-            this,
-            2,
-            toggleOverlayIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
 
-        val stopIntent = Intent(this, MediaInterceptorService::class.java).apply {
-            action = ACTION_STOP
+        val contentText = buildString {
+            append("Pasta: $subfolder ($folderCount) • Prefixo: $prefix • Sessão: $sessionCount")
+            if (serverOn) {
+                append("\n")
+                append(mdnsManager.getPrimaryHttpsDomainUrl())
+            }
         }
-        val stopPending = PendingIntent.getService(
+
+        val openAppIntent = PendingIntent.getActivity(
             this,
-            1,
-            stopIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            100,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val toggleInterceptorPending = PendingIntent.getService(
+            this,
+            101,
+            Intent(this, MediaInterceptorService::class.java).apply { action = ACTION_TOGGLE_INTERCEPTOR },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val toggleServerPending = PendingIntent.getService(
+            this,
+            102,
+            Intent(this, MediaInterceptorService::class.java).apply { action = ACTION_TOGGLE_SERVER },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopAllPending = PendingIntent.getService(
+            this,
+            103,
+            Intent(this, MediaInterceptorService::class.java).apply { action = ACTION_STOP_ALL },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val interceptorActionLabel = if (interceptorOn) "Pausar Fotos" else "Ligar Fotos"
+        val serverActionLabel = if (serverOn) "Parar Web" else "Ligar Web"
+
+        return NotificationCompat.Builder(this, CHANNEL_ID_FOREGROUND)
             .setSmallIcon(R.drawable.ic_ifgestor_logo)
-            .setContentTitle("IFGestor Ativo ($count capturados)")
-            .setContentText("Prefixo: $prefix | $webInfo")
+            .setContentTitle(title)
+            .setContentText(contentText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(contentText))
+            .setContentIntent(openAppIntent)
             .setOngoing(true)
-            .setContentIntent(openAppPending)
-            .addAction(
-                android.R.drawable.ic_menu_view,
-                "Widget Flutuante",
-                toggleOverlayPending
-            )
-            .addAction(
-                android.R.drawable.ic_media_pause,
-                "Parar",
-                stopPending
-            )
+            .setOnlyAlertOnce(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .addAction(0, interceptorActionLabel, toggleInterceptorPending)
+            .addAction(0, serverActionLabel, toggleServerPending)
+            .addAction(0, "Desligar Tudo", stopAllPending)
             .build()
     }
 
-    private fun updateNotification() {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager?.notify(NOTIFICATION_ID, buildNotification())
-    }
-
-    private fun createNotificationChannels() {
+    private fun ensureForegroundChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-
-            val serviceChannel = NotificationChannel(
-                CHANNEL_ID,
-                "Monitoramento da Câmera e Servidor Web",
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val channel = NotificationChannel(
+                CHANNEL_ID_FOREGROUND,
+                "Motores IFGestor (Interceptador e Servidor HTTPS)",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Mantém o IFGestor interceptando fotos e servindo arquivos na rede"
+                description = "Mantém o interceptador de fotos e o servidor HTTPS ativos em segundo plano"
             }
-
-            val authChannel = NotificationChannel(
-                AUTH_CHANNEL_ID,
-                "Autorizações 2FA de Segurança",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Exibe solicitações de aprovação em duas etapas do computador"
-            }
-
-            manager?.createNotificationChannel(serviceChannel)
-            manager?.createNotificationChannel(authChannel)
+            nm.createNotificationChannel(channel)
         }
-    }
-
-    private fun stopInterceptorService() {
-        SettingsManager.onTwoFactorCodeGenerated = null
-        SettingsManager.onTwoFactorRequestWithAction = null
-        overlayManager?.hide()
-        WebServerManager.stopServer()
-        releaseLocks()
-        SettingsManager.setServiceRunning(false)
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
     }
 
     override fun onDestroy() {
-        SettingsManager.onTwoFactorCodeGenerated = null
-        SettingsManager.onTwoFactorRequestWithAction = null
-        overlayManager?.hide()
-        WebServerManager.stopServer()
-        releaseLocks()
-        mediaObserver?.let { contentResolver.unregisterContentObserver(it) }
-        SettingsManager.setServiceRunning(false)
-        serviceScope.cancel()
+        unregisterMediaContentObserver()
+        if (webServer.isServerRunning()) {
+            webServer.stopServer()
+        }
+        FloatingOverlayManager.getInstance(applicationContext).hideOverlay()
+        _interceptorRunningFlow.value = false
+        _webServerRunningFlow.value = false
+        IFGestorHomeWidgetProvider.updateAllWidgets(applicationContext)
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    companion object {
+        const val CHANNEL_ID_FOREGROUND = "ifgestor_engines_foreground_channel"
+        private const val NOTIFICATION_ID_FOREGROUND = 9100
+
+        const val ACTION_SYNC_ENGINES = "com.ifgestor.app.ACTION_SYNC_ENGINES"
+        const val ACTION_START_INTERCEPTOR = "com.ifgestor.app.ACTION_START_INTERCEPTOR"
+        const val ACTION_STOP_INTERCEPTOR = "com.ifgestor.app.ACTION_STOP_INTERCEPTOR"
+        const val ACTION_TOGGLE_INTERCEPTOR = "com.ifgestor.app.ACTION_TOGGLE_INTERCEPTOR"
+
+        const val ACTION_START_SERVER = "com.ifgestor.app.ACTION_START_SERVER"
+        const val ACTION_STOP_SERVER = "com.ifgestor.app.ACTION_STOP_SERVER"
+        const val ACTION_TOGGLE_SERVER = "com.ifgestor.app.ACTION_TOGGLE_SERVER"
+
+        const val ACTION_START_BOTH = "com.ifgestor.app.ACTION_START_BOTH"
+        const val ACTION_STOP_ALL = "com.ifgestor.app.ACTION_STOP_ALL"
+        const val ACTION_REFRESH_UI = "com.ifgestor.app.ACTION_REFRESH_UI"
+
+        private val _interceptorRunningFlow = MutableStateFlow(false)
+        val interceptorRunningFlow: StateFlow<Boolean> = _interceptorRunningFlow.asStateFlow()
+
+        private val _webServerRunningFlow = MutableStateFlow(false)
+        val webServerRunningFlow: StateFlow<Boolean> = _webServerRunningFlow.asStateFlow()
+
+        private val _lastInterceptedFileFlow = MutableStateFlow("")
+        val lastInterceptedFileFlow: StateFlow<String> = _lastInterceptedFileFlow.asStateFlow()
+
+        private val _sessionCountFlow = MutableStateFlow(0)
+        val sessionCountFlow: StateFlow<Int> = _sessionCountFlow.asStateFlow()
+
+        fun sendAction(context: Context, action: String) {
+            val appContext = context.applicationContext
+            val intent = Intent(appContext, MediaInterceptorService::class.java).apply {
+                this.action = action
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    appContext.startForegroundService(intent)
+                } else {
+                    appContext.startService(intent)
+                }
+            } catch (_: Exception) {
+                try {
+                    appContext.startService(intent)
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
 }
