@@ -4,8 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.ThumbnailUtils
-import android.os.PowerManager
 import android.net.wifi.WifiManager
+import android.os.PowerManager
 import android.provider.MediaStore
 import org.json.JSONArray
 import org.json.JSONObject
@@ -200,14 +200,12 @@ class WebServerManager private constructor(context: Context) {
         bodyStream: InputStream,
         out: OutputStream
     ) {
-        // 1. Página Principal SPA
         if (method == "GET" && (path == "/" || path == "/index.html")) {
             val htmlBytes = buildSpaHtml().toByteArray(Charsets.UTF_8)
             sendResponse(out, 200, "OK", "text/html; charset=utf-8", htmlBytes)
             return
         }
 
-        // 2. Rotas Públicas / Pré-Autenticação (Login, 2FA, Troca Obrigatória do PIN 1234 e Status)
         when (path) {
             "/api/auth/status" -> {
                 val validSession = security.getValidAuthenticatedSession(sessionToken, clientIp)
@@ -254,6 +252,230 @@ class WebServerManager private constructor(context: Context) {
                     SecurityManager.PinStatus.SUCCESS -> {
                         val session = security.createWebSession(clientIp, userAgent, mustChangePin = false)
                         security.issue2faChallenge(session.token, clientIp, "Acesso Web PC")
+                        val resp = JSONObject().apply {
+                            put("ok", true)
+                            put("mustChangePin", false)
+                            put("requires2fa", true)
+                            put("sessionToken", session.token)
+                            put("message", "Código 2FA de 6 dígitos enviado para a notificação do telemóvel.")
+                        }
+                        sendJson(out, 200, resp, sessionCookie = session.token)
+                    }
+                }
+                return
+            }
+
+            "/api/change-pin" -> {
+                if (method != "POST") {
+                    sendJsonError(out, 405, "Método inválido.")
+                    return
+                }
+                val preSession = security.getPreAuthSession(sessionToken, clientIp)
+                if (preSession == null) {
+                    sendJsonError(out, 401, "Sessão expirada. Faça login novamente.")
+                    return
+                }
+                val body = readJsonBody(bodyStream)
+                val currentPin = body.optString("currentPin", "")
+                val newPin = body.optString("newPin", "")
+
+                val changeResult = security.changePin(currentPin, newPin, clientIp)
+                if (changeResult.isFailure) {
+                    sendJsonError(out, 400, changeResult.exceptionOrNull()?.message ?: "Erro ao alterar PIN.")
+                    return
+                }
+
+                security.issue2faChallenge(preSession.token, clientIp, "Acesso Web pós-troca de PIN")
+                val resp = JSONObject().apply {
+                    put("ok", true)
+                    put("requires2fa", true)
+                    put("sessionToken", preSession.token)
+                    put("message", "PIN atualizado com sucesso! Digite o código 2FA enviado ao telemóvel.")
+                }
+                sendJson(out, 200, resp, sessionCookie = preSession.token)
+                return
+            }
+
+            "/api/verify-2fa" -> {
+                if (method != "POST") {
+                    sendJsonError(out, 405, "Método inválido.")
+                    return
+                }
+                val preSession = security.getPreAuthSession(sessionToken, clientIp)
+                if (preSession == null) {
+                    sendJsonError(out, 401, "Sessão inválida ou expirada.")
+                    return
+                }
+                val body = readJsonBody(bodyStream)
+                val code = body.optString("code", "")
+
+                if (security.verify2faChallenge(preSession.token, code, clientIp)) {
+                    val resp = JSONObject().apply {
+                        put("ok", true)
+                        put("sessionToken", preSession.token)
+                    }
+                    sendJson(out, 200, resp, sessionCookie = preSession.token)
+                } else {
+                    sendJsonError(out, 401, "Código 2FA inválido ou expirado.")
+                }
+                return
+            }
+
+            "/api/logout" -> {
+                security.revokeSession(sessionToken, clientIp)
+                sendJson(out, 200, JSONObject().put("ok", true), clearCookie = true)
+                return
+            }
+
+            "/api/p2p/handshake" -> {
+                if (method != "POST") {
+                    sendJsonError(out, 405, "Método inválido.")
+                    return
+                }
+                val body = readJsonBody(bodyStream)
+                val transferId = body.optString("transferId", "")
+                val senderNickname = body.optString("senderNickname", "Telemóvel Remoto")
+                val targetSubfolder = body.optString("targetSubfolder", settings.getTargetSubfolder())
+                val fileCount = body.optInt("fileCount", 1)
+                val totalBytes = body.optLong("totalBytes", 0L)
+
+                if (transferId.isBlank()) {
+                    sendJsonError(out, 400, "transferId ausente.")
+                    return
+                }
+
+                p2pManager.handleIncomingHandshake(
+                    transferId = transferId,
+                    senderNickname = senderNickname,
+                    senderIp = clientIp,
+                    targetSubfolder = targetSubfolder,
+                    fileCount = fileCount,
+                    totalBytes = totalBytes
+                )
+                sendJson(out, 200, JSONObject().put("ok", true))
+                return
+            }
+
+            "/api/p2p/verify-receiver" -> {
+                if (method != "POST") {
+                    sendJsonError(out, 405, "Método inválido.")
+                    return
+                }
+                val body = readJsonBody(bodyStream)
+                val transferId = body.optString("transferId", "")
+                val code = body.optString("code", "")
+
+                val res = p2pManager.verifyIncoming2fa(transferId, code)
+                if (res.isSuccess) {
+                    val resp = JSONObject().apply {
+                        put("ok", true)
+                        put("authToken", res.getOrNull() ?: "")
+                    }
+                    sendJson(out, 200, resp)
+                } else {
+                    sendJsonError(out, 401, res.exceptionOrNull()?.message ?: "Código 2FA recusado.")
+                }
+                return
+            }
+
+            "/api/p2p/upload" -> {
+                if (method != "POST") {
+                    sendJsonError(out, 405, "Método inválido.")
+                    return
+                }
+                val transferId = queryParams["transferId"] ?: ""
+                val fileName = queryParams["fileName"] ?: "p2p_${System.currentTimeMillis()}.jpg"
+                val subfolder = queryParams["subfolder"] ?: settings.getTargetSubfolder()
+                val expectedBytes = queryParams["expectedBytes"]?.toLongOrNull() ?: contentLength
+                val p2pToken = headers["x-p2p-auth-token"]
+
+                val saveRes = p2pManager.receiveIncomingFileStream(
+                    transferId = transferId,
+                    authToken = p2pToken,
+                    fileName = fileName,
+                    subfolder = subfolder,
+                    expectedBytes = expectedBytes,
+                    inputStream = bodyStream
+                )
+                if (saveRes.isSuccess) {
+                    sendJson(
+                        out,
+                        200,
+                        JSONObject().put("ok", true).put("savedName", saveRes.getOrNull()?.name ?: fileName)
+                    )
+                } else {
+                    sendJsonError(out, 403, saveRes.exceptionOrNull()?.message ?: "Falha na recepção P2P.")
+                }
+                return
+            }
+        }
+
+        val authSession = security.getValidAuthenticatedSession(sessionToken, clientIp)
+        if (authSession == null) {
+            sendJsonError(out, 401, "Sessão não autorizada ou expirada. Valide o PIN e o código 2FA.")
+            return
+        }
+
+        when (path) {
+            "/api/files" -> handleListFiles(queryParams, out)
+            "/api/subfolder/create" -> handleCreateSubfolder(bodyStream, clientIp, out)
+            "/api/upload" -> handleWebFileUpload(queryParams, contentLength, bodyStream, clientIp, out)
+            "/api/move" -> handleMoveFiles(bodyStream, clientIp, out)
+            "/api/delete" -> handleDeleteFiles(bodyStream, clientIp, out)
+            "/api/tasks" -> handleGetTasksAndPeers(out)
+            "/api/tasks/clear" -> {
+                taskManager.clearFinishedTasks()
+                sendJson(out, 200, JSONObject().put("ok", true))
+            }
+            "/api/peers" -> {
+                val resp = JSONObject().apply {
+                    put("ok", true)
+                    put("peers", mdnsManager.toJsonArray())
+                }
+                sendJson(out, 200, resp)
+            }
+            "/api/audit" -> {
+                val resp = JSONObject().apply {
+                    put("ok", true)
+                    put("logs", audit.toJsonArray(150))
+                }
+                sendJson(out, 200, resp)
+            }
+            "/api/p2p/initiate" -> handleWebInitiateP2p(bodyStream, out)
+            "/api/p2p/confirm-source" -> handleWebConfirmSourceP2p(bodyStream, out)
+            "/api/p2p/confirm-receiver" -> handleWebConfirmReceiverP2p(bodyStream, out)
+            "/api/p2p/approve-incoming" -> handleWebApproveIncomingP2p(bodyStream, out)
+            "/api/whatsapp-trigger" -> handleRemoteWhatsAppTrigger(bodyStream, clientIp, out)
+            "/api/thumb" -> handleServeThumbnail(queryParams, out)
+            "/api/file" -> handleServeFullFile(queryParams, clientIp, out)
+            "/api/download-zip" -> handleStreamingZipDownload(queryParams, clientIp, out)
+            else -> sendJsonError(out, 404, "Rota não encontrada: $path")
+        }
+    }
+
+    private fun handleListFiles(queryParams: Map<String, String>, out: OutputStream) {
+        val requestedSub = queryParams["subfolder"]?.ifBlank { settings.getTargetSubfolder() }
+            ?: settings.getTargetSubfolder()
+        val folder = settings.resolveSafeSubfolder(requestedSub)
+        security.assertInsideSandbox(folder)
+
+        val subfolders = settings.listSandboxSubfolders()
+        val filesArray = JSONArray()
+        val sdf = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
+
+        val validFiles = (folder.listFiles() ?: emptyArray())
+            .filter { it.isFile && !it.name.startsWith(".") && !it.name.endsWith(".part") }
+            .sortedByDescending { it.lastModified() }
+
+        for (file in validFiles) {
+            val ext = file.extension.lowercase(Locale.ROOT)
+            val isVideo = ext in listOf("mp4", "mkv", "mov", "3gp", "webm")
+            val obj = JSONObject().apply {
+                put("name", file.name)
+                put("subfolder", folder.name)
+                put("sizeBytes", file.length())
+                put("formattedSize", FileLockAndTaskManager.formatSize(file.length()))
+                put("lastModified.token, clientIp, "Acesso Web PC")
                         val resp = JSONObject().apply {
                             put("ok", true)
                             put("mustChangePin", false)
